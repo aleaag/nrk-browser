@@ -93,7 +93,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.10.9'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.10.11'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -4674,6 +4674,12 @@ $folderPane.Controls.Add($folderHeader)
 
 $itemsList = New-DarkList -Back $T.Bg -WithIcons -Header 'Pick a folder'
 $itemsList.Dock = 'Fill'
+# 2.10.10: when the filter box leaves nothing in the list, say why, and offer to search everything
+$script:EmptyHint = New-Object System.Windows.Forms.LinkLabel
+$script:EmptyHint.Visible = $false; $script:EmptyHint.AutoSize = $false; $script:EmptyHint.Dock = 'Top'; $script:EmptyHint.Height = 96
+$script:EmptyHint.TextAlign = 'MiddleCenter'; $script:EmptyHint.Padding = New-Object System.Windows.Forms.Padding(16, 24, 16, 0)
+$script:EmptyHint.Add_LinkClicked({ param($s, $e) if ([string]$e.Link.LinkData -eq 'search') { Invoke-SearchAll $search.Text } else { $search.Text = '' } })
+$itemsList.Controls.Add($script:EmptyHint)
 $itemsList.MultiSelect = $true   # Shift/Ctrl+click to select several files
 $itemsList.Add_DrawItem({ if ($args[0].View -eq 'LargeIcon') { try { Invoke-DrawGridItem $args[1] } catch { } } })   # (thumbnail tiles; rows draw in DrawSubItem)
 
@@ -5682,14 +5688,20 @@ function Invoke-SearchAll([string] $Query) {
     $flt = Get-SearchFilter
     $hits = [NrkSearch]::Find($q, $script:SearchMax, $flt.Types, $flt.Available, (Get-Date).ToString('s'), $flt.YearMin, $flt.YearMax)
     Add-IndexPriority -Term $q   # (2.10.0: series with this in the name are indexed next)
-    $folders = New-Object System.Collections.Generic.List[object]
-    $files = New-Object System.Collections.Generic.List[object]
+    # (2.10.11: ArrayLists and finished arrays: Windows PowerShell 5.1 threw "Argument types do not
+    #  match" making the Search folder from generic lists, so every search everything failed)
+    $folders = New-Object System.Collections.ArrayList
+    $files = New-Object System.Collections.ArrayList
     $seriesItems = @{}
     foreach ($i in $hits) {
         $r = ConvertFrom-SearchRow ([NrkSearch]::Row($i)) $seriesItems   # (nothing you hid)
         if (-not $r) { continue }
-        if ($r.Folder) { $folders.Add($r.Folder) } elseif ($r.File) { $files.Add($r.File) }
+        if ($r.Folder -is [System.Windows.Forms.TreeNode]) { [void]$folders.Add($r.Folder) }
+        elseif ($r.File) { foreach ($one in @($r.File)) { if ($one) { [void]$files.Add($one) } } }   # (one file each, never a list)
     }
+    $fileArr = $files.ToArray()
+    $folderArr = New-Object 'System.Windows.Forms.TreeNode[]' $folders.Count
+    for ($k = 0; $k -lt $folders.Count; $k++) { $folderArr[$k] = $folders[$k] }
     Write-Log INFO ("Search '{0}': {1} of {2:N0} entries match, {3} ms" -f $q, $hits.Count, $n, $sw.ElapsedMilliseconds)
     $folderTree.BeginUpdate()
     try {
@@ -5699,9 +5711,12 @@ function Invoke-SearchAll([string] $Query) {
         }
         $sn = $script:SearchNode
         $sn.Text = 'Search: {0}   ({1:N0})' -f $q, $hits.Count
-        $sn.Tag = @{ Kind = 'search'; Title = "Search: $q"; Query = $q; Items = @($files); Loaded = $true }
+        $tag = New-Object System.Collections.Hashtable
+        $tag['Kind'] = 'search'; $tag['Title'] = "Search: $q"; $tag['Query'] = [string]$q; $tag['Items'] = $fileArr; $tag['Loaded'] = $true
+        try { $sn.Tag = $tag }
+        catch { Write-Log ERROR ("Search folder: {0} (files: {1} {2}, first: {3})" -f $_.Exception.Message, $fileArr.GetType().FullName, $fileArr.Length, $(if ($fileArr.Length) { $fileArr[0].GetType().FullName } else { '-' })); throw }
         $sn.Nodes.Clear()
-        if ($folders.Count) { $sn.Nodes.AddRange([System.Windows.Forms.TreeNode[]]$folders.ToArray()) }   # best matches first
+        if ($folderArr.Length) { $sn.Nodes.AddRange($folderArr) }   # best matches first
     } finally { $folderTree.EndUpdate() }
     $search.Text = ''          # (the box filters the list it shows; the results are already the match)
     if ($folderTree.SelectedNode -eq $script:SearchNode) { Open-Folder $script:SearchNode } else { $folderTree.SelectedNode = $script:SearchNode }
@@ -6627,12 +6642,24 @@ function Show-Files {
     $what = switch (@($script:Files | Select-Object -First 1).Type) { 'live' { 'channels' } 'radiolive' { 'channels' } 'episode' { 'episodes' } 'audio' { 'recordings' } default { 'files' } }
     # (2.10.1: say so when files are left out, so a short or empty list never looks like a fault)
     $hid = @()
-    if ($nFiltered) { $hid += ('{0} not matching "{1}" (Esc clears)' -f $nFiltered, $q) }
+    if ($nFiltered) { $hid += ('filter "{0}"' -f $q) }
     if ($nWatched) { $hid += ('{0} watched hidden' -f $nWatched) }
     Set-ItemsHeader $(if (-not $folder) { 'Pick a folder' }
                       elseif ($hid) { '{0}  ·  {1} of {2} {3} shown  ·  {4}' -f $folder.Tag.Title, $n, $total, $what, ($hid -join ', ') }
                       else { '{0}  ·  {1} {2}' -f $folder.Tag.Title, $total, $what })
-    if ($q) { Set-Status ('{0} of {1} {2} match "{3}"' -f $n, $total, $what, $q) }
+    if ($q) { Set-Status ('{0} of {1} {2} match "{3}"  ·  Enter: search everything  ·  Esc: show all' -f $n, $total, $what, $q) }
+    # nothing left by the filter: a note in the list itself (the header is too short for it)
+    $h = $script:EmptyHint
+    if ($q -and $n -eq 0 -and $total -gt 0) {
+        $h.BackColor = $itemsList.BackColor; $h.ForeColor = $T.Muted
+        $h.LinkColor = $T.Accent; $h.ActiveLinkColor = $T.AccentHover; $h.VisitedLinkColor = $T.Accent
+        $a = 'Search all of NRK TV and radio for "{0}"' -f $q; $b = 'show all'
+        $h.Text = "Nothing in this folder matches ""$q"".`n`n$a   ·   $b"
+        $h.Links.Clear()
+        [void]$h.Links.Add($h.Text.IndexOf($a), $a.Length, 'search')
+        [void]$h.Links.Add($h.Text.LastIndexOf($b), $b.Length, 'clear')
+        $h.Visible = $true
+    } elseif ($h.Visible) { $h.Visible = $false }
     if ($folder) { Write-PerfNote 'list' ([string]$folder.Tag.Kind) ([string]$folder.Tag.Title) $perf.ElapsedMilliseconds ([ordered]@{ Count = $total; Shown = $n; Filter = [bool]$q }) 0 }
 }
 
