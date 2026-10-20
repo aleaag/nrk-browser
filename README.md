@@ -27,6 +27,8 @@ with subtitles, chapters and covers, all without a browser tab.
 - **Favourites**: star any series or podcast (right-click › Add to favourites).
 - **New this week** and **Last chance**: what came on NRK in the last 7 days, and what leaves
   within 14 days.
+- **Continue watching** (what you started, and the next episode of series you watch) and
+  **Watch later** (right-click › Watch later), separate from Favourites.
 - **Recently played**, a clickable breadcrumb, Back, sorting (Z–A, A–Z or NRK's order), and
   Shift/Ctrl multi-select in the tree and the list.
 - **Descriptions under titles** and **"Available until"** (with "5 days left" in the list).
@@ -48,15 +50,21 @@ with subtitles, chapters and covers, all without a browser tab.
   (sign language), under **Audio ▾**.
 - **Continues where you stopped**, to the second, also after a restart, crash or update.
   Watched episodes get a green line in the list; started ones show how far you got.
-- Previous/next episode, autoplay of the next one (can be turned off), full screen, keep on top.
+- Previous/next episode, autoplay with a **countdown card** (Play now / Cancel), full screen, keep on
+  top, a **mini player** that stays on top, **picture quality** choice and **screenshots**.
+- Subtitle **colour, background and position**.
 - "Open NRK page" plays a programme in NRK's own web player instead.
 
 ### Listen: the radio bar
 - Radio programmes, podcasts and live radio in a bar at the bottom of the window.
 - Play/pause, ±15 s, seek, speed, volume; seek back through live radio and jump to live.
 - **Your own queue**: right-click › Play next / Add to queue.
+- **Skip silences** and **voice boost**; per series or podcast: its own **speed**, and **skip the
+  intro / the outro** (the bars button in the radio bar).
+- Live radio shows the **song playing now**; a **small radio window** stays on top.
+- **Wake to radio**: a channel at a set time on the days you pick (Options › Wake to radio).
 - **Sleep timer** (the moon button, the player window or the tray): 15–120 minutes or the end of
-  this episode.
+  this episode; the volume goes down over the last minute.
 - Media keys and Windows' media controls work.
 
 ### Cast to a Chromecast or a TV
@@ -68,6 +76,10 @@ with subtitles, chapters and covers, all without a browser tab.
 - The first time, Windows asks whether PowerShell may use the network: allow it on private
   networks, or subtitles (Chromecast) and TVs won't work.
 
+### Record
+- **Record live TV and radio**: right-click a live channel › Record… (now, or from a time), or a
+  programme in the TV schedule › Record this programme. FFmpeg copies NRK's stream as it is.
+
 ### Download
 - Every Download adds to a **queue**: whole seasons, series, categories or selected files.
 - **TV**: MP4 (or MKV) in NRK's best quality (or up to 1080p / 720p / 480p / 360p), copied as it
@@ -76,23 +88,31 @@ with subtitles, chapters and covers, all without a browser tab.
   and cover.
 - **Pause / resume**, also after a restart; a lost connection pauses and continues by itself;
   damaged pieces are fetched again.
-- **Follow a series**: new episodes download by themselves (right-click a favourite › Follow).
+- **Follow a series**: new episodes download by themselves (right-click a favourite › Follow), or
+  just get a notification (Follow, only tell me).
+- **File names** of your own: `{series} - S{season}E{episode} - {title}` (Options › Download rules).
 - **Download history**: what you downloaded before isn't fetched again, even after you moved or
   deleted it ("Download again" when you want it).
 - **Kodi / Jellyfin / Plex**: .nfo files, posters and fanart next to the videos.
 - Whole series: only the newest N episodes, or only those after a date.
 - Speed limit, download hours (for example 01:00–07:00), a disk space check, and a Windows
-  notification when the queue is done.
+  notification when the queue is done (**Options › Download rules**).
 - Update the tags and cover of files you already have; delete downloaded files; open their folder.
-- Podcasts: copy NRK's own podcast feed (RSS) address for your podcast app.
+- Podcasts: copy NRK's own podcast feed (RSS) address for your podcast app, or export all your
+  favourite podcasts as OPML.
 
 ### Fits into Windows
 - Light and dark theme (follows Windows), 11 looks for the top-bar icons.
 - System tray: minimize or close to the tray and keep playing; Pause, Mute, Sleep timer,
   Check for updates, Exit.
 - Start with Windows, one copy at a time, sound output for this app only.
+- **Global hotkeys** (also in the background) and shortcuts you can change (Options › Shortcuts).
+- **Taskbar**: Previous / Play / Next under the preview, recent channels when you right-click it.
+- **Phone remote**: control playback from a phone on your home network (Options › Phone remote).
+- **Statistics**: hours watched and listened to, and your most played series.
 - **Child mode** (with a PIN): only NRK Super and children's categories, nothing rated above the
   age you choose, no search.
+- **Find setting** box at the top of Options.
 - **Back up and restore** your settings, favourites, hidden items, watched list and download list.
 
 ### Install, update and repair
@@ -153,6 +173,9 @@ Everything else is checked at startup and installed on request:
 | `Ctrl+I` | Indexer |
 | `Ctrl+F` | Filter / search box |
 | `Ctrl+G` | Files as thumbnails / as a list |
+| `Ctrl+W` | Watch later (selected files) |
+| `Ctrl+R` | Recordings |
+| `Ctrl+Alt+P`, `Ctrl+Alt+←/→`, `Ctrl+Alt+↑/↓`, `Ctrl+Alt+M`, `Ctrl+Alt+N` | Anywhere in Windows: play/pause, previous/next, volume, mute, show the app |
 | `F11` / `Esc` | Player full screen / leave full screen |
 | `Space`, `←` / `→` | Player and radio bar: play/pause, back/forward |
 | `Ctrl+↑` / `Ctrl+↓`, `Del` | Downloads: move or remove the selected files |
@@ -167,6 +190,7 @@ Everything else is checked at startup and installed on request:
 | `-DumpResponses` | also save every raw NRK API response to the log folder |
 | `-LogDir <folder>` | write logs somewhere else |
 | `-ShowConsole` | keep the PowerShell console visible |
+| `-Play radio:p1` / `-Play tv:nrk1` | start that channel (used by the taskbar jump list) |
 
 ## Where things are stored
 
@@ -177,10 +201,13 @@ Everything lives in **`%LOCALAPPDATA%\NRK-Browser`** (Options › Install & file
 | `settings.json` | your options |
 | `favourites.json`, `excluded.json`, `recent.json` | favourites (and followed series), hidden items, recently played |
 | `positions.json` | where you stopped in each programme, and what you've watched |
+| `continue.json`, `watchlater.json` | Continue watching and Watch later |
+| `seriesprefs.json`, `recentchannels.json` | speed and skips per series; channels for the jump list and phone remote |
+| `recordings.json`, `stats.json` | planned and done recordings; statistics |
 | `downloads.json`, `dlhistory.json` | the download list, and what was downloaded before |
 | `indexer\` | the indexer's list of everything (search, New this week, Last chance) |
 | `cache\` | saved NRK pages and images (clear it in Options) |
-| `images\` | the NRK TV picture used for TV folders without one |
+| `assets\` | icons and folder pictures, fetched from this repository's `icons` and `pictures` folders at startup (only what is missing) |
 | `logs\` | log files, when **Save logs to disk** is on |
 | `backups\` | what you had before a restore |
 | `webview2-sdk\`, `hls.js\`, `WebView2Data\` | components and player data |
@@ -190,7 +217,8 @@ choose in **Options › Downloads**.
 
 ## Troubleshooting
 
-- **Nothing loads**: run with `-SelfTest`, then look at **Logs** (`Ctrl+L`).
+- **Nothing loads**: run with `-SelfTest`, then look at **Logs** (`Ctrl+L`). **Pause** there stops
+  the view from scrolling while you read; the app keeps logging.
 - **Search, New this week or Last chance is empty**: they come from the indexer; open it
   (`Ctrl+I`) and let a full run finish.
 - **A programme plays on NRK's page instead of the built-in player**: it's copy-protected, so only
@@ -205,7 +233,22 @@ choose in **Options › Downloads**.
 1. Raise `$script:AppVersion` near the top of `NRK-Browser.ps1`.
 2. Commit `NRK-Browser.ps1` to the root of `main`.
 3. Running copies download that file, compare its version line with their own, and install it
-   when it is newer. There is nothing else to publish.
+   when it is newer.
+4. Changed or new icons/pictures: update `assets.json` (it lists every file in `icons` and
+   `pictures` with the start of its SHA-256), so running copies fetch only what changed. From the
+   repository folder in PowerShell:
+   ```powershell
+   $f = [ordered]@{}; Get-ChildItem icons, pictures -Recurse -Filter *.png | Where-Object Name -ne 'main.png' | Sort-Object FullName | ForEach-Object { $f[(Resolve-Path -Relative $_.FullName).TrimStart('.\').Replace('\', '/')] = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.Substring(0, 16).ToLower() }
+   [ordered]@{ version = 1; files = $f } | ConvertTo-Json | Set-Content assets.json -Encoding UTF8
+   ```
+4. After changing anything in `icons/` or `pictures/`, update `assets.json` so running copies
+   fetch the new pictures (each file's first 16 hex digits of its SHA-256). From the repository
+   folder in PowerShell:
+   ```powershell
+   $f = [ordered]@{}; Get-ChildItem icons, pictures -Recurse -Filter *.png | Where-Object Name -ne 'main.png' | Sort-Object FullName | ForEach-Object {
+       $f[(Resolve-Path -Relative $_.FullName).TrimStart('.\').Replace('\', '/')] = (Get-FileHash $_.FullName SHA256).Hash.Substring(0, 16).ToLower() }
+   [ordered]@{ version = 1; files = $f } | ConvertTo-Json | Set-Content assets.json -Encoding UTF8
+   ```
 
 ## Credits
 
