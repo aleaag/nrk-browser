@@ -14,8 +14,6 @@ with subtitles, chapters and covers, all without a browser tab.
 
 <img src="https://raw.githubusercontent.com/aleaag/nrk-browser/refs/heads/main/main.png" alt="main" width="800" height="auto">
 
-<img src="https://raw.githubusercontent.com/aleaag/nrk-browser/refs/heads/main/main.png" alt="main" width="800" height="auto">
-
 ---
 
 ## Features
