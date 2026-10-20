@@ -1,37 +1,53 @@
 ﻿<#
 .SYNOPSIS
-    NRK Browser - browse tv.nrk.no categories and the A-Å programme index,
-    watch, listen and download (FFmpeg) - see README.md.
+    NRK Browser - browse, watch, listen to, record, cast and download NRK TV and NRK Radio
+    from one Windows app. See README.md (github.com/aleaag/nrk-browser).
 
 .DESCRIPTION
-    Windows PowerShell 5.1+ / PowerShell 7+ (GUI needs Windows).
+    Windows PowerShell 5.1+ or PowerShell 7+ on Windows 10/11 (.NET Framework 4.7.2+).
 
-    Endpoints used (verified against psapi.nrk.no, October 2026):
-      /tv/pages                              -> { pageListItems: [ {id,title,pageType,_links} ] }
-      /tv/pages/{pageId}                     -> { sections: [ {type:'included', included:{title,plugs:[...]}} ] }
-      /medium/tv/letters                     -> [ {id:'A',title:'A',availableInNorway:..} ]  (the A-Å list on tv.nrk.no/programmer)
-      /medium/tv/letters/{l}/indexelements   -> [ {id,title,type:'series'|'programme',description,isGeoBlocked} ]
-      /tv/catalog/series/{seriesId}          -> series + _links.seasons[] (+ _links.extramaterial)
-      /tv/catalog/programs/{programId}       -> programme metadata
-      /playback/manifest/program/{programId} -> playability ('playable' / 'nonPlayable' + reason)
+    NRK's public programme API (psapi.nrk.no), checked October 2026:
+      /tv/pages, /tv/pages/{id}                    TV front page and categories
+      /medium/tv/letters, .../{l}/indexelements    the TV A-Å index
+      /tv/catalog/series/{id}, .../seasons/{s}     TV series, seasons, episodes
+      /tv/catalog/programs/{id}                    a TV programme
+      /tv/live, /radio/live                        live TV and radio channels
+      /epg/...                                     today's schedule per channel
+      /radio/pages, /radio/search/categories/...   radio categories and the radio A-Å
+      /radio/catalog/series|podcast/{id}/...       radio series, podcasts, seasons, episodes
+      /channels/{id}/liveelements/now              the song playing on live radio
+      /playback/manifest/..., /playback/metadata/...   streams, subtitles, chapters, age ratings
+    Also: gfx.nrk.no (pictures) and NRK's stream servers; raw.githubusercontent.com (updates and
+    assets.zip with the icons and pictures).
 
-    Every request, its HTTP status, size and timing, plus all errors with stack
-    traces, are written to a daily log file (default: %LOCALAPPDATA%\NRK-Browser\logs).
+    Every request (status, size, time) and every error is written to a daily log file when
+    "Save logs to disk" is on (default folder: %LOCALAPPDATA%\NRK-Browser\logs).
+
+.NOTES
+    Startup checks these components and asks before installing any of them:
+      Microsoft Edge WebView2 Runtime  the player engine (normally part of Windows; winget)
+      WebView2 SDK for .NET            nuget.org, stored in %LOCALAPPDATA%\NRK-Browser
+      hls.js                           the radio bar and the built-in video player (cdn.jsdelivr.net)
+      FFmpeg                           downloads, recordings and casting to a TV (winget Gyan.FFmpeg)
+      winget                           only if needed to install the above
+    The app never needs to run as administrator.
 
 .PARAMETER LogDir
-    Folder for log files. Default: %LOCALAPPDATA%\NRK-Browser\logs (falls back to %TEMP%).
+    Folder for log files (also switches saving to disk on). Default: %LOCALAPPDATA%\NRK-Browser\logs.
 
 .PARAMETER DumpResponses
     Also save every raw JSON response to <LogDir>\responses\ for inspection.
 
-.NOTES
-    Startup checks these components and asks before installing any of them:
-      Microsoft Edge WebView2 Runtime  (embedded NRK player engine; winget)
-      WebView2 SDK for .NET            (nuget.org, stored in %LOCALAPPDATA%\NRK-Browser)
-      FFmpeg                           (downloads; winget Gyan.FFmpeg)
-      hls.js                           (the audio bar and the built-in video player)
-      winget                           (only if needed to install the above)
-    The app never needs to run as administrator.
+.PARAMETER SelfTest
+    No window. Calls each endpoint once, prints a summary and writes the log.
+    Run this first if the browser shows nothing.
+
+.PARAMETER Index
+    No window. Runs the indexer: walks every TV and radio folder slowly into the local
+    cache (one request at a time). Started from the Indexer window or a daily scheduled task.
+
+.PARAMETER NoGui
+    Loads everything and stops before any window (for tests and scripts that dot-source this file).
 
 .PARAMETER ShowConsole
     Keep the PowerShell console window visible (it is hidden while the app runs by default).
@@ -40,23 +56,21 @@
     Start hidden in the system tray (used by the "Start with Windows" shortcut).
 
 .PARAMETER UpdatedFrom
-    Set by the updater when it restarts the app after an update.
+    Set by the updater when it restarts the app after an update (the version it came from).
 
-.PARAMETER SelfTest
-    No GUI. Calls each endpoint once, prints a summary and writes the log.
-    Run this first if the browser shows nothing.
+.PARAMETER UpdateResult
+    Set by the updater: the result file its helper wrote, shown after the restart.
 
-.PARAMETER NoGui
-    Loads everything and stops before any window (for tests and scripts that dot-source this file).
-
-.PARAMETER Index
-    No window. Runs the indexer: walks every TV and radio folder slowly into the local
-    cache (one request at a time). Started from the Indexer window or a daily scheduled task.
+.PARAMETER Play
+    Start a live channel: radio:<id> or tv:<id>, for example radio:p1 or tv:nrk1. If the app is
+    already running, that copy plays it (used by the taskbar jump list).
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\NRK-Browser.ps1
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\NRK-Browser.ps1 -SelfTest -DumpResponses
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\NRK-Browser.ps1 -Play radio:p3
 #>
 [CmdletBinding()]
 param(
@@ -74,7 +88,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.9.9'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.9.10'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -1650,7 +1664,7 @@ function Get-DependencyStatus {
         Found = [bool]$sdk; Detail = $(if ($sdk) { Split-Path -Parent $sdk.WinForms } else { 'not downloaded' })
         Method = 'nuget'; Package = 'Microsoft.Web.WebView2'; Admin = $false })
     $rows.Add([pscustomobject]@{ Key = 'ffmpeg'; Name = 'FFmpeg'
-        Purpose = 'Downloads (TV with subtitles, chapters and cover; radio as M4A, MP3 or FLAC) and casting to a TV.'
+        Purpose = 'Downloads (TV with subtitles, chapters and cover; radio as M4A, MP3 or FLAC), recordings of live TV and radio, and casting to a TV.'
         Found = $ff.Found; Detail = $(if ($ff.Found) { $ff.Path } else { 'not installed' })
         Method = 'winget'; Package = 'Gyan.FFmpeg'; Admin = $false })
     $hlsVer = if ($hls) { Get-HlsJsInstalledVersion } else { '' }
@@ -1709,7 +1723,7 @@ function Invoke-Logged {
     # Runs a native command and copies its output into the transcript line by line.
     # Spinner/progress-bar redraws (\r) are reduced to their final state.
     param([string] $Exe, [string[]] $Arguments)
-    $ErrorActionPreference = 'Continue'   # stderr lines (pip warnings, winget notes) must not abort
+    $ErrorActionPreference = 'Continue'   # stderr lines (winget notes) must not abort
     & $Exe @Arguments 2>&1 | ForEach-Object {
         $t = [string]$_
         $t = ($t -split "`r" | Where-Object { $_.Trim() } | Select-Object -Last 1)
@@ -1849,7 +1863,6 @@ try {
                 $w = Get-Winget
                 if (-not $w) { $problems.Add("$($name): skipped, winget is not available"); break }
                 $wgArgs = @('install', '--id', $id, '--exact', '--source', 'winget', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
-                if ($id -like 'Python.Python.*') { $wgArgs += @('--scope', 'user') }   # per-user Python: no admin needed
                 if ($action -eq 'winget-install-force') { $wgArgs += '--force' }
                 $code = Invoke-Logged $w $wgArgs
                 Write-Host "    winget exit code: $code"
@@ -2845,25 +2858,7 @@ function Set-DarkTheme {
 $script:AssetBase = 'https://raw.githubusercontent.com/{0}/refs/heads/main' -f $script:UpdateRepo
 $script:AssetsDir = Join-Path $script:AppDataDir 'assets'
 $script:AssetImgs = @{}
-$script:AssetTopStyles = @('thin', 'bold', 'solid', 'accent', 'duotone', 'ring', 'tiles', 'soft', 'muted', 'muted-hover')
-$script:AssetTopNames = @('back', 'index', 'down', 'logs', 'reload', 'options',
-    # 2.9.2: the buttons of the Downloads and Logs windows, the main window and the cast bar
-    'play', 'pause', 'stop', 'cancel', 'check', 'selectall', 'minus', 'folder', 'copy', 'edit', 'trash', 'web', 'link', 'cast', 'rewind', 'forward', 'volume',
-    'previous', 'next', 'window', 'record',
-    # 2.9.3: the video player's bar
-    'startover', 'speed', 'subtitles', 'quality', 'sleep', 'pin', 'fullscreen', 'mini', 'camera')
-$script:AssetListKinds = @('folder', 'program', 'episode', 'live', 'other', 'star', 'new', 'clock')
 $script:AssetPictures = @{ continue = 'continue-watching'; watchlater = 'watch-later'; tv = 'tv'; radio = 'radio'; recent = 'recently-played'; fav = 'favourites'; new = 'new-this-week'; last = 'last-chance' }
-
-function Get-AssetList {
-    $l = New-Object System.Collections.Generic.List[string]
-    foreach ($th in 'dark', 'light') {
-        foreach ($st in $script:AssetTopStyles) { foreach ($n in $script:AssetTopNames) { $l.Add("icons/$th/$st/$n.png") } }
-        foreach ($k in $script:AssetListKinds) { $l.Add("icons/$th/list/$k.png") }
-    }
-    foreach ($n in $script:AssetPictures.Values) { $l.Add("pictures/$n.png") }
-    return $l
-}
 
 function Get-AssetFile([string] $Rel) { return (Join-Path $script:AssetsDir ($Rel -replace '/', '\')) }
 
@@ -2893,23 +2888,13 @@ function New-ScaledImage($Src, [int] $W, [int] $H, [int] $BoxH = 0) {
     return $bmp
 }
 
-function Get-AssetHash([string] $Path) {
-    # the first 16 hex digits of the file's SHA-256 (what assets.json in the repository lists)
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try { return (([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($Path)))) -replace '-', '').Substring(0, 16).ToLower() } finally { $sha.Dispose() }
-}
-
 function Start-AssetDownload {
-    # GUI only, in the background: assets.json in the repository lists every icon and picture with
-    # a hash; what is missing here or has changed there is fetched (4 at a time), then the app
-    # switches to it. Without assets.json: only what is missing. A failed file is tried next start.
+    # GUI only, in the background: assets.json in the repository gives the SHA-256 of assets.zip
+    # (every icon and picture); the zip is fetched only when that changed (Start-AssetZip). Offline,
+    # or GitHub not answering: the icons and pictures there are stay, and it is tried next start.
     if ($script:AssetRun -or -not ('System.Windows.Forms.Timer' -as [type])) { return }
-    $old = Join-Path $script:AppDataDir 'images'   # (older versions kept NRK's TV logo there)
-    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
     $wc = New-Object System.Net.WebClient; $wc.Headers['User-Agent'] = $script:UserAgent
-    $script:AssetRun = @{ Phase = 'manifest'; ManifestClient = $wc; ManifestTask = $wc.DownloadDataTaskAsync("$($script:AssetBase)/assets.json")
-                          Queue = (New-Object System.Collections.Generic.Queue[string]); Want = @{}; Busy = @{}; Got = 0; Failed = 0; FirstError = $null
-                          Timer = (New-Object System.Windows.Forms.Timer) }
+    $script:AssetRun = @{ Phase = 'manifest'; ManifestClient = $wc; ManifestTask = $wc.DownloadDataTaskAsync("$($script:AssetBase)/assets.json"); Timer = (New-Object System.Windows.Forms.Timer) }
     $script:AssetRun.Timer.Interval = 200
     $script:AssetRun.Timer.Add_Tick({ try { Update-AssetDownload } catch { Write-LogException $_ 'Assets'; $script:AssetRun.Timer.Stop() } })
     $script:AssetRun.Timer.Start()
@@ -2917,71 +2902,17 @@ function Start-AssetDownload {
 
 function Update-AssetDownload {
     $run = $script:AssetRun
-    $localFile = Join-Path $script:AssetsDir 'assets.local.json'   # what we have: name -> hash
     if ($run.Phase -eq 'zip') { if ($run.Zip.Task.IsCompleted) { Complete-AssetZip }; return }
-    if ($run.Phase -eq 'manifest') {
-        if (-not $run.ManifestTask.IsCompleted) { return }
-        $list = @{}
-        try {
-            if ($run.ManifestTask.IsFaulted) { throw $run.ManifestTask.Exception.GetBaseException() }
-            $j = [Text.Encoding]::UTF8.GetString($run.ManifestTask.Result) | ConvertFrom-Json
-            if ($j.zip -and $j.sha256) {
-                # 2.9.4: everything in one zip (assets.zip); fetched only when its hash changed
-                try { $run.ManifestClient.Dispose() } catch { }
-                Start-AssetZip $j
-                return
-            }
-            foreach ($p in $j.files.PSObject.Properties) { if ($p.Name -match '^(icons|pictures)/[\w\-/]+\.png$') { $list[$p.Name] = [string]$p.Value } }
-            Write-Log DEBUG "Assets: assets.json lists $($list.Count) file(s)"
-        } catch {
-            Write-Log DEBUG "Assets: no assets.json ($($_.Exception.Message)); fetching only what is missing"
-            foreach ($r in (Get-AssetList)) { $list[$r] = '' }
-        }
-        try { $run.ManifestClient.Dispose() } catch { }
-        $have = @{}
-        $lj = Read-JsonFile $localFile
-        if ($lj) { foreach ($p in $lj.PSObject.Properties) { $have[$p.Name] = [string]$p.Value } }
-        $run.Have = $have; $run.LocalFile = $localFile
-        foreach ($r in $list.Keys) {
-            $f = Get-AssetFile $r
-            $exists = Test-Path -LiteralPath $f
-            if ($exists -and $list[$r] -and -not $have[$r]) { try { $have[$r] = Get-AssetHash $f } catch { } }   # (fetched before there was a list)
-            if (-not $exists -or ($list[$r] -and $have[$r] -ne $list[$r])) { $run.Queue.Enqueue($r); $run.Want[$r] = $list[$r] }
-        }
-        if (-not $run.Queue.Count) { $run.Timer.Stop(); $run.Timer.Dispose(); Save-AssetLocal; return }
-        Write-Log INFO "Assets: fetching $($run.Queue.Count) new or changed icon(s)/picture(s) from $($script:AssetBase)"
-        $run.Phase = 'files'
-    }
-    foreach ($rel in @($run.Busy.Keys)) {
-        $j = $run.Busy[$rel]
-        if (-not $j.Task.IsCompleted) { continue }
-        $run.Busy.Remove($rel)
-        try {
-            if ($j.Task.IsFaulted -or $j.Task.IsCanceled) { throw $(if ($j.Task.Exception) { $j.Task.Exception.GetBaseException() } else { 'cancelled' }) }
-            $b = $j.Task.Result
-            if (-not $b -or $b.Length -lt 8 -or $b[0] -ne 0x89 -or $b[1] -ne 0x50) { throw 'not a PNG' }
-            $f = Get-AssetFile $rel
-            New-Item -ItemType Directory -Path (Split-Path -Parent $f) -Force | Out-Null
-            [IO.File]::WriteAllBytes("$f.part", $b); Move-Item -LiteralPath "$f.part" -Destination $f -Force
-            $run.Have[$rel] = if ($run.Want[$rel]) { $run.Want[$rel] } else { Get-AssetHash $f }
-            $run.Got++
-        } catch { $run.Failed++; if (-not $run.FirstError) { $run.FirstError = "${rel}: $(if ($_.Exception.Message) { $_.Exception.Message } else { $_ })" } }
-        finally { try { $j.Client.Dispose() } catch { } }
-    }
-    while ($run.Busy.Count -lt 4 -and $run.Queue.Count) {
-        $rel = $run.Queue.Dequeue()
-        try {
-            $c = New-Object System.Net.WebClient
-            $c.Headers['User-Agent'] = $script:UserAgent
-            $run.Busy[$rel] = @{ Client = $c; Task = $c.DownloadDataTaskAsync("$($script:AssetBase)/$rel") }
-        } catch { $run.Failed++ }
-    }
-    if (-not $run.Busy.Count -and -not $run.Queue.Count) {
-        $run.Timer.Stop(); $run.Timer.Dispose()
-        Save-AssetLocal
-        Write-Log $(if ($run.Failed) { 'WARN' } else { 'INFO' }) ("Assets: {0} saved in {1}{2}" -f $run.Got, $script:AssetsDir, $(if ($run.Failed) { ", $($run.Failed) failed (first: $($run.FirstError)); tried again next start" } else { '' }))
-        if ($run.Got) { try { Update-AssetPictures } catch { Write-LogException $_ 'Assets' } }
-    }
+    if (-not $run.ManifestTask.IsCompleted) { return }
+    $j = $null
+    try {
+        if ($run.ManifestTask.IsFaulted -or $run.ManifestTask.IsCanceled) { throw $(if ($run.ManifestTask.Exception) { $run.ManifestTask.Exception.GetBaseException() } else { 'cancelled' }) }
+        $j = [Text.Encoding]::UTF8.GetString($run.ManifestTask.Result) | ConvertFrom-Json
+    } catch { Write-Log DEBUG "Assets: assets.json not read ($($_.Exception.Message)); keeping the icons and pictures there are" }
+    finally { try { $run.ManifestClient.Dispose() } catch { } }
+    if ($j -and $j.zip -and $j.sha256) { Start-AssetZip $j; return }
+    if ($j) { Write-Log WARN 'Assets: assets.json on GitHub is not the zip kind (format "zip", zip, sha256); keeping the icons and pictures there are' }
+    $run.Timer.Stop(); $run.Timer.Dispose()
 }
 
 function Start-AssetZip($Manifest) {
@@ -3046,13 +2977,6 @@ function Complete-AssetZip {
         Remove-Item -LiteralPath $new -Recurse -Force -ErrorAction SilentlyContinue
         if (-not (Test-Path -LiteralPath $script:AssetsDir) -and (Test-Path -LiteralPath $old)) { Rename-Item -LiteralPath $old -NewName 'assets' -ErrorAction SilentlyContinue }
     } finally { try { $z.Client.Dispose() } catch { } }
-}
-
-function Save-AssetLocal {
-    $run = $script:AssetRun
-    if (-not $run.Have) { return }
-    $o = [ordered]@{}; foreach ($k in ($run.Have.Keys | Sort-Object)) { if ($run.Have[$k]) { $o[$k] = $run.Have[$k] } }
-    Write-JsonFile $run.LocalFile $o
 }
 
 function Update-AssetPictures {
@@ -5154,6 +5078,7 @@ function Import-AppBackup([string] $Path) {
         }
     } finally { $zip.Dispose() }
     $script:SettingsMem.Stamp = ''; $script:Favs = $null; $script:PosMap = $null; $script:Excluded = $null; $script:ExcludedVer++
+    $script:WatchLaterMem = $null; $script:RecentChMem = $null; $script:Cont = $null; $script:Stats = $null; $script:SeriesPrefs = $null   # (2.9.x lists: read again)
     Write-Log INFO "Restore: $n file(s) from $Path (the previous ones: $safety)"
     return $n
 }
@@ -5525,7 +5450,11 @@ function Start-ContinueNextJob {
     } { param($err) $script:ContNextJob = $null; $script:ContNextAt = Get-Date; Write-LogException $err 'Continue watching (next episodes)' }
 }
 
-function Get-WatchLaterRecords { $j = Read-JsonFile $script:WatchLaterFile; if ($j) { return @($j.Items | Where-Object { $_ -and $_.Key }) } else { return @() } }
+function Get-WatchLaterRecords {
+    # (kept in memory: read from the file once; Set-WatchLater updates both)
+    if ($null -eq $script:WatchLaterMem) { $j = Read-JsonFile $script:WatchLaterFile; $script:WatchLaterMem = if ($j) { @($j.Items | Where-Object { $_ -and $_.Key }) } else { @() } }
+    return @($script:WatchLaterMem)
+}
 function Get-WatchLaterFiles {
     @(foreach ($r in (Get-WatchLaterRecords)) {
         $f = ConvertFrom-FileRecord $r.File
@@ -5533,7 +5462,7 @@ function Get-WatchLaterFiles {
         $f
     })
 }
-function Test-WatchLater($File) { if (-not (Test-PosFile $File)) { return $false }; $k = Get-FileKey $File; return [bool]@(Get-WatchLaterRecords | Where-Object { $_.Key -eq $k }).Count }
+function Test-WatchLater($File) { if (-not (Test-PosFile $File)) { return $false }; $k = Get-FileKey $File; foreach ($r in (Get-WatchLaterRecords)) { if ($r.Key -eq $k) { return $true } }; return $false }
 function Set-WatchLater([object[]] $Files, [bool] $On) {
     $list = New-Object System.Collections.ArrayList; foreach ($r in (Get-WatchLaterRecords)) { [void]$list.Add($r) }
     $n = 0
@@ -5545,6 +5474,7 @@ function Set-WatchLater([object[]] $Files, [bool] $On) {
     }
     if (-not $n) { return }
     Write-JsonFile $script:WatchLaterFile ([ordered]@{ Items = @($list) })
+    $script:WatchLaterMem = @($list)
     if ($script:WatchLaterNode) { $script:WatchLaterNode.Text = 'Watch later   ({0})' -f $list.Count }
     Set-Status ('{0} {1} Watch later' -f $n, $(if ($On) { 'added to' } else { 'removed from' }))
     if ((Get-FolderTag).Kind -eq 'watchlater') { Open-Folder $folderTree.SelectedNode }
@@ -6174,7 +6104,21 @@ function Open-Folder {
             Set-Status $(if ($script:Files.Count) { 'Recently played: {0}  ·  newest first  ·  double-click to play again' -f $script:Files.Count } else { 'Nothing played yet' })
         }
         'continue' {
-            $script:Files = @(Get-ContinueFiles | Where-Object { Test-ChildAllowed $_ -Quiet })
+            $all = @(Get-ContinueFiles)
+            if (Test-ChildMode) {
+                # (child mode: what has a known rating now; the others are looked up in the background)
+                $unknown = @($all | Where-Object { -not $script:AgeCache.ContainsKey((Get-FileKey $_)) })
+                if ($unknown.Count -and -not $script:ContAgeJob) {
+                    $script:ContAgeJob = Start-ApiJob 'Continue watching (age ratings)' { param($l) foreach ($f in $l) { [void](Get-AgeRating $f) } } {
+                        param($r, $l)
+                        $script:ContAgeJob = $null
+                        foreach ($f in $l) { $k = Get-FileKey $f; if (-not $script:AgeCache.ContainsKey($k)) { $script:AgeCache[$k] = '' } }
+                        if ((Get-FolderTag).Kind -eq 'continue') { Open-Folder $folderTree.SelectedNode }
+                    } { param($err) $script:ContAgeJob = $null } $unknown
+                }
+                $all = @($all | Where-Object { $script:AgeCache.ContainsKey((Get-FileKey $_)) -and (Test-ChildAllowed $_ -Quiet) })
+            }
+            $script:Files = $all
             Set-Status $(if ($script:Files.Count) { 'Continue watching: {0}  ·  started ones first, then the next episode of series you watch' -f $script:Files.Count } else { 'Nothing started yet: what you stop halfway shows up here' })
             Start-ContinueNextJob
         }
@@ -7493,6 +7437,7 @@ function Start-Player {
     # (whether this play came from the selected file in the list)
     $listFile = if (-not $Target) { $script:SelectedFile } else { $null }
     $playTarget = if ($Target) { $Target } else { Get-PlayTarget }
+    if ($playTarget -and $playTarget.File -and (Request-AgeRating $playTarget.File 'video' @{ Target = $playTarget; FromQueue = [bool]$FromQueue })) { return }   # (child mode: looked up first)
     if ($playTarget -and $playTarget.File -and -not (Test-ChildAllowed $playTarget.File)) { return }   # (child mode: too old for it)
     if ($playTarget -and $playTarget.Audio) { Start-AudioPlayer $playTarget.Audio; return }   # radio: audio bar, no window
     if (-not $FromQueue) { Set-VideoQueue $(if ($playTarget) { $playTarget.File } else { $null }) }
@@ -8241,6 +8186,7 @@ function Start-AudioPlayer {
     # Plays a radio channel or recording in the audio bar.
     param($File, [switch] $FromQueue)
     if (-not $File -or -not $File.ManifestPath) { return }
+    if (Request-AgeRating $File 'audio' @{ FromQueue = [bool]$FromQueue }) { return }   # (child mode: looked up first)
     if (-not (Test-ChildAllowed $File)) { return }
     Write-Log INFO "UI: listen $($File.Type) $($File.Id) ($($File.ManifestPath))"
     if (-not (Initialize-WebView2)) {
@@ -8966,6 +8912,7 @@ function Test-CastableFile($File) { return [bool]($File -and $File.Type -in 'epi
 
 function Start-Cast($Device, $File, [object[]] $Queue = $null, [int] $Index = -1, $QueueNode = $null) {
     if (-not $Device -or -not (Test-CastableFile $File) -or -not (Initialize-Cast)) { return }
+    if (Request-AgeRating $File 'cast' @{ Device = $Device; Queue = $Queue; Index = $Index; QueueNode = $QueueNode }) { return }   # (child mode: looked up first)
     if (-not (Test-ChildAllowed $File)) { return }
     if ($script:Cast.Session) { Stop-Cast -Quiet }
     $res = @{ M = $null }
@@ -10156,8 +10103,29 @@ function Get-AgeRating($File) {
             $age = if ([string](Get-Prop $body 'status') -eq 'exempt') { 'A' } else { [string](Get-Prop (Get-Prop $body 'rating') 'displayAge') }
         } catch { }
     }
+    if ($script:ApiJob -and $script:ApiJob.Need) { return '' }   # (a background job: the page comes first, then it asks again)
     $script:AgeCache[$k] = $age
     return $age
+}
+
+function Request-AgeRating($File, [string] $Then, [hashtable] $State) {
+    # 2.9.10: child mode and the age rating not known yet: it is looked up in the background (the
+    # window doesn't wait), then $Then runs again: 'video' (Start-Player), 'audio' (Start-AudioPlayer)
+    # or 'cast' (Start-Cast). $true = the caller stops now.
+    if (-not (Test-ChildMode) -or -not $File -or $script:AgeCache.ContainsKey((Get-FileKey $File))) { return $false }
+    Set-Status "Checking the age rating of $($File.Title)..."
+    $State.File = $File; $State.Then = $Then
+    [void](Start-ApiJob "Age rating $($File.Title)" { param($st) Get-AgeRating $st.File } {
+        param($r, $st)
+        $k = Get-FileKey $st.File
+        if (-not $script:AgeCache.ContainsKey($k)) { $script:AgeCache[$k] = '' }   # (looked up, nothing found: unknown)
+        switch ($st.Then) {
+            'video' { Start-Player -Target $st.Target -FromQueue:([bool]$st.FromQueue) }
+            'audio' { Start-AudioPlayer $st.File -FromQueue:([bool]$st.FromQueue) }
+            'cast'  { Start-Cast $st.Device $st.File $st.Queue $st.Index $st.QueueNode }
+        }
+    } { param($err, $st) $script:AgeCache[(Get-FileKey $st.File)] = ''; Write-LogException $err "Age rating $($st.File.Title)"; Set-Status "Could not check the age rating of $($st.File.Title)" } $State)
+    return $true
 }
 
 function Test-ChildAllowed($File, [switch] $Quiet) {
@@ -14248,16 +14216,18 @@ function Add-RecentChannel($Channel) {
     $key = "$($medium):$($Channel.Id)"
     $list = New-Object System.Collections.ArrayList
     $j = Read-JsonFile $script:RecentChFile
-    if ($j) { foreach ($x in @($j.Items)) { if ($x -and $x.Key -ne $key) { [void]$list.Add($x) } } }
+    if ($j) { foreach ($x in @($j.Items)) { if ($x -and $x.Key -and $x.Key -ne $key) { [void]$list.Add($x) } } }
     $list.Insert(0, [pscustomobject]@{ Key = $key; Title = [string]$Channel.Title })
     while ($list.Count -gt 8) { $list.RemoveAt($list.Count - 1) }
     Write-JsonFile $script:RecentChFile ([ordered]@{ Items = @($list) })
+    $script:RecentChMem = @($list)
     Update-JumpList
 }
 
 function Get-RecentChannels {
-    $j = Read-JsonFile $script:RecentChFile
-    $l = @(if ($j) { @($j.Items | Where-Object { $_ -and $_.Key }) })
+    # (kept in memory: read from the file once; Add-RecentChannel updates both)
+    if ($null -eq $script:RecentChMem) { $j = Read-JsonFile $script:RecentChFile; $script:RecentChMem = @(if ($j) { @($j.Items | Where-Object { $_ -and $_.Key }) }) }
+    $l = @($script:RecentChMem)
     if (-not $l.Count) { $l = @([pscustomobject]@{ Key = 'radio:p1'; Title = 'NRK P1' }, [pscustomobject]@{ Key = 'radio:p3'; Title = 'NRK P3' }, [pscustomobject]@{ Key = 'radio:mp3'; Title = 'NRK mP3' }, [pscustomobject]@{ Key = 'tv:nrk1'; Title = 'NRK1' }) }
     return $l
 }
@@ -14904,11 +14874,30 @@ function Show-OptionsWindow {
     $ui.AlarmCh = New-Object System.Windows.Forms.ComboBox; $ui.AlarmCh.DropDownStyle = 'DropDownList'; $ui.AlarmCh.FlatStyle = 'Flat'; $ui.AlarmCh.Width = 260; $ui.AlarmCh.BackColor = $T.Surface; $ui.AlarmCh.ForeColor = $T.Text
     [void](& $add $ui.AlarmCh 220 184)
     $ui.AlarmChIds = @()
-    $chs = @(); try { $chs = @(Get-Cached 'radio:live' { Get-NrkLiveChannels -Medium radio }) } catch { }
-    if (-not $chs.Count) { $chs = @([pscustomobject]@{ Id = [string]$st.AlarmChannel; Title = [string]$st.AlarmChannelTitle }) }
-    foreach ($c in $chs) { [void]$ui.AlarmCh.Items.Add([string]$c.Title); $ui.AlarmChIds += [string]$c.Id }
-    $ui.AlarmCh.SelectedIndex = [Math]::Max(0, [array]::IndexOf($ui.AlarmChIds, [string]$st.AlarmChannel))
-    $ui.AlarmCh.Add_SelectedIndexChanged({ $s = Get-AppSettings; $s.AlarmChannel = $script:OptUi.AlarmChIds[$this.SelectedIndex]; $s.AlarmChannelTitle = [string]$this.SelectedItem; Save-AppSettings $s; Write-Log INFO "Option AlarmChannel = $($s.AlarmChannel)" })
+    # the channels: what the app already has; otherwise the chosen one now, and the list fetched in
+    # the background (Options opens at once, also offline)
+    $script:OptFillChannels = {
+        param($chs)
+        $u = $script:OptUi; if (-not $u -or $u.Form.IsDisposed) { return }
+        $s0 = Get-AppSettings
+        $chs = @($chs | Where-Object { $_ -and $_.Id })
+        if (-not $chs.Count) { $chs = @([pscustomobject]@{ Id = [string]$s0.AlarmChannel; Title = [string]$s0.AlarmChannelTitle }) }
+        $u.AlarmFilling = $true
+        $u.AlarmCh.BeginUpdate(); $u.AlarmCh.Items.Clear(); $u.AlarmChIds = @()
+        foreach ($c in $chs) { [void]$u.AlarmCh.Items.Add([string]$c.Title); $u.AlarmChIds += [string]$c.Id }
+        $u.AlarmCh.SelectedIndex = [Math]::Max(0, [array]::IndexOf($u.AlarmChIds, [string]$s0.AlarmChannel))
+        $u.AlarmCh.EndUpdate(); $u.AlarmFilling = $false
+    }
+    $have = if ($script:Cache.ContainsKey('radio:live')) { @($script:Cache['radio:live']) } else { @() }
+    & $script:OptFillChannels $have
+    if (-not $have.Count) {
+        [void](Start-ApiJob 'Radio channels for Wake to radio' { ,@(Get-NrkLiveChannels -Medium radio) } {
+            param($list)
+            if (@($list).Count) { $script:Cache['radio:live'] = @($list); $script:CacheAt['radio:live'] = Get-Date }
+            & $script:OptFillChannels @($list)
+        } { param($err) Write-Log DEBUG "Wake to radio: no channel list ($($err.Exception.Message))" })
+    }
+    $ui.AlarmCh.Add_SelectedIndexChanged({ if ($script:OptUi.AlarmFilling) { return }; $s = Get-AppSettings; $s.AlarmChannel = $script:OptUi.AlarmChIds[$this.SelectedIndex]; $s.AlarmChannelTitle = [string]$this.SelectedItem; Save-AppSettings $s; Write-Log INFO "Option AlarmChannel = $($s.AlarmChannel)" })
     $ui.AlarmNext = & $muted '' 26 228 600 20
     [void](& $muted 'The PC must be on and NRK Browser running (in the tray is fine). The volume rises gently over 45 seconds. Sleep mode: Windows does not wake the PC for this.' 26 258 600 40)
     $bTry = New-FlatButton 'Try it now' 120; [void](& $add $bTry 24 306)
