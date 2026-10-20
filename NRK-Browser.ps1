@@ -68,12 +68,13 @@ param(
     [switch] $ShowConsole,
     [switch] $Tray,                 # start hidden in the system tray (used by "Start with Windows")
     [string] $UpdatedFrom = '',     # set by the updater when it restarts the app
-    [string] $UpdateResult = ''     # result file written by the update helper
+    [string] $UpdateResult = '',    # result file written by the update helper
+    [string] $Play = ''             # 2.9.0: start a channel, e.g. radio:p1 or tv:nrk1 (the taskbar jump list)
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion   = '2.8.5'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.9.0'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -88,6 +89,8 @@ $script:ScriptDir    = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location
 
 #region ---------- Logging ----------------------------------------------------
 
+$script:LogCount = 0          # lines logged this session (the Logs window adds only what is new)
+$script:LogBuf = New-Object System.Text.StringBuilder; $script:LogBuffered = $false
 # One log file per day (logs\NRK-Browser_<date>.log), kept for LogDays days (settings.json,
 # default 3). Removing the oldest day is deleting a file; the Logs window shows all days merged.
 function Initialize-Log {
@@ -120,19 +123,50 @@ function Initialize-Log {
     $script:LogFile = $null
 }
 
+function Add-LogText([string] $Text) {
+    # Until the main window runs (and always in the indexer) every line goes to the file at once.
+    # After that, lines are collected and written once a second (Start-LogFlushTimer): one file
+    # open per second instead of one per line. The file is opened for each write, so the indexer
+    # (another process writing the same day's file) and this app never overwrite each other.
+    if (-not $script:LogFile) { return }
+    if ($script:LogBuffered) { [void]$script:LogBuf.Append($Text); if ($script:LogBuf.Length -gt 262144) { Close-LogWriter }; return }
+    Write-LogFileText $Text
+}
+
+function Write-LogFileText([string] $Text) {
+    $enc = New-Object Text.UTF8Encoding($false)
+    try { [IO.File]::AppendAllText($script:LogFile, $Text, $enc) }
+    catch { try { New-Item -ItemType Directory -Path (Split-Path -Parent $script:LogFile) -Force | Out-Null; [IO.File]::AppendAllText($script:LogFile, $Text, $enc) } catch { } }
+}
+
+function Close-LogWriter {
+    # write what is collected (exit, Clear log, switching off, the 1 s timer)
+    if (-not $script:LogBuf -or -not $script:LogBuf.Length) { return }
+    $t = $script:LogBuf.ToString(); [void]$script:LogBuf.Clear()
+    if ($script:LogToDisk -and $script:LogFile) { Write-LogFileText $t }
+}
+
+function Start-LogFlushTimer {
+    if ($script:IndexMode -or $script:LogFlushTimer) { return }
+    $script:LogBuffered = $true
+    $script:LogFlushTimer = New-Object System.Windows.Forms.Timer
+    $script:LogFlushTimer.Interval = 1000
+    $script:LogFlushTimer.Add_Tick({ Close-LogWriter })
+    $script:LogFlushTimer.Start()
+}
+
 function Write-LogPending {
     # lines from before logging to disk was switched on (this session) go into the file first
     if (-not $script:LogPending -or -not $script:LogPending.Count -or -not $script:LogFile) { return }
     try {
-        New-Item -ItemType Directory -Path (Split-Path -Parent $script:LogFile) -Force | Out-Null
-        [IO.File]::AppendAllText($script:LogFile, (($script:LogPending -join [Environment]::NewLine) + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false)))
+        Add-LogText (($script:LogPending -join [Environment]::NewLine) + [Environment]::NewLine)
         $script:LogPending.Clear()
     } catch { }
 }
 
 function Set-LogToDisk([bool] $On) {
     $script:LogToDisk = $On
-    if ($On) { Write-LogPending; Write-Log INFO 'Logging to disk switched on' } else { Write-Log INFO 'Logging to disk switched off (this session is kept in memory only)' }
+    if ($On) { Write-LogPending; Write-Log INFO 'Logging to disk switched on' } else { Close-LogWriter; Write-Log INFO 'Logging to disk switched off (this session is kept in memory only)' }
 }
 
 function Write-Log {
@@ -144,10 +178,9 @@ function Write-Log {
     $line = '{0} [{1,-5}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Level, $Message
     # always in memory (the Logs window's "This session"), on disk only when switched on
     if (-not $script:LogMem) { $script:LogMem = New-Object System.Collections.Generic.List[string]; $script:LogPending = New-Object System.Collections.Generic.List[string] }
-    $script:LogMem.Add($line); if ($script:LogMem.Count -gt 6000) { $script:LogMem.RemoveRange(0, 1000) }
+    $script:LogMem.Add($line); $script:LogCount++; if ($script:LogMem.Count -gt 6000) { $script:LogMem.RemoveRange(0, 1000) }
     if ($script:LogToDisk -and $script:LogFile) {
-        try { [IO.File]::AppendAllText($script:LogFile, $line + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false))) }
-        catch { try { New-Item -ItemType Directory -Path (Split-Path -Parent $script:LogFile) -Force | Out-Null; [IO.File]::AppendAllText($script:LogFile, $line + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false))) } catch { } }
+        Add-LogText ($line + [Environment]::NewLine)
     } elseif ($null -eq $script:LogToDisk -or -not $script:LogToDisk) {
         $script:LogPending.Add($line); if ($script:LogPending.Count -gt 6000) { $script:LogPending.RemoveRange(0, 1000) }
     }
@@ -157,6 +190,7 @@ function Write-Log {
 function Write-LogException {
     param($ErrorRecord, [string] $Context)
     $e = $ErrorRecord.Exception
+    if ($e -and $e.Message -eq 'NRKB-NEEDFETCH') { return }   # (a background job asking for a page: not an error)
     Write-Log ERROR ("{0}: {1}: {2}" -f $Context, $e.GetType().FullName, $e.Message)
     $inner = $e.InnerException
     while ($inner) {
@@ -446,10 +480,177 @@ function Optimize-AppCache {
     [void](Measure-CacheSize)
 }
 
+function Test-UiPump {
+    # true when a GET may keep the window alive while it waits (the main window's own thread,
+    # its message loop running, not the indexer or the self-test, and not already waiting)
+    if ($script:IndexMode -or $script:Pumping -or $script:ApiJob) { return $false }
+    if (-not ('System.Windows.Forms.Application' -as [type]) -or -not [System.Windows.Forms.Application]::MessageLoop) { return $false }
+    $f = Get-Variable -Name form -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if (-not $f -or $f.IsDisposed -or -not $f.IsHandleCreated -or $f.InvokeRequired) { return $false }
+    if (-not ('NrkInputBlock' -as [type])) {
+        if ($script:PumpFailed) { return $false }
+        try {
+            $refs = if ($PSVersionTable.PSEdition -eq 'Desktop') { @('System.Windows.Forms') }
+                    else { [AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { -not $_.IsDynamic -and $_.Location -and $_.GetName().Name -match '^System\.(Windows\.Forms(\.Primitives)?|Runtime|ComponentModel\.Primitives|Private\.CoreLib)$' } | ForEach-Object Location }
+            Add-Type -ReferencedAssemblies $refs -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+// While a GET is waiting the window still paints, but clicks and keys are held back and sent
+// again, in order, once it is done (no second action starts halfway through the first one, and
+// nothing typed or clicked meanwhile is lost). Timer ticks are skipped (they come again).
+public class NrkInputBlock : IMessageFilter {
+    struct Held { public IntPtr H; public int M; public IntPtr W; public IntPtr L; }
+    readonly List<Held> held = new List<Held>();
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, int m, IntPtr w, IntPtr l);
+    public bool PreFilterMessage(ref Message m) {
+        int x = m.Msg;
+        if (x == 0x113) return true;
+        bool input = (x >= 0x100 && x <= 0x109) || (x >= 0x200 && x <= 0x20E) || (x >= 0xA0 && x <= 0xAD);
+        if (!input) return false;
+        // (mouse moves are not kept: only where the pointer is now matters)
+        if (x != 0x200 && x != 0xA0 && held.Count < 300) held.Add(new Held { H = m.HWnd, M = x, W = m.WParam, L = m.LParam });
+        return true;
+    }
+    public void Release() {
+        foreach (var h in held) PostMessage(h.H, h.M, h.W, h.L);
+        held.Clear();
+    }
+}
+'@
+        } catch { $script:PumpFailed = $true; Write-Log DEBUG "Input filter not available, GETs wait without painting: $($_.Exception.Message)"; return $false }
+    }
+    if (-not $script:Http) {
+        try {
+            if (-not ('System.Net.Http.HttpClient' -as [type])) { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop }
+            $h = New-Object System.Net.Http.HttpClientHandler
+            $h.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+            $c = New-Object System.Net.Http.HttpClient($h)
+            $c.Timeout = [TimeSpan]::FromSeconds(30)
+            [void]$c.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', $script:UserAgent)
+            [void]$c.DefaultRequestHeaders.TryAddWithoutValidation('Accept', 'application/json')
+            $script:Http = $c
+        } catch { $script:PumpFailed = $true; return $false }
+    }
+    return $true
+}
+
+function Invoke-PumpedGet([string] $Uri) {
+    # The GET runs while the window keeps painting (no "Not responding"). Returns
+    # @{ Status; Bytes; ContentType }; throws with .Data['Status'] set on HTTP errors.
+    $script:Pumping = $true
+    $filter = New-Object NrkInputBlock
+    [System.Windows.Forms.Application]::AddMessageFilter($filter)
+    $old = $form.Cursor; $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try {
+        $task = $script:Http.GetAsync($Uri)
+        while (-not $task.IsCompleted) { [System.Windows.Forms.Application]::DoEvents(); [void]$task.Wait(15) }
+        if ($task.IsCanceled) { throw (New-Object TimeoutException("No answer from $Uri in 30 s")) }
+        if ($task.IsFaulted) { $ex = $task.Exception.GetBaseException(); throw $ex }
+        $resp = $task.Result
+        try {
+            $read = $resp.Content.ReadAsByteArrayAsync()
+            while (-not $read.IsCompleted) { [System.Windows.Forms.Application]::DoEvents(); [void]$read.Wait(15) }
+            $bytes = $read.Result
+            $status = [int]$resp.StatusCode
+            if (-not $resp.IsSuccessStatusCode) {
+                $ex = New-Object System.Net.Http.HttpRequestException(('Response status code does not indicate success: {0} ({1}).' -f $status, $resp.ReasonPhrase))
+                $ex.Data['Status'] = $status
+                throw $ex
+            }
+            $ctype = if ($resp.Content.Headers.ContentType) { [string]$resp.Content.Headers.ContentType } else { '' }
+            return @{ Status = $status; Bytes = $bytes; ContentType = $ctype }
+        } finally { $resp.Dispose() }
+    } finally {
+        [System.Windows.Forms.Application]::RemoveMessageFilter($filter)
+        try { $filter.Release() } catch { }
+        $form.Cursor = $old
+        $script:Pumping = $false
+    }
+}
+
+# ---- background jobs: NRK pages fetched without the window waiting -------------------------
+# Start-ApiJob runs $Work; whenever it needs a page that is not saved yet, Invoke-NrkApi stops it
+# (NRKB-NEEDFETCH), the page is fetched in the background and $Work runs again from the start
+# with that page at hand. When it gets through, $Done gets its result (on the window's thread).
+# $Work must only read (no changes), since it may run several times.
+$script:ApiJob = $null
+# folders that list things from many places (no "next episode", no NRK order)
+$script:MixedKinds = @('recent', 'search', 'newweek', 'expiring', 'continue', 'watchlater')
+$script:ApiJobs = [System.Collections.Generic.List[object]]::new()   # (::new: New-Object List[object] refuses hashtables in Add)
+
+function Start-ApiJob([string] $Name, [scriptblock] $Work, [scriptblock] $Done, [scriptblock] $Failed = $null, $State = $null) {
+    $job = @{ Name = $Name; Work = $Work; Done = $Done; Failed = $Failed; State = $State; Got = @{}; Need = $null; Fetch = $null; Runs = 0; Canceled = $false }
+    $script:ApiJobs.Add($job)
+    if (-not $script:ApiJobTimer) {
+        $script:ApiJobTimer = New-Object System.Windows.Forms.Timer
+        $script:ApiJobTimer.Interval = 100
+        $script:ApiJobTimer.Add_Tick({ Step-ApiJobs })
+    }
+    $script:ApiJobTimer.Start()
+    return $job
+}
+
+function Step-ApiJobs {
+    if ($script:ApiJob) { return }   # (one at a time)
+    foreach ($job in @($script:ApiJobs)) {
+        if ($job.Canceled) { [void]$script:ApiJobs.Remove($job); continue }
+        $f = $job.Fetch
+        if ($f) {
+            if (-not $f.Task.IsCompleted) {
+                if ($f.Watch.Elapsed.TotalSeconds -gt 30) { try { $f.Client.CancelAsync() } catch { } }
+                continue
+            }
+            $entry = @{}
+            if ($f.Task.IsFaulted -or $f.Task.IsCanceled) {
+                $ex = if ($f.Task.Exception) { $f.Task.Exception.GetBaseException() } else { New-Object TimeoutException("No answer from $($f.Uri) in 30 s") }
+                $code = 'n/a'; try { if ($ex.Response) { $code = [int]$ex.Response.StatusCode } } catch { }
+                Write-Log ERROR ('GET {0} FAILED (background, HTTP {1}): {2}' -f $f.Uri, $code, $ex.Message)
+                $entry.Error = $ex
+            } else {
+                $entry.Bytes = $f.Task.Result
+                Write-Log INFO ('GET {0} -> {1:N0} bytes, {2} ms (background)' -f $f.Uri, $entry.Bytes.Length, $f.Watch.ElapsedMilliseconds)
+                $cf = if ($script:AppDataDir -and (Get-ApiCacheTtl $f.Uri) -gt 0) { Get-CacheFile $f.Uri } else { $null }
+                if ($cf) { try { [void](ConvertFrom-JsonSafe -Json ([Text.Encoding]::UTF8.GetString($entry.Bytes)) -Source $f.Uri); Save-CacheFile $cf $entry.Bytes } catch { } }
+            }
+            try { $f.Client.Dispose() } catch { }
+            $job.Got[$f.Uri] = $entry; $job.Fetch = $null
+        }
+        # run it (again)
+        $job.Need = $null; $job.Runs++
+        $script:ApiJob = $job
+        $result = $null; $err = $null
+        try { $result = & $job.Work $job.State } catch { $err = $_ }
+        finally { $script:ApiJob = $null }
+        if ($job.Need -and $job.Runs -lt 400) {
+            # a page is missing (even if $Work caught the signal itself): fetch it, then run again
+            try {
+                $wc = New-Object System.Net.WebClient
+                $wc.Headers['User-Agent'] = $script:UserAgent; $wc.Headers['Accept'] = 'application/json'
+                Write-Log DEBUG "GET $($job.Need) (background: $($job.Name))"
+                $job.Fetch = @{ Uri = $job.Need; Client = $wc; Task = $wc.DownloadDataTaskAsync($job.Need); Watch = [Diagnostics.Stopwatch]::StartNew() }
+            } catch { $job.Got[$job.Need] = @{ Error = $_.Exception } }
+            continue
+        }
+        [void]$script:ApiJobs.Remove($job)
+        if ($err) { if ($job.Failed) { try { & $job.Failed $err $job.State } catch { Write-LogException $_ $job.Name } } else { Write-LogException $err $job.Name } }
+        else { try { & $job.Done $result $job.State } catch { Write-LogException $_ $job.Name } }
+    }
+    if (-not $script:ApiJobs.Count) { $script:ApiJobTimer.Stop() }
+}
+
 function Invoke-NrkApi {
     param([Parameter(Mandatory = $true)] [string] $Path)
 
     $uri = if ($Path -match '^https?://') { $Path } else { $script:ApiBase + $Path }
+    $job = $script:ApiJob
+    if ($job -and $job.Got.ContainsKey($uri)) {
+        # a background job (Start-ApiJob): this page was fetched for it meanwhile
+        $hit = $job.Got[$uri]
+        if ($hit.Error) { throw $hit.Error }
+        return (ConvertFrom-JsonSafe -Json ([Text.Encoding]::UTF8.GetString($hit.Bytes)) -Source $uri)
+    }
     $ttl = Get-ApiCacheTtl $uri
     $cacheFile = $null
     if ($ttl -gt 0 -and $script:AppDataDir) {
@@ -467,15 +668,20 @@ function Invoke-NrkApi {
             } catch { if (-not $script:IndexMode) { Write-Log DEBUG "cache entry unreadable, fetching: $uri" } }
         }
     }
+    if ($job) { if (-not $job.Need) { $job.Need = $uri }; throw 'NRKB-NEEDFETCH' }   # (fetched in the background, then the job runs again)
     Write-Log DEBUG "GET $uri"
     $sw = [Diagnostics.Stopwatch]::StartNew()
     try {
-        $resp = Invoke-WebRequest -Uri $uri -Method Get -UseBasicParsing -TimeoutSec 30 `
-            -UserAgent $script:UserAgent -Headers @{ 'Accept' = 'application/json' } -ErrorAction Stop
+        if (Test-UiPump) { $r = Invoke-PumpedGet $uri }
+        else {
+            $resp = Invoke-WebRequest -Uri $uri -Method Get -UseBasicParsing -TimeoutSec 30 `
+                -UserAgent $script:UserAgent -Headers @{ 'Accept' = 'application/json' } -ErrorAction Stop
+            $r = @{ Status = [int]$resp.StatusCode; Bytes = $resp.RawContentStream.ToArray(); ContentType = ($resp.Headers['Content-Type'] -join ',') }
+        }
     } catch {
         $sw.Stop()
         $code = 'n/a'
-        try { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } } catch { }
+        try { if ($_.Exception.Data -and $_.Exception.Data.Contains('Status')) { $code = [int]$_.Exception.Data['Status'] } elseif ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } } catch { }
         Write-Log ERROR ('GET {0} FAILED after {1} ms (HTTP {2})' -f $uri, $sw.ElapsedMilliseconds, $code)
         Write-LogException $_ 'Invoke-NrkApi'
         if ($script:IndexMode) { $err = $_; Register-IndexFetch $false $code; throw $err }   # (no stale copy: the indexer counts it as an error)
@@ -489,10 +695,10 @@ function Invoke-NrkApi {
     $sw.Stop()
 
     # Decode bytes as UTF-8 ourselves, so æ/ø/å survive on every PowerShell version.
-    $bytes = $resp.RawContentStream.ToArray()
+    $bytes = $r.Bytes
     $text  = [Text.Encoding]::UTF8.GetString($bytes)
-    $ctype = ($resp.Headers['Content-Type'] -join ',')
-    Write-Log INFO ('GET {0} -> HTTP {1}, {2:N0} bytes, {3} ms, {4}' -f $uri, [int]$resp.StatusCode, $bytes.Length, $sw.ElapsedMilliseconds, $ctype)
+    $ctype = $r.ContentType
+    Write-Log INFO ('GET {0} -> HTTP {1}, {2:N0} bytes, {3} ms, {4}' -f $uri, $r.Status, $bytes.Length, $sw.ElapsedMilliseconds, $ctype)
 
     if ($script:DumpResponses -and $script:LogDir) {
         try {
@@ -506,7 +712,7 @@ function Invoke-NrkApi {
     }
 
     $parsed = ConvertFrom-JsonSafe -Json $text -Source $uri
-    if ($cacheFile -and [int]$resp.StatusCode -eq 200) { Save-CacheFile $cacheFile $bytes }   # only when it parsed
+    if ($cacheFile -and $r.Status -eq 200) { Save-CacheFile $cacheFile $bytes }   # only when it parsed
     if ($script:IndexMode) { Register-IndexFetch $true 200 }
     return $parsed
 }
@@ -1349,7 +1555,10 @@ function Add-ToProcessPath {
     }
 }
 
-function Find-FFmpeg {
+function Find-FFmpeg([switch] $Refresh) {
+    # found once: remembered for the session (it was looked up again for every download and cast);
+    # not found: looked for again next time (it may have been installed meanwhile)
+    if ($script:FFmpegFound -and -not $Refresh -and (Test-Path -LiteralPath $script:FFmpegFound.Path)) { return $script:FFmpegFound }
     Update-PathFromRegistry
     $path = $null; $how = $null
 
@@ -1376,7 +1585,9 @@ function Find-FFmpeg {
         if ($how -ne 'PATH') { Add-ToProcessPath (Split-Path -Parent $path) }
     }
     Write-Log INFO ("FFmpeg: {0}" -f $(if ($path) { "$path [$how] $version" } else { 'not found' }))
-    [pscustomobject]@{ Found = [bool]$path; Path = $path; Source = $how; Version = $version }
+    $res = [pscustomobject]@{ Found = [bool]$path; Path = $path; Source = $how; Version = $version }
+    $script:FFmpegFound = if ($path) { $res } else { $null }
+    return $res
 }
 
 function Find-Winget {
@@ -1427,7 +1638,7 @@ function Get-DependencyStatus {
     $wg = Find-Winget
     $rt = Get-WebView2RuntimeVersion
     $sdk = Find-WebView2Sdk (Join-Path $script:AppDataDir 'webview2-sdk')
-    $ff = Find-FFmpeg
+    $ff = Find-FFmpeg -Refresh   # (the components window: always the real state)
     $hls = Find-HlsJs
 
     $rows.Add([pscustomobject]@{ Key = 'webview2-runtime'; Name = 'Microsoft Edge WebView2 Runtime'
@@ -1439,7 +1650,7 @@ function Get-DependencyStatus {
         Found = [bool]$sdk; Detail = $(if ($sdk) { Split-Path -Parent $sdk.WinForms } else { 'not downloaded' })
         Method = 'nuget'; Package = 'Microsoft.Web.WebView2'; Admin = $false })
     $rows.Add([pscustomobject]@{ Key = 'ffmpeg'; Name = 'FFmpeg'
-        Purpose = 'Saves TV programmes (MP4 with subtitles, chapters and cover) and radio recordings when you download.'
+        Purpose = 'Downloads (TV with subtitles, chapters and cover; radio as M4A, MP3 or FLAC) and casting to a TV.'
         Found = $ff.Found; Detail = $(if ($ff.Found) { $ff.Path } else { 'not installed' })
         Method = 'winget'; Package = 'Gyan.FFmpeg'; Admin = $false })
     $hlsVer = if ($hls) { Get-HlsJsInstalledVersion } else { '' }
@@ -1460,7 +1671,7 @@ function Get-DependencyStatus {
 # responsive. It reports progress through a status file and logs everything with Start-Transcript.
 $script:DependencyInstallScript = @'
 # NRK Browser installer. Runs hidden and works through a plan, one step per item:
-#   sdk-remove | sdk-install | hlsjs-remove | hlsjs-install | winget-ensure | winget-repair | pip-uninstall | pip-install
+#   sdk-remove | sdk-install | hlsjs-remove | hlsjs-install | winget-ensure | winget-repair
 #   winget-install=Id|Name | winget-install-force=Id|Name | winget-uninstall=Id|Name | note=Text
 # The app shows progress by reading
 #   -StatusPath     : one line "step|total|state|text" (state = running, done, failed)
@@ -1517,17 +1728,6 @@ function Find-Winget {
     if ($c) { return $c.Source }
     $p = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
     if (Test-Path $p) { return $p }
-    return $null
-}
-function Find-Py {
-    Update-Path
-    $c = Get-Command py -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($c) { return , @($c.Source, '-3') }
-    foreach ($p in @("$env:LOCALAPPDATA\Programs\Python\Launcher\py.exe", "$env:SystemRoot\py.exe")) { if (Test-Path $p) { return , @($p, '-3') } }
-    $c = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Where-Object { $_.Source -notmatch '\\WindowsApps\\' } | Select-Object -First 1
-    if ($c) { return , @($c.Source) }
-    $p = Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe" -ErrorAction SilentlyContinue | Select-Object -Last 1
-    if ($p) { return , @($p.FullName) }
     return $null
 }
 function Invoke-WingetBootstrap([switch] $Repair) {
@@ -1662,28 +1862,6 @@ try {
                 if ($code -ne 0) { Write-Host "    winget exit code $code - probably not installed through winget; continuing with the install" }
                 else { Write-Host '    uninstalled' }
             }
-            'pip-uninstall' {
-                Start-Step 'Uninstalling nrkdownload (pip)'
-                $py = Find-Py
-                if (-not $py) { Write-Host '    Python not found - nothing to uninstall' }
-                else {
-                    $pyArgs = @($py | Select-Object -Skip 1) + @('-m', 'pip', 'uninstall', '-y', '--disable-pip-version-check', 'nrkdownload')
-                    Write-Host "    $($py[0]) $($pyArgs -join ' ')"
-                    $code = Invoke-Logged $py[0] $pyArgs
-                    Write-Host "    pip exit code: $code"
-                }
-            }
-            'pip-install' {
-                Start-Step 'Installing nrkdownload (Python package, pip --user)'
-                $py = Find-Py
-                if (-not $py) { $problems.Add('nrkdownload: Python was not found, so pip could not run') }
-                else {
-                    $pyArgs = @($py | Select-Object -Skip 1) + @('-m', 'pip', 'install', '--user', '--upgrade', '--disable-pip-version-check', 'nrkdownload')
-                    Write-Host "    $($py[0]) $($pyArgs -join ' ')"
-                    $code = Invoke-Logged $py[0] $pyArgs
-                    if ($code -ne 0) { $problems.Add("nrkdownload: pip failed (exit $code)") }
-                }
-            }
             default { Start-Step "Unknown step '$item'"; $problems.Add("unknown plan step '$item'") }
         }
     }
@@ -1705,14 +1883,12 @@ function Get-InstallPlan {
     # Turns "install these / reinstall these" into installer steps (see the script header).
     param([string[]] $Install = @(), [string[]] $Reinstall = @(), [object[]] $Status = @())
     $plan = New-Object Collections.Generic.List[string]
-    $py = $Status | Where-Object Key -eq 'python' | Select-Object -First 1
     foreach ($k in $Reinstall) {
         switch ($k) {
             'webview2-sdk'     { $plan.Add('sdk-remove'); $plan.Add('sdk-install') }
             'hlsjs'            { $plan.Add('hlsjs-remove'); $plan.Add('hlsjs-install') }
             'webview2-runtime' { $plan.Add('note=WebView2 Runtime is part of Windows and cannot be uninstalled - reinstalling over it'); $plan.Add('winget-install-force=Microsoft.EdgeWebView2Runtime|Microsoft Edge WebView2 Runtime') }
             'ffmpeg'           { $plan.Add('winget-uninstall=Gyan.FFmpeg|FFmpeg'); $plan.Add('winget-install=Gyan.FFmpeg|FFmpeg') }
-            'python'           { $plan.Add('pip-uninstall'); $plan.Add('pip-install') }
             'winget'           { $plan.Add('winget-repair') }
         }
     }
@@ -1722,7 +1898,6 @@ function Get-InstallPlan {
             'hlsjs'            { $plan.Add('hlsjs-install') }
             'webview2-runtime' { $plan.Add('winget-install=Microsoft.EdgeWebView2Runtime|Microsoft Edge WebView2 Runtime') }
             'ffmpeg'           { $plan.Add('winget-install=Gyan.FFmpeg|FFmpeg') }
-            'python'           { if ($py -and $py.Method -eq 'winget+pip') { $plan.Add('winget-install=Python.Python.3.13|Python 3.13') }; $plan.Add('pip-install') }   # (nrkdownload supports Python 3.10-3.13)
             'winget'           { $plan.Add('winget-ensure') }
         }
     }
@@ -1879,15 +2054,15 @@ function Initialize-WebView2 {
 # indexes, every series, season and episode list, one request at a time with a pause in
 # between, and saves them in the same cache the app reads. Folders then open instantly.
 # Entries saved in the last IndexFreshHours are skipped without a request, so a stopped run
-# simply continues where it was. It also writes indexer\index.jsonl (one line per series or
-# programme), the basis for searching offline later.
+# simply continues where it was. It also writes indexer\search.tsv (one line per series,
+# programme and episode): what Search, New this week and Last chance read.
 #   indexer\status.json   progress, written by the indexer, read by the Indexer window
 #   indexer\control.json  { Command: pause | resume | stop, PaceMs } written by the window
 $script:IndexMode   = $false
 $script:IndexDir    = Join-Path $script:AppDataDir 'indexer'
 $script:IndexStatusFile  = Join-Path $script:IndexDir 'status.json'
 $script:IndexControlFile = Join-Path $script:IndexDir 'control.json'
-$script:IndexFile   = Join-Path $script:IndexDir 'index.jsonl'
+$script:IndexFile   = Join-Path $script:IndexDir 'index.jsonl'   # (older versions wrote it; removed on the next run)
 $script:SearchFile  = Join-Path $script:IndexDir 'search.tsv'    # what "search everything" looks through
 $script:EmptyFile   = Join-Path $script:IndexDir 'empty.txt'     # folders NRK has nothing in
 $script:IndexTaskName = 'NRK Browser indexer'
@@ -1896,8 +2071,16 @@ $script:IndexPaceMs = 1000
 $script:Idx = $null
 
 function Read-JsonFile([string] $Path) {
-    try { if (Test-Path -LiteralPath $Path) { return ([IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) | ConvertFrom-Json) } } catch { }
-    return $null
+    # $null when the file is not there; a damaged file is logged and kept as <name>.damaged
+    # (the app then starts that list empty instead of silently losing it)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try { return ([IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop) }
+    catch {
+        $keep = "$Path.damaged"
+        try { Copy-Item -LiteralPath $Path -Destination $keep -Force -ErrorAction Stop; $where = " (a copy is kept as $keep)" } catch { $where = '' }
+        try { Write-Log WARN ('Could not read {0}: {1}{2}' -f $Path, $_.Exception.Message, $where) } catch { }
+        return $null
+    }
 }
 
 function Write-JsonFile([string] $Path, $Object) {
@@ -1905,9 +2088,12 @@ function Write-JsonFile([string] $Path, $Object) {
         $dir = Split-Path -Parent $Path
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $tmp = "$Path.$PID.tmp"
-        [IO.File]::WriteAllText($tmp, ($Object | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($tmp, ($Object | ConvertTo-Json -Depth 12), (New-Object Text.UTF8Encoding($false)))
         Move-Item -LiteralPath $tmp -Destination $Path -Force
-    } catch { }
+    } catch {
+        Write-Log WARN ('Could not save {0}: {1}' -f $Path, $_.Exception.Message)
+        try { if ($tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } } catch { }
+    }
 }
 
 function Write-IndexStatus([switch] $Force) {
@@ -2021,9 +2207,6 @@ function Add-IndexSeries([hashtable] $Map, [string] $Key, $Item, [string] $Where
     if ($Where -and -not $Map[$Key].Where.Contains($Where)) { $Map[$Key].Where.Add($Where) }
 }
 
-function Add-IndexLine($Object) {
-    try { [IO.File]::AppendAllText($script:Idx.TmpFile, ($Object | ConvertTo-Json -Compress -Depth 5) + "`n", (New-Object Text.UTF8Encoding($false))) } catch { }
-}
 
 function Add-SearchRow {
     # one line of search.tsv: type, id, title, subtitle, series id, series title, season, kind, date,
@@ -2060,7 +2243,6 @@ function Invoke-Indexer {
         Current = ''; Fetched = 0; Cached = 0; Errors = 0; LastError = ''; Backoff = 0; Episodes = 0
         Tv = @{}; Radio = @{}; Programs = @{}
         LastFull = $(if ($prev) { $prev.LastFull } else { $null }); LastFullSeconds = $(if ($prev) { $prev.LastFullSeconds } else { $null })
-        TmpFile = Join-Path $script:IndexDir "index.$PID.tmp"
         SearchTmp = Join-Path $script:IndexDir "search.$PID.tmp"; SearchW = $null
         Empty = New-Object System.Collections.Generic.List[string]   # folders NRK has nothing in (hidden in the app)
     }
@@ -2072,7 +2254,7 @@ function Invoke-Indexer {
     Write-Log INFO ("Indexer {0} started: pace {1} ms, entries younger than {2} h are skipped" -f $script:AppVersion, $script:IndexPaceMs, ($script:IndexFreshMin / 60))
     Write-IndexStatus -Force
     try {
-        [IO.File]::WriteAllText($x.TmpFile, '', (New-Object Text.UTF8Encoding($false)))
+        Remove-Item -LiteralPath $script:IndexFile -Force -ErrorAction SilentlyContinue   # (index.jsonl from older versions: nothing reads it)
         $x.SearchW = New-Object System.IO.StreamWriter($x.SearchTmp, $false, (New-Object Text.UTF8Encoding($false)))
         $x.SearchW.WriteLine("#nrkb-search 2")
 
@@ -2136,7 +2318,6 @@ function Invoke-Indexer {
         }
         foreach ($k in $x.Programs.Keys) {
             $p = $x.Programs[$k]
-            Add-IndexLine ([ordered]@{ m = 'tv'; type = 'program'; id = $p.Item.Id; title = $p.Item.Title; desc = $p.Item.Description; cat = @($p.Where) })
             Add-SearchRow tvprogram $p.Item.Id $p.Item.Title $p.Item.Description -Rights $p.Item
         }
         # 5. TV series: seasons and episode lists
@@ -2145,7 +2326,7 @@ function Invoke-Indexer {
             $s = $x.Tv[$k]
             Invoke-IndexStep "TV $($s.Item.Title)" {
                 $info = Get-NrkSeriesInfo -SeriesId $s.Item.Id
-                $seas = @(); $total = 0
+                $total = 0
                 Add-SearchRow tvseries $s.Item.Id $s.Item.Title $s.Item.Description
                 foreach ($sea in @($info.Seasons)) {
                     if ($x.Hidden.Contains("season|$($s.Item.Id)|$($sea.Name)")) { continue }
@@ -2153,10 +2334,8 @@ function Invoke-Indexer {
                     $x.Episodes += $eps.Count; $total += $eps.Count
                     if ($eps.Count -eq 0) { $x.Empty.Add("season|$($s.Item.Id)|$($sea.Name)") }
                     foreach ($e in $eps) { Add-SearchRow tvepisode $e.Id $e.Title $e.Subtitle $s.Item.Id $s.Item.Title $sea.Name -Rights $e }
-                    $seas += [ordered]@{ name = $sea.Name; title = $sea.Title; eps = @($eps | ForEach-Object { [ordered]@{ id = $_.Id; t = $_.Title; s = $_.Subtitle } }) }
                 }
                 if ($total -eq 0) { $x.Empty.Add("series|$($s.Item.Id)") }
-                Add-IndexLine ([ordered]@{ m = 'tv'; type = 'series'; id = $s.Item.Id; title = $s.Item.Title; desc = $s.Item.Description; cat = @($s.Where); category = $info.Category; seasons = $seas })
             }
             $x.PhaseDone++
         }
@@ -2166,7 +2345,7 @@ function Invoke-Indexer {
             $s = $x.Radio[$k]
             Invoke-IndexStep "Radio $($s.Item.Title)" {
                 $info = Get-NrkRadioSeriesInfo -Kind $s.Item.Kind -Id $s.Item.Id
-                $seas = @(); $total = 0
+                $total = 0
                 $stitle = if ($info.Title) { $info.Title } else { $s.Item.Title }
                 Add-SearchRow radioseries $s.Item.Id $stitle $s.Item.Description '' '' '' $s.Item.Kind
                 foreach ($sea in @($info.Seasons)) {
@@ -2176,15 +2355,12 @@ function Invoke-Indexer {
                     $x.Episodes += $eps.Count; $total += $eps.Count
                     if ($eps.Count -eq 0) { $x.Empty.Add("radioseason|$($s.Item.Id)|$($sea.Name)") }
                     foreach ($e in $eps) { Add-SearchRow radioepisode $e.Id $e.Title $e.Description $s.Item.Id $stitle $sea.Name $s.Item.Kind $e.Date -Rights $e }
-                    $seas += [ordered]@{ name = $sea.Name; title = $sea.Title; eps = @($eps | ForEach-Object { [ordered]@{ id = $_.Id; t = $_.Title; d = $_.Date } }) }
                 }
                 if ($total -eq 0) { $x.Empty.Add("radioseries|$($s.Item.Kind)|$($s.Item.Id)") }
-                Add-IndexLine ([ordered]@{ m = 'radio'; type = $s.Item.Kind; id = $s.Item.Id; title = $s.Item.Title; desc = $s.Item.Description; cat = @($s.Where); category = $info.Category; seasons = $seas })
             }
             $x.PhaseDone++
         }
 
-        Move-Item -LiteralPath $x.TmpFile -Destination $script:IndexFile -Force
         $x.SearchW.Close(); $x.SearchW = $null
         Move-Item -LiteralPath $x.SearchTmp -Destination $script:SearchFile -Force
         # only a complete walk knows what is empty
@@ -2208,7 +2384,6 @@ function Invoke-Indexer {
         }
     } finally {
         if ($x.SearchW) { try { $x.SearchW.Close() } catch { } }
-        Remove-Item -LiteralPath $x.TmpFile -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $x.SearchTmp -Force -ErrorAction SilentlyContinue
         $x.Finished = (Get-Date).ToString('o')
         Write-IndexStatus -Force
@@ -2384,7 +2559,8 @@ try {
             }
             Write-Log INFO "Took over from version $($run.Version); continuing with $($script:AppVersion)"
         } else {
-            if (-not $Tray) { if ((Send-InstanceCommand 'SHOW') -ne 'OK') { [void]$script:ShowEvent.Set() } }
+            if ($Play) { [void](Send-InstanceCommand "PLAY $Play") }
+            elseif (-not $Tray) { if ((Send-InstanceCommand 'SHOW') -ne 'OK') { [void]$script:ShowEvent.Set() } }
             Write-Log INFO 'NRK Browser is already running: asked it to come to the front; this copy exits'
             return
         }
@@ -2643,6 +2819,162 @@ function Set-DarkTheme {
     foreach ($c in $Control.Controls) { Set-DarkTheme $c }
 }
 
+# ---- icons and pictures from the GitHub repository -----------------------------------------
+# icons\<dark|light>\<style>\<name>.png (top bar, 48 px), icons\<theme>\list\<kind>.png (44x68)
+# and pictures\<name>.png (960x540) are fetched into <app data>\assets at startup, only what is
+# missing. Until a file is there the app draws its own version.
+$script:AssetBase = 'https://raw.githubusercontent.com/{0}/refs/heads/main' -f $script:UpdateRepo
+$script:AssetsDir = Join-Path $script:AppDataDir 'assets'
+$script:AssetImgs = @{}
+$script:AssetTopStyles = @('thin', 'bold', 'solid', 'accent', 'duotone', 'ring', 'tiles', 'soft', 'muted', 'muted-hover')
+$script:AssetTopNames = @('back', 'index', 'down', 'logs', 'reload', 'options')
+$script:AssetListKinds = @('folder', 'program', 'episode', 'live', 'other', 'star', 'new', 'clock')
+$script:AssetPictures = @{ continue = 'continue-watching'; watchlater = 'watch-later'; tv = 'tv'; radio = 'radio'; recent = 'recently-played'; fav = 'favourites'; new = 'new-this-week'; last = 'last-chance' }
+
+function Get-AssetList {
+    $l = New-Object System.Collections.Generic.List[string]
+    foreach ($th in 'dark', 'light') {
+        foreach ($st in $script:AssetTopStyles) { foreach ($n in $script:AssetTopNames) { $l.Add("icons/$th/$st/$n.png") } }
+        foreach ($k in $script:AssetListKinds) { $l.Add("icons/$th/list/$k.png") }
+    }
+    foreach ($n in $script:AssetPictures.Values) { $l.Add("pictures/$n.png") }
+    return $l
+}
+
+function Get-AssetFile([string] $Rel) { return (Join-Path $script:AssetsDir ($Rel -replace '/', '\')) }
+
+function Get-AssetImage([string] $Rel) {
+    # the picture from <app data>\assets (read once; the file is not kept open), or $null
+    if ($script:AssetImgs.ContainsKey($Rel)) { return $script:AssetImgs[$Rel] }
+    $img = $null
+    $f = Get-AssetFile $Rel
+    if (Test-Path -LiteralPath $f) {
+        try { $ms = New-Object IO.MemoryStream(, [IO.File]::ReadAllBytes($f)); $img = New-Object System.Drawing.Bitmap($ms) }
+        catch { Write-Log DEBUG "Asset ${Rel}: $($_.Exception.Message)"; $img = $null }
+    }
+    $script:AssetImgs[$Rel] = $img
+    return $img
+}
+
+function Get-AssetTheme { if ($script:ThemeEffective -eq 'Light') { 'light' } else { 'dark' } }
+
+function New-ScaledImage($Src, [int] $W, [int] $H, [int] $BoxH = 0) {
+    # a new bitmap (the caller may dispose it) with $Src scaled to W x H, centred in a W x BoxH box
+    if ($BoxH -lt $H) { $BoxH = $H }
+    $bmp = New-Object System.Drawing.Bitmap($W, $BoxH)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.InterpolationMode = 'HighQualityBicubic'; $g.PixelOffsetMode = 'HighQuality'; $g.SmoothingMode = 'AntiAlias'
+    $g.DrawImage($Src, (New-Object System.Drawing.Rectangle(0, [int](($BoxH - $H) / 2), $W, $H)))
+    $g.Dispose()
+    return $bmp
+}
+
+function Get-AssetHash([string] $Path) {
+    # the first 16 hex digits of the file's SHA-256 (what assets.json in the repository lists)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return (([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($Path)))) -replace '-', '').Substring(0, 16).ToLower() } finally { $sha.Dispose() }
+}
+
+function Start-AssetDownload {
+    # GUI only, in the background: assets.json in the repository lists every icon and picture with
+    # a hash; what is missing here or has changed there is fetched (4 at a time), then the app
+    # switches to it. Without assets.json: only what is missing. A failed file is tried next start.
+    if ($script:AssetRun -or -not ('System.Windows.Forms.Timer' -as [type])) { return }
+    $old = Join-Path $script:AppDataDir 'images'   # (older versions kept NRK's TV logo there)
+    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+    $wc = New-Object System.Net.WebClient; $wc.Headers['User-Agent'] = $script:UserAgent
+    $script:AssetRun = @{ Phase = 'manifest'; ManifestClient = $wc; ManifestTask = $wc.DownloadDataTaskAsync("$($script:AssetBase)/assets.json")
+                          Queue = (New-Object System.Collections.Generic.Queue[string]); Want = @{}; Busy = @{}; Got = 0; Failed = 0; FirstError = $null
+                          Timer = (New-Object System.Windows.Forms.Timer) }
+    $script:AssetRun.Timer.Interval = 200
+    $script:AssetRun.Timer.Add_Tick({ try { Update-AssetDownload } catch { Write-LogException $_ 'Assets'; $script:AssetRun.Timer.Stop() } })
+    $script:AssetRun.Timer.Start()
+}
+
+function Update-AssetDownload {
+    $run = $script:AssetRun
+    $localFile = Join-Path $script:AssetsDir 'assets.local.json'   # what we have: name -> hash
+    if ($run.Phase -eq 'manifest') {
+        if (-not $run.ManifestTask.IsCompleted) { return }
+        $list = @{}
+        try {
+            if ($run.ManifestTask.IsFaulted) { throw $run.ManifestTask.Exception.GetBaseException() }
+            $j = [Text.Encoding]::UTF8.GetString($run.ManifestTask.Result) | ConvertFrom-Json
+            foreach ($p in $j.files.PSObject.Properties) { if ($p.Name -match '^(icons|pictures)/[\w\-/]+\.png$') { $list[$p.Name] = [string]$p.Value } }
+            Write-Log DEBUG "Assets: assets.json lists $($list.Count) file(s)"
+        } catch {
+            Write-Log DEBUG "Assets: no assets.json ($($_.Exception.Message)); fetching only what is missing"
+            foreach ($r in (Get-AssetList)) { $list[$r] = '' }
+        }
+        try { $run.ManifestClient.Dispose() } catch { }
+        $have = @{}
+        $lj = Read-JsonFile $localFile
+        if ($lj) { foreach ($p in $lj.PSObject.Properties) { $have[$p.Name] = [string]$p.Value } }
+        $run.Have = $have; $run.LocalFile = $localFile
+        foreach ($r in $list.Keys) {
+            $f = Get-AssetFile $r
+            $exists = Test-Path -LiteralPath $f
+            if ($exists -and $list[$r] -and -not $have[$r]) { try { $have[$r] = Get-AssetHash $f } catch { } }   # (fetched before there was a list)
+            if (-not $exists -or ($list[$r] -and $have[$r] -ne $list[$r])) { $run.Queue.Enqueue($r); $run.Want[$r] = $list[$r] }
+        }
+        if (-not $run.Queue.Count) { $run.Timer.Stop(); $run.Timer.Dispose(); Save-AssetLocal; return }
+        Write-Log INFO "Assets: fetching $($run.Queue.Count) new or changed icon(s)/picture(s) from $($script:AssetBase)"
+        $run.Phase = 'files'
+    }
+    foreach ($rel in @($run.Busy.Keys)) {
+        $j = $run.Busy[$rel]
+        if (-not $j.Task.IsCompleted) { continue }
+        $run.Busy.Remove($rel)
+        try {
+            if ($j.Task.IsFaulted -or $j.Task.IsCanceled) { throw $(if ($j.Task.Exception) { $j.Task.Exception.GetBaseException() } else { 'cancelled' }) }
+            $b = $j.Task.Result
+            if (-not $b -or $b.Length -lt 8 -or $b[0] -ne 0x89 -or $b[1] -ne 0x50) { throw 'not a PNG' }
+            $f = Get-AssetFile $rel
+            New-Item -ItemType Directory -Path (Split-Path -Parent $f) -Force | Out-Null
+            [IO.File]::WriteAllBytes("$f.part", $b); Move-Item -LiteralPath "$f.part" -Destination $f -Force
+            $run.Have[$rel] = if ($run.Want[$rel]) { $run.Want[$rel] } else { Get-AssetHash $f }
+            $run.Got++
+        } catch { $run.Failed++; if (-not $run.FirstError) { $run.FirstError = "${rel}: $(if ($_.Exception.Message) { $_.Exception.Message } else { $_ })" } }
+        finally { try { $j.Client.Dispose() } catch { } }
+    }
+    while ($run.Busy.Count -lt 4 -and $run.Queue.Count) {
+        $rel = $run.Queue.Dequeue()
+        try {
+            $c = New-Object System.Net.WebClient
+            $c.Headers['User-Agent'] = $script:UserAgent
+            $run.Busy[$rel] = @{ Client = $c; Task = $c.DownloadDataTaskAsync("$($script:AssetBase)/$rel") }
+        } catch { $run.Failed++ }
+    }
+    if (-not $run.Busy.Count -and -not $run.Queue.Count) {
+        $run.Timer.Stop(); $run.Timer.Dispose()
+        Save-AssetLocal
+        Write-Log $(if ($run.Failed) { 'WARN' } else { 'INFO' }) ("Assets: {0} saved in {1}{2}" -f $run.Got, $script:AssetsDir, $(if ($run.Failed) { ", $($run.Failed) failed (first: $($run.FirstError)); tried again next start" } else { '' }))
+        if ($run.Got) { try { Update-AssetPictures } catch { Write-LogException $_ 'Assets' } }
+    }
+}
+
+function Save-AssetLocal {
+    $run = $script:AssetRun
+    if (-not $run.Have) { return }
+    $o = [ordered]@{}; foreach ($k in ($run.Have.Keys | Sort-Object)) { if ($run.Have[$k]) { $o[$k] = $run.Have[$k] } }
+    Write-JsonFile $run.LocalFile $o
+}
+
+function Update-AssetPictures {
+    # new files arrived: use them everywhere now, and free the pictures they replace
+    $old = New-Object System.Collections.Generic.List[object]
+    foreach ($v in @($script:AssetImgs.Values) + @($script:Placeholders.Values) + @($script:SmallPlaceholders.Values)) { if ($v -and -not $old.Contains($v)) { $old.Add($v) } }
+    $script:AssetImgs = @{}
+    foreach ($k in @($script:Placeholders.Keys)) { $script:Placeholders.Remove($k) }
+    $script:SmallPlaceholders = @{}
+    Reset-ListIcons
+    Set-TopBarIcons
+    try { if (-not $script:SelectedFile) { $pic.Image = $null; Show-FolderPreview } } catch { }
+    try { $itemsList.Refresh(); $folderTree.Refresh() } catch { }
+    $shown = try { $pic.Image } catch { $null }
+    foreach ($v in $old) { if (-not [object]::ReferenceEquals($v, $shown)) { try { $v.Dispose() } catch { } } }
+}
+
 # ---- small drawn icons for the lists
 function New-ListIcon {
     param([string] $Kind, [int] $W = 22, [int] $H = 34)
@@ -2726,7 +3058,12 @@ $script:IconsTall.ImageSize = New-Object System.Drawing.Size(22, 52)
 $script:IconKinds = @('folder', 'program', 'episode', 'live', 'other', 'star', 'new', 'clock')
 function Reset-ListIcons {
     $script:Icons.Images.Clear(); $script:IconsTall.Images.Clear()
-    foreach ($k in $script:IconKinds) { $script:Icons.Images.Add($k, (New-ListIcon $k)); $script:IconsTall.Images.Add($k, (New-ListIcon $k 22 52)) }
+    $th = Get-AssetTheme
+    foreach ($k in $script:IconKinds) {
+        $png = Get-AssetImage "icons/$th/list/$k.png"
+        if ($png) { $script:Icons.Images.Add($k, (New-ScaledImage $png 22 34)); $script:IconsTall.Images.Add($k, (New-ScaledImage $png 22 34 52)) }
+        else { $script:Icons.Images.Add($k, (New-ListIcon $k)); $script:IconsTall.Images.Add($k, (New-ListIcon $k 22 52)) }
+    }
 }
 Reset-ListIcons
 
@@ -2735,6 +3072,15 @@ Reset-ListIcons
 $script:TopIconStyles = [ordered]@{
     text = 'Text symbols (as before)'; thin = 'Thin outline'; bold = 'Bold outline'; solid = 'Solid'; accent = 'Accent outline'
     duotone = 'Duotone (white, teal detail)'; ring = 'Ring'; tiles = 'Teal tiles'; soft = 'Soft tiles'; muted = 'Muted, lights on hover'; label = 'Icon + label'
+}
+
+function Get-TopIconPicture([string] $Kind, [string] $Style, [System.Drawing.Color] $Color, [int] $Size = 22, [string] $AssetStyle) {
+    # the downloaded icon (icons\<theme>\<style>\<name>.png) when it is there, otherwise drawn
+    if (-not $AssetStyle) { $AssetStyle = $Style }
+    $name = if ($Kind -eq 'opts') { 'options' } else { $Kind }
+    $png = Get-AssetImage ("icons/{0}/{1}/{2}.png" -f (Get-AssetTheme), $AssetStyle, $name)
+    if ($png) { return (New-ScaledImage $png $Size $Size) }
+    return (New-TopIcon $Kind $Style $Color $Size)
 }
 
 function New-TopIcon([string] $Kind, [string] $Style, [System.Drawing.Color] $Color, [int] $Size = 22) {
@@ -2843,17 +3189,17 @@ function Set-TopBarIcons {
         }
         if ($style -eq 'label') {
             # the icon and the word side by side (the top bar keeps its height); wide enough for the word
-            $b.Image = New-TopIcon $d[1] 'thin' $T.Text 18
+            $b.Image = Get-TopIconPicture $d[1] 'thin' $T.Text 18
             $b.Text = $d[3]; $b.Font = $script:FontSmall; $b.ForeColor = $T.Text
             $b.TextImageRelation = 'ImageBeforeText'; $b.ImageAlign = 'MiddleLeft'; $b.TextAlign = 'MiddleRight'
             $b.Padding = New-Object System.Windows.Forms.Padding(6, 0, 8, 0)
             $b.Width = [System.Windows.Forms.TextRenderer]::MeasureText($d[3], $script:FontSmall).Width + 40
             continue
         }
-        $b.Image = New-TopIcon $d[1] $style $col $(if ($style -eq 'ring') { 30 } else { 22 })
+        $b.Image = Get-TopIconPicture $d[1] $style $col $(if ($style -eq 'ring') { 30 } else { 22 })
         if ($style -eq 'muted') {
             # grey until the mouse is over it
-            $b.Tag = @{ Off = $b.Image; On = (New-TopIcon $d[1] 'accent' $T.Accent 22) }
+            $b.Tag = @{ Off = $b.Image; On = (Get-TopIconPicture $d[1] 'accent' $T.Accent 22 'muted-hover') }
             if (-not $script:TopHoverWired) { }
         }
     }
@@ -3012,20 +3358,41 @@ $script:SettingDefaults = [ordered]@{
     FilesView = 'list'   # files list: list (rows) or grid (thumbnails)
     ChildMode = $false; ChildMaxAge = 'A'; ChildPin = ''   # child mode: only NRK Super, up to this age; the PIN (hashed) to leave it
     TopIcons = 'text'   # top bar icons: text, thin, bold, solid, accent, duotone, ring, tiles, soft, muted, label
+    # ---- 2.9.0 (see CHANGES-2.9.0.md) ----
+    SubColor = 'white'; SubBg = 'box'; SubPos = 'bottom'   # built-in player subtitles: colour, background, height
+    UpNextCard = $true; UpNextSeconds = 10   # end of an episode: a card that counts down to the next one (off: straight on, as before)
+    SleepFade = $true   # sleep timer: lower the volume over the last minute
+    NowPlaying = $true   # live radio: the song playing now (when NRK tells)
+    AlarmOn = $false; AlarmTime = '07:00'; AlarmDays = '1,2,3,4,5'; AlarmChannel = 'p1'; AlarmChannelTitle = 'NRK P1'; AlarmLast = ''   # wake to radio
+    RecordDir = ''   # recordings of live TV / radio ('' = <download folder>\Recordings)
+    DlNameTv = ''; DlNameRadio = ''   # file-name templates ('' = the built-in names)
+    Hotkeys = $true; HotkeyMap = ''   # global hotkeys (work while the app is in the background); HotkeyMap: JSON, '' = the defaults
+    KeyMap = ''   # in-app shortcuts (JSON, '' = the defaults)
+    RemoteOn = $false; RemoteKey = ''   # phone remote (a page on your network)
+    StatsOn = $true   # count what you watch and listen to (Statistics)
+    SkipSilence = $false; VoiceBoost = $false   # radio bar: quiet parts faster; clearer speech
+    TaskbarButtons = $true   # Previous / Play-Pause / Next under the taskbar preview, and the jump list
 }
 # Settings are read from disk only when settings.json changed (another copy, the indexer or
 # an edit by hand): otherwise the last read is reused. Each caller gets its own copy.
 $script:SettingsMem = @{ Stamp = ''; Values = $null }
 function Get-AppSettings {
+    # In memory: Save-AppSettings (and a restore) start a fresh read; the file itself is looked at
+    # at most every 10 s (for a change made outside the app), not on every call.
+    if ($script:SettingsMem.Stamp -and $script:SettingsMem.Values -and $script:SettingsMem.CheckedAt -and ([Environment]::TickCount - $script:SettingsMem.CheckedAt) -lt 10000 -and ([Environment]::TickCount - $script:SettingsMem.CheckedAt) -ge 0) {
+        $copy = [ordered]@{}; foreach ($k in $script:SettingsMem.Values.Keys) { $copy[$k] = $script:SettingsMem.Values[$k] }
+        return [pscustomobject]$copy
+    }
     $stamp = ''
     try { $fi = New-Object IO.FileInfo($script:SettingsFile); if ($fi.Exists) { $stamp = '{0}|{1}' -f $fi.LastWriteTimeUtc.Ticks, $fi.Length } else { $stamp = 'none' } } catch { }
+    $script:SettingsMem.CheckedAt = [Environment]::TickCount
     if ($stamp -and $stamp -eq $script:SettingsMem.Stamp -and $script:SettingsMem.Values) {
         $copy = [ordered]@{}; foreach ($k in $script:SettingsMem.Values.Keys) { $copy[$k] = $script:SettingsMem.Values[$k] }
         return [pscustomobject]$copy
     }
     $r = Read-AppSettingsFile
     $vals = [ordered]@{}; foreach ($p in $r.PSObject.Properties) { $vals[$p.Name] = $p.Value }
-    $script:SettingsMem = @{ Stamp = $stamp; Values = $vals }
+    $script:SettingsMem = @{ Stamp = $stamp; Values = $vals; CheckedAt = [Environment]::TickCount }
     return $r
 }
 function Read-AppSettingsFile {
@@ -3058,7 +3425,7 @@ function Save-AppSettings($Settings) {
     # never half-written: write a new file next to it, then swap it in (the old one stays as .bak)
     try {
         New-Item -ItemType Directory -Path $script:AppDataDir -Force | Out-Null
-        $json = $Settings | ConvertTo-Json -Depth 4
+        $json = $Settings | ConvertTo-Json -Depth 12
         $tmp = "$($script:SettingsFile).$PID.tmp"
         [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding($false)))
         if (Test-Path -LiteralPath $script:SettingsFile) {
@@ -3172,7 +3539,6 @@ function Get-DependencyHow {
             'hlsjs'            { 'Reinstall: delete hls.min.js  ->  download it again (cdn.jsdelivr.net)' }
             'webview2-runtime' { 'Reinstall: winget install --force (it is part of Windows and cannot be uninstalled)' }
             'ffmpeg'           { 'Reinstall: winget uninstall Gyan.FFmpeg  ->  winget install Gyan.FFmpeg' }
-            'python'           { 'Reinstall: pip uninstall nrkdownload  ->  pip install --user nrkdownload' }
             'winget'           { 'Repair: re-register App Installer  ->  Repair-WinGetPackageManager' }
         }
         return
@@ -3181,8 +3547,6 @@ function Get-DependencyHow {
         'winget'     { "Install: winget install $($Row.Package)" }
         'nuget'      { 'Install: download from nuget.org (official Microsoft package)' }
         'download'   { "Install: download hls.min.js $($script:HlsJsVersion) from cdn.jsdelivr.net (open-source, Apache 2.0)" }
-        'pip'        { 'Install: py -m pip install --user nrkdownload' }
-        'winget+pip' { "Install: winget install $($Row.Package)  +  pip install --user nrkdownload" }
         'bootstrap'  { 'Install: re-register App Installer, or Microsoft.WinGet.Client from the PowerShell Gallery' }
     }
     if ($Row.Admin) { $how += '   (Windows may ask for administrator approval)' }
@@ -3585,7 +3949,9 @@ $miFQueueClear = New-ThemedMenuItem 'Clear the radio queue'
 $miFView = New-ThemedMenuItem 'Show as thumbnails    (Ctrl+G)'
 $miFWatched = New-ThemedMenuItem 'Mark as watched'
 $miFUnwatched = New-ThemedMenuItem 'Mark as not watched'
-[void]$filesMenu.Items.AddRange(@($miFPlay, $miFPlayNext, $miFQueue, $miFQueueClear, $miFDownload, $miFFav, $miFWatched, $miFUnwatched, (New-Object System.Windows.Forms.ToolStripSeparator), $miFWeb, $miFCopy, (New-Object System.Windows.Forms.ToolStripSeparator), $miFView, $miFHide))
+$miFLater = New-ThemedMenuItem 'Watch later'
+$miFRecord = New-ThemedMenuItem 'Record...'
+[void]$filesMenu.Items.AddRange(@($miFPlay, $miFPlayNext, $miFQueue, $miFQueueClear, $miFDownload, $miFLater, $miFRecord, $miFFav, $miFWatched, $miFUnwatched, (New-Object System.Windows.Forms.ToolStripSeparator), $miFWeb, $miFCopy, (New-Object System.Windows.Forms.ToolStripSeparator), $miFView, $miFHide))
 $treeMenu = New-ThemedMenu
 $miTDownload = New-ThemedMenuItem 'Download'
 $miTOpen = New-ThemedMenuItem 'Open'
@@ -3596,7 +3962,9 @@ $miTFav = New-ThemedMenuItem 'Add to favourites'
 $miTFollow = New-ThemedMenuItem 'Follow (download new episodes by themselves)'
 $miTCheckFollow = New-ThemedMenuItem 'Check followed series for new episodes now'
 $miTFeed = New-ThemedMenuItem 'Copy the podcast feed address (RSS)'
-[void]$treeMenu.Items.AddRange(@($miTOpen, $miTDownload, $miTFav, $miTFollow, $miTCheckFollow, $miTFeed, $miTClearRecent, $miTCloseSearch, $miTHide))
+$miTFollowNotify = New-ThemedMenuItem 'Follow (only tell me about new episodes)'
+$miTOpml = New-ThemedMenuItem 'Export the podcasts (OPML)...'
+[void]$treeMenu.Items.AddRange(@($miTOpen, $miTDownload, $miTFav, $miTFollow, $miTFollowNotify, $miTCheckFollow, $miTFeed, $miTOpml, $miTClearRecent, $miTCloseSearch, $miTHide))
 
 # ---- content panel: preview card on top, a divider, then details below
 #      (+ today's schedule for live channels)
@@ -4070,6 +4438,8 @@ function Initialize-Tree {
     $script:SearchNode = $null
     Read-KnownEmpty
     $script:RecentNode = New-FolderNode 'Recently played' @{ Kind = 'recent'; Title = 'Recently played' } 'other'
+    $script:ContinueNode = New-FolderNode 'Continue watching' @{ Kind = 'continue'; Title = 'Continue watching' } 'episode'
+    $script:WatchLaterNode = New-FolderNode ('Watch later   ({0})' -f @(Get-WatchLaterRecords).Count) @{ Kind = 'watchlater'; Title = 'Watch later' } 'program'
     $script:FavNode = New-FolderNode 'Favourites' @{ Kind = 'favourites'; Title = 'Favourites' } 'star'
     $script:NewNode = New-FolderNode 'New this week' @{ Kind = 'newweek'; Title = 'New this week' } 'new'
     $script:LastNode = New-FolderNode 'Last chance' @{ Kind = 'expiring'; Title = 'Last chance' } 'clock'
@@ -4088,8 +4458,8 @@ function Initialize-Tree {
     $script:RadioLettersNode = New-FolderNode ('A {0} Å' -f [char]0x2013) @{ Kind = 'group'; Title = 'Radio A - Å' }
     $script:RadioCatsNode = New-FolderNode 'Categories' @{ Kind = 'group'; Title = 'Radio categories' }
     if ($child) { [void]$script:RadioNode.Nodes.Add($script:RadioCatsNode) } else { [void]$script:RadioNode.Nodes.AddRange(@($script:RadioCatsNode, $script:RadioLettersNode)) }
-    if ($child) { [void]$folderTree.Nodes.AddRange(@($script:RecentNode, $script:FavNode, $script:TvLiveNode, $script:RadioLiveNode, $script:TvNode, $script:RadioNode)) }
-    else { [void]$folderTree.Nodes.AddRange(@($script:RecentNode, $script:FavNode, $script:NewNode, $script:LastNode, $script:TvLiveNode, $script:RadioLiveNode, $script:TvNode, $script:RadioNode)) }
+    if ($child) { [void]$folderTree.Nodes.AddRange(@($script:RecentNode, $script:ContinueNode, $script:FavNode, $script:TvLiveNode, $script:RadioLiveNode, $script:TvNode, $script:RadioNode)) }
+    else { [void]$folderTree.Nodes.AddRange(@($script:ContinueNode, $script:RecentNode, $script:WatchLaterNode, $script:FavNode, $script:NewNode, $script:LastNode, $script:TvLiveNode, $script:RadioLiveNode, $script:TvNode, $script:RadioNode)) }
     $folderTree.EndUpdate()
     $script:Favs = $null   # (read again: a restore may have changed it)
     Update-FavouritesNode
@@ -4239,7 +4609,7 @@ function Add-Excluded {
         $names += $f.Title
     }
     foreach ($n in $Nodes) {
-        if (-not $n -or -not $n.Tag -or $n.Tag.Kind -in 'group', 'live', 'radiolive', 'search', 'recent', 'placeholder', 'favourites', 'newweek', 'expiring') { continue }
+        if (-not $n -or -not $n.Tag -or $n.Tag.Kind -in 'group', 'live', 'radiolive', 'search', 'recent', 'placeholder', 'favourites', 'newweek', 'expiring', 'continue', 'watchlater') { continue }
         $k = Get-NodeKey $n
         $title = [string]$n.Tag.Title
         if ($n.Tag.Kind -in 'season', 'radioseason' -and $n.Parent) { $title = '{0}  ·  {1}' -f $n.Parent.Tag.Title, $title }
@@ -4864,6 +5234,8 @@ function Set-PlayPosition($File, [double] $Pos, [double] $Dur, [switch] $Ended) 
     $nearEnd = ($Dur -gt 0 -and $Pos -ge $Dur - [Math]::Min(60, $Dur * 0.05))   # the last minute (or 5 %): the credits
     $done = [bool]($Ended -or $nearEnd -or ($old -and $old.Done -and $Pos -lt 1))
     $m[$k] = [pscustomobject]@{ Key = $k; Pos = [Math]::Round($Pos, 1); Dur = [Math]::Round($Dur, 1); At = (Get-Date).ToString('o'); Done = $done; Title = [string]$File.Title }
+    try { Add-PlayStats $File $old $Pos } catch { }
+    try { Update-ContinueRecord $File $Pos $done } catch { }
     $script:PosDirty = $true
     Save-PosMap
     if (-not $old -or [bool]$old.Done -ne $done -or [Math]::Abs([double]$old.Pos - $Pos) -gt 20) { try { $itemsList.Invalidate() } catch { } }
@@ -4893,6 +5265,248 @@ function Set-Watched([object[]] $Files, [bool] $On) {
     $script:ShownCache.Key = ''
     Show-Files
     Set-Status ('{0} file(s) marked as {1}' -f $n, $(if ($On) { 'watched' } else { 'not watched' }))
+}
+
+# ---- 2.9.0: Continue watching, Watch later, statistics --------------------------------------
+# continue.json: what you started (file records, newest first); the "Continue watching" folder
+# lists the unfinished ones and, for series you finished an episode of, the next episode.
+$script:ContFile = Join-Path $script:AppDataDir 'continue.json'
+$script:Cont = $null; $script:ContNext = @(); $script:ContNextAt = [datetime]::MinValue
+$script:WatchLaterFile = Join-Path $script:AppDataDir 'watchlater.json'
+$script:StatsFile = Join-Path $script:AppDataDir 'stats.json'
+$script:Stats = $null; $script:StatsDirty = $false
+
+function Get-ContinueMap {
+    if ($null -ne $script:Cont) { return $script:Cont }
+    $m = [ordered]@{}
+    $j = Read-JsonFile $script:ContFile
+    if ($j) { foreach ($r in @($j.Items | Where-Object { $_ -and $_.Key })) { $m[[string]$r.Key] = $r } }
+    $script:Cont = $m
+    return $m
+}
+
+function Update-ContinueRecord($File, [double] $Pos, [bool] $Done) {
+    if (-not (Test-PosFile $File) -or ($Pos -lt 15 -and -not $Done)) { return }
+    $m = Get-ContinueMap; $k = Get-FileKey $File
+    $isNew = -not $m.Contains($k)
+    $old = if ($isNew) { $null } else { $m[$k] }
+    if ($old -and [bool]$old.Done -eq $Done -and ((Get-Date) - [datetime]$old.At).TotalSeconds -lt 60) { return }   # (at most once a minute)
+    $rec = [pscustomobject]@{ Key = $k; At = (Get-Date).ToString('o'); Done = $Done; File = (ConvertTo-FileRecord $File) }
+    if (-not $isNew) { $m.Remove($k) }
+    $new = [ordered]@{}; $new[$k] = $rec
+    $n = 0; foreach ($x in $m.Keys) { if ($n -ge 199) { break }; $new[$x] = $m[$x]; $n++ }
+    $script:Cont = $new
+    Write-JsonFile $script:ContFile ([ordered]@{ Items = @($new.Values) })
+    if ($Done) { $script:ContNextAt = [datetime]::MinValue }   # (the next episode changes)
+}
+
+function Get-ContinueFiles {
+    # started and not finished (newest first), then the next episode of series you are watching
+    $out = New-Object System.Collections.Generic.List[object]
+    $series = @{}
+    foreach ($r in (Get-ContinueMap).Values) {
+        $f = ConvertFrom-FileRecord $r.File
+        $rec = Get-PlayRecord $f
+        if ($f.SeriesItem -and $f.SeriesItem.Id) { if (-not $series.ContainsKey([string]$f.SeriesItem.Id)) { $series[[string]$f.SeriesItem.Id] = $r } }
+        if ($rec -and -not $rec.Done -and [double]$rec.Pos -ge 15) {
+            if ($f.SeriesItem -and $f.SeriesItem.Title -and -not $f.ListTitle) { $f | Add-Member -NotePropertyName ListTitle -NotePropertyValue ('{0}  ·  {1}' -f $f.SeriesItem.Title, $f.Title) -Force }
+            $out.Add($f)
+        }
+    }
+    foreach ($n in @($script:ContNext)) {
+        if (-not $n) { continue }
+        $dup = $false; foreach ($x in $out) { if ($x.Type -eq $n.Type -and $x.Id -eq $n.Id) { $dup = $true; break } }
+        if (-not $dup -and -not (Test-Watched $n)) { $out.Add($n) }
+    }
+    return ,@($out)
+}
+
+function Get-ContinueNextWork {
+    # (background job) the episode after the last finished one, for up to 8 series watched lately
+    $seen = @{}; $result = @()
+    foreach ($r in (Get-ContinueMap).Values) {
+        if ($seen.Count -ge 8) { break }
+        $f = ConvertFrom-FileRecord $r.File
+        if ($f.Type -ne 'episode' -or -not $f.SeriesItem -or -not $f.SeriesItem.Id) { continue }
+        $sid = [string]$f.SeriesItem.Id
+        if ($seen.ContainsKey($sid)) { continue }
+        $seen[$sid] = $true
+        if (-not $r.Done) { continue }   # (the newest of this series is not finished: it is listed itself)
+        if (((Get-Date) - [datetime]$r.At).TotalDays -gt 60) { continue }
+        $eps = @(Get-NrkSeasonEpisodes -SeriesId $sid -Season ([string]$f.Season))
+        $i = -1; for ($k = 0; $k -lt $eps.Count; $k++) { if ([string]$eps[$k].Id -eq [string]$f.Id) { $i = $k; break } }
+        $next = $null; $season = [string]$f.Season
+        if ($i -ge 0 -and $i -lt $eps.Count - 1) { $next = $eps[$i + 1] }
+        elseif ($i -ge 0) {
+            $info = Get-NrkSeriesInfo -SeriesId $sid
+            $names = @($info.Seasons | Where-Object { $_.Name -ne 'ekstramateriale' } | ForEach-Object { [string]$_.Name })
+            $si = [array]::IndexOf($names, $season)
+            if ($si -ge 0 -and $si -lt $names.Count - 1) { $season = $names[$si + 1]; $first = @(Get-NrkSeasonEpisodes -SeriesId $sid -Season $season) | Select-Object -First 1; if ($first) { $next = $first } }
+        }
+        if ($next) {
+            $nf = New-EpisodeFile $next $f.SeriesItem $season
+            $nf | Add-Member -NotePropertyName ListTitle -NotePropertyValue ('{0}  ·  next: {1}' -f $f.SeriesItem.Title, $nf.Title) -Force
+            $result += $nf
+        }
+    }
+    return ,@($result)
+}
+
+function Start-ContinueNextJob {
+    if ($script:ContNextJob -or ((Get-Date) - $script:ContNextAt).TotalMinutes -lt 10) { return }
+    $script:ContNextJob = Start-ApiJob 'Continue watching' { Get-ContinueNextWork } {
+        param($list)
+        $script:ContNextJob = $null; $script:ContNext = @($list); $script:ContNextAt = Get-Date
+        if ((Get-FolderTag).Kind -eq 'continue' -and @($list).Count) { Open-Folder $folderTree.SelectedNode }
+    } { param($err) $script:ContNextJob = $null; $script:ContNextAt = Get-Date; Write-LogException $err 'Continue watching (next episodes)' }
+}
+
+function Get-WatchLaterRecords { $j = Read-JsonFile $script:WatchLaterFile; if ($j) { return @($j.Items | Where-Object { $_ -and $_.Key }) } else { return @() } }
+function Get-WatchLaterFiles {
+    @(foreach ($r in (Get-WatchLaterRecords)) {
+        $f = ConvertFrom-FileRecord $r.File
+        if ($f.SeriesItem -and $f.SeriesItem.Title -and -not $f.ListTitle -and $f.Type -eq 'episode') { $f | Add-Member -NotePropertyName ListTitle -NotePropertyValue ('{0}  ·  {1}' -f $f.SeriesItem.Title, $f.Title) -Force }
+        $f
+    })
+}
+function Test-WatchLater($File) { if (-not (Test-PosFile $File)) { return $false }; $k = Get-FileKey $File; return [bool]@(Get-WatchLaterRecords | Where-Object { $_.Key -eq $k }).Count }
+function Set-WatchLater([object[]] $Files, [bool] $On) {
+    $list = [System.Collections.Generic.List[object]]::new(); foreach ($r in (Get-WatchLaterRecords)) { $list.Add($r) }
+    $n = 0
+    foreach ($f in @($Files | Where-Object { Test-PosFile $_ })) {
+        $k = Get-FileKey $f
+        $had = @($list | Where-Object { $_.Key -eq $k })
+        if ($On -and -not $had.Count) { $list.Insert(0, [pscustomobject]@{ Key = $k; Added = (Get-Date).ToString('o'); File = (ConvertTo-FileRecord $f) }); $n++ }
+        elseif (-not $On -and $had.Count) { foreach ($h in $had) { [void]$list.Remove($h) }; $n++ }
+    }
+    if (-not $n) { return }
+    Write-JsonFile $script:WatchLaterFile ([ordered]@{ Items = @($list) })
+    if ($script:WatchLaterNode) { $script:WatchLaterNode.Text = 'Watch later   ({0})' -f $list.Count }
+    Set-Status ('{0} {1} Watch later' -f $n, $(if ($On) { 'added to' } else { 'removed from' }))
+    if ((Get-FolderTag).Kind -eq 'watchlater') { Open-Folder $folderTree.SelectedNode }
+}
+
+# statistics: content time played, per day, medium and series (stats.json; Options > About > Statistics)
+function Get-Stats {
+    if ($null -ne $script:Stats) { return $script:Stats }
+    $j = Read-JsonFile $script:StatsFile
+    $st = @{ Days = @{}; Series = @{}; Since = (Get-Date).ToString('yyyy-MM-dd') }
+    if ($j) {
+        if ($j.Since) { $st.Since = [string]$j.Since }
+        if ($j.Days) { foreach ($p in $j.Days.PSObject.Properties) { $st.Days[$p.Name] = @{ tv = [double]$p.Value.tv; radio = [double]$p.Value.radio } } }
+        if ($j.Series) { foreach ($p in $j.Series.PSObject.Properties) { $st.Series[$p.Name] = @{ Title = [string]$p.Value.Title; Medium = [string]$p.Value.Medium; Sec = [double]$p.Value.Sec } } }
+    }
+    $script:Stats = $st
+    return $st
+}
+
+function Add-StatSeconds([string] $Medium, [string] $Key, [string] $Title, [double] $Sec) {
+    if ($Sec -le 0 -or -not (Get-AppSettings).StatsOn) { return }
+    $st = Get-Stats
+    $d = (Get-Date).ToString('yyyy-MM-dd')
+    if (-not $st.Days.ContainsKey($d)) { $st.Days[$d] = @{ tv = 0.0; radio = 0.0 } }
+    $st.Days[$d][$Medium] = [double]$st.Days[$d][$Medium] + $Sec
+    if ($Key) {
+        if (-not $st.Series.ContainsKey($Key)) { $st.Series[$Key] = @{ Title = $Title; Medium = $Medium; Sec = 0.0 } }
+        $st.Series[$Key].Sec = [double]$st.Series[$Key].Sec + $Sec
+        if ($Title) { $st.Series[$Key].Title = $Title }
+    }
+    $script:StatsDirty = $true
+}
+
+function Add-PlayStats($File, $Old, [double] $Pos) {
+    # the time between two position reports (at most 90 s, forwards only: jumps don't count)
+    if (-not $Old -or -not $Old.At) { return }
+    $gap = ((Get-Date) - [datetime]$Old.At).TotalSeconds
+    $delta = $Pos - [double]$Old.Pos
+    if ($gap -gt 120 -or $delta -le 0 -or $delta -gt 90) { return }
+    $medium = if ($File.Medium -eq 'radio' -or $File.Type -eq 'audio') { 'radio' } else { 'tv' }
+    $key = if ($File.SeriesItem -and $File.SeriesItem.Id) { "series|$($File.SeriesItem.Id)" } elseif ($File.SeriesId) { "radio|$($File.SeriesId)" } else { "file|$($File.Id)" }
+    $title = if ($File.SeriesItem -and $File.SeriesItem.Title) { [string]$File.SeriesItem.Title } elseif ($File.SeriesTitle) { [string]$File.SeriesTitle } else { [string]$File.Title }
+    Add-StatSeconds $medium $key $title $delta
+}
+
+function Save-Stats {
+    if (-not $script:StatsDirty -or $null -eq $script:Stats) { return }
+    $st = $script:Stats
+    Write-JsonFile $script:StatsFile ([ordered]@{ Since = $st.Since; Days = $st.Days; Series = $st.Series })
+    $script:StatsDirty = $false
+}
+
+function Start-StatsTimer {
+    # live TV and radio have no positions: count each minute something live plays; save once a minute
+    if ($script:StatsTimer) { return }
+    $script:StatsTimer = New-Object System.Windows.Forms.Timer
+    $script:StatsTimer.Interval = 60000
+    $script:StatsTimer.Add_Tick({
+        try {
+            $u = $script:AudioUi
+            if ($u -and $u.Current -and $u.Current.Type -eq 'radiolive' -and -not $u.Paused) { Add-StatSeconds 'radio' "channel|$($u.Current.Id)" ([string]$u.Current.Title) 60 }
+            $pw = $script:PlayerWin
+            if ($pw -and -not $pw.Form.IsDisposed -and $pw.Form.Visible -and $pw.Target -and $pw.Target.File -and $pw.Target.File.Type -eq 'live' -and -not $pw.Paused) { Add-StatSeconds 'tv' "channel|$($pw.Target.File.Id)" ([string]$pw.Target.File.Title) 60 }
+            Save-Stats
+        } catch { }
+    })
+    $script:StatsTimer.Start()
+}
+
+function Show-StatsWindow {
+    $st = Get-Stats
+    $w = New-Object System.Windows.Forms.Form
+    Set-AppIcon $w
+    $w.Text = 'Statistics - NRK Browser'; $w.ClientSize = New-Object System.Drawing.Size(620, 520); $w.StartPosition = 'CenterParent'
+    $w.FormBorderStyle = 'FixedDialog'; $w.MaximizeBox = $false; $w.MinimizeBox = $false
+    $w.Font = $script:FontUi; $w.BackColor = $T.Bg; $w.ForeColor = $T.Text
+    $sum = { param([int] $Days) $tv = 0.0; $ra = 0.0; $from = (Get-Date).Date.AddDays(1 - $Days)
+             foreach ($k in $st.Days.Keys) { $d = [datetime]::ParseExact($k, 'yyyy-MM-dd', $null); if ($Days -le 0 -or $d -ge $from) { $tv += [double]$st.Days[$k].tv; $ra += [double]$st.Days[$k].radio } }
+             @($tv, $ra) }
+    $fmtH = { param([double] $s) if ($s -lt 3600) { '{0:N0} min' -f ($s / 60) } else { '{0:N1} h' -f ($s / 3600) } }
+    $y = 18
+    $hdr = New-Object System.Windows.Forms.Label; $hdr.Text = "What you watched and listened to (since $($st.Since))"; $hdr.Font = $script:FontHeader; $hdr.AutoSize = $true; $hdr.Location = New-Object System.Drawing.Point(20, $y); $w.Controls.Add($hdr)
+    $y += 44
+    foreach ($row in @(@('Last 7 days', 7), @('Last 30 days', 30), @('All time', 0))) {
+        $v = & $sum $row[1]
+        $l = New-Object System.Windows.Forms.Label; $l.AutoSize = $true; $l.Location = New-Object System.Drawing.Point(24, $y)
+        $l.Text = '{0,-14}   TV {1}    ·    Radio {2}' -f $row[0], (& $fmtH $v[0]), (& $fmtH $v[1])
+        $w.Controls.Add($l); $y += 26
+    }
+    $y += 12
+    $h2 = New-Object System.Windows.Forms.Label; $h2.Text = 'Most played series and channels'; $h2.Font = $script:FontBold; $h2.AutoSize = $true; $h2.Location = New-Object System.Drawing.Point(20, $y); $w.Controls.Add($h2)
+    $y += 28
+    $lv = New-Object System.Windows.Forms.ListView; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.HeaderStyle = 'Nonclickable'; $lv.BorderStyle = 'None'
+    $lv.Location = New-Object System.Drawing.Point(20, $y); $lv.Size = New-Object System.Drawing.Size(580, (500 - $y - 40)); $lv.BackColor = $T.Surface; $lv.ForeColor = $T.Text
+    [void]$lv.Columns.Add('Title', 380); [void]$lv.Columns.Add('', 80); [void]$lv.Columns.Add('Time', 100)
+    foreach ($e in @($st.Series.Values | Sort-Object { [double]$_.Sec } -Descending | Select-Object -First 25)) {
+        $it = New-Object System.Windows.Forms.ListViewItem([string]$e.Title); [void]$it.SubItems.Add($(if ($e.Medium -eq 'radio') { 'Radio' } else { 'TV' })); [void]$it.SubItems.Add((& $fmtH ([double]$e.Sec))); [void]$lv.Items.Add($it)
+    }
+    $w.Controls.Add($lv)
+    $bReset = New-FlatButton 'Start counting again' 200; $bReset.Location = New-Object System.Drawing.Point(20, 478); $bReset.ForeColor = $T.Bad
+    $bReset.Add_Click({ if ([System.Windows.Forms.MessageBox]::Show($this.FindForm(), 'Forget everything counted so far?', 'Statistics', 'YesNo', 'Question') -eq 'Yes') { $script:Stats = @{ Days = @{}; Series = @{}; Since = (Get-Date).ToString('yyyy-MM-dd') }; $script:StatsDirty = $true; Save-Stats; $this.FindForm().Close() } })
+    $w.Controls.Add($bReset)
+    Set-DarkTheme $w; Enable-DarkTitleBar $w
+    $lv.BackColor = $T.Surface
+    [void]$w.ShowDialog($form)
+}
+
+function Export-PodcastOpml {
+    # the favourite podcasts as an OPML file (NRK's own RSS feeds) for another podcast app
+    $pods = @((Get-FavMap).Values | Where-Object { $_.Item -and $_.Item.Kind -eq 'podcast' -and $_.Item.Id })
+    if (-not $pods.Count) { [void][System.Windows.Forms.MessageBox]::Show($form, 'No podcasts among the favourites yet (right-click a podcast > Add to favourites).', 'Export podcasts', 'OK', 'Information'); return }
+    $d = New-Object System.Windows.Forms.SaveFileDialog
+    $d.Filter = 'OPML (*.opml)|*.opml'; $d.FileName = 'NRK podcasts.opml'
+    if ($d.ShowDialog($form) -ne 'OK') { return }
+    $x = New-Object System.Text.StringBuilder
+    [void]$x.AppendLine('<?xml version="1.0" encoding="UTF-8"?>')
+    [void]$x.AppendLine('<opml version="2.0"><head><title>NRK podcasts (NRK Browser)</title><dateCreated>' + (Get-Date).ToUniversalTime().ToString('r') + '</dateCreated></head><body>')
+    foreach ($r in $pods) {
+        $t = [Security.SecurityElement]::Escape([string]$r.Item.Title)
+        $u = [Security.SecurityElement]::Escape((Get-PodcastFeedUrl $r.Item))
+        [void]$x.AppendLine(('  <outline type="rss" text="{0}" title="{0}" xmlUrl="{1}" htmlUrl="{2}"/>' -f $t, $u, [Security.SecurityElement]::Escape([string]$r.Item.WebUrl)))
+    }
+    [void]$x.AppendLine('</body></opml>')
+    [IO.File]::WriteAllText($d.FileName, $x.ToString(), (New-Object Text.UTF8Encoding($false)))
+    Write-Log INFO "Exported $($pods.Count) podcast(s) to $($d.FileName)"
+    Set-Status "Exported $($pods.Count) podcast(s) to $($d.FileName)"
 }
 
 function Format-PlayTime([double] $Sec) {
@@ -4935,7 +5549,7 @@ function Test-KnownEmpty($Node) { return $script:KnownEmpty.Contains((Get-NodeKe
 
 function Hide-EmptyNode($Node) {
     # after the current event has finished (the folder may be the one being opened)
-    if (-not $Node -or -not $Node.TreeView -or $Node.Tag.Kind -in 'group', 'live', 'radiolive', 'search', 'recent', 'favourites', 'newweek', 'expiring' -or $Node.Tag.Fav) { return }
+    if (-not $Node -or -not $Node.TreeView -or $Node.Tag.Kind -in 'group', 'live', 'radiolive', 'search', 'recent', 'favourites', 'newweek', 'expiring', 'continue', 'watchlater' -or $Node.Tag.Fav) { return }
     $k = Get-NodeKey $Node
     [void]$script:EmptyNow.Add($k); [void]$script:KnownEmpty.Add($k)
     [void]$script:HideQueue.Add($Node)
@@ -5174,56 +5788,26 @@ function Show-Schedule([bool] $On) {
 }
 
 # ---- placeholder pictures for folders without one ----------------------------------------
-# TV folders: NRK's white "NRK TV" logo on a dark tile. It is fetched once from NRK's press page
-# into <app data>\images and read from there afterwards. Radio folders: a picture drawn by the app.
-$script:ImagesDir = Join-Path $script:AppDataDir 'images'
-$script:TvLogoUrl = 'https://info.nrk.no/wp-content/uploads/2025/04/NRK-TV_hvit.png'
+# pictures\<name>.png from the repository (Start-AssetDownload); until it is there, the same
+# line drawing is made here: a TV set, a radio set, or the special folders' own picture.
 $script:Placeholders = @{}
-$script:TvLogoTried = $false
 
-function Get-TvLogoFile {
-    $f = Join-Path $script:ImagesDir 'NRK-TV_hvit.png'
-    if (Test-Path -LiteralPath $f) { return $f }
-    if ($script:TvLogoTried) { return $null }       # (once per session: no network, no picture)
-    $script:TvLogoTried = $true
-    try {
-        New-Item -ItemType Directory -Path $script:ImagesDir -Force | Out-Null
-        # (at most 5 s: without a network the folder must not hang)
-        $rq = [System.Net.HttpWebRequest]::Create($script:TvLogoUrl); $rq.UserAgent = $script:UserAgent; $rq.Timeout = 5000; $rq.ReadWriteTimeout = 5000
-        $rs = $rq.GetResponse(); $ms = New-Object IO.MemoryStream
-        try { $rs.GetResponseStream().CopyTo($ms) } finally { $rs.Close() }
-        $bytes = $ms.ToArray()
-        if ($bytes.Length -gt 200) { [IO.File]::WriteAllBytes($f, $bytes); Write-Log INFO "Placeholder: saved $($script:TvLogoUrl) -> $f"; return $f }
-    } catch { Write-Log WARN "Placeholder: could not fetch $($script:TvLogoUrl): $($_.Exception.Message)" }
-    return $null
-}
-
-function Get-PlaceholderImage([ValidateSet('tv', 'radio', 'recent', 'fav', 'new', 'last')] [string] $Kind) {
+function Get-PlaceholderImage([ValidateSet('tv', 'radio', 'recent', 'fav', 'new', 'last', 'continue', 'watchlater')] [string] $Kind) {
     $key = "$Kind|$($script:ThemeEffective)"
     if ($script:Placeholders[$key]) { return $script:Placeholders[$key] }
+    if ($script:AssetPictures.Contains($Kind)) {
+        $png = Get-AssetImage "pictures/$($script:AssetPictures[$Kind]).png"
+        if ($png) { $script:Placeholders[$key] = $png; return $png }
+    }
     $w = 960; $h = 540
     $bmp = New-Object System.Drawing.Bitmap($w, $h)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = 'AntiAlias'; $g.InterpolationMode = 'HighQualityBicubic'; $g.TextRenderingHint = 'AntiAliasGridFit'
-    # a dark tile in both themes (the logo is white)
+    # a dark tile in both themes
     $bg = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-Object System.Drawing.Point(0, 0)), (New-Object System.Drawing.Point($w, $h)), [System.Drawing.Color]::FromArgb(12, 24, 32), [System.Drawing.Color]::FromArgb(22, 40, 50))
     $g.FillRectangle($bg, 0, 0, $w, $h); $bg.Dispose()
-    $ok = $false
-    if ($Kind -eq 'tv') {
-        $file = Get-TvLogoFile
-        if ($file) {
-            try {
-                $logo = [System.Drawing.Image]::FromFile($file)
-                $lw = [int]($w * 0.42); $lh = [int]($logo.Height * $lw / [Math]::Max(1, $logo.Width))
-                if ($lh -gt $h * 0.5) { $lh = [int]($h * 0.5); $lw = [int]($logo.Width * $lh / [Math]::Max(1, $logo.Height)) }
-                $g.DrawImage($logo, [int](($w - $lw) / 2), [int](($h - $lh) / 2), $lw, $lh)
-                $logo.Dispose(); $ok = $true
-            } catch { Write-Log WARN "Placeholder: $($_.Exception.Message)" }
-        }
-    }
-    if (-not $ok) {
-        # a line drawing (white, with a teal detail) on a 170 x 120 grid and the folder's name under it:
-        # radio = an old-style radio set (or TV without the logo), the special folders their own picture
+    if ($true) {
+        # a line drawing (white, with a teal detail) on a 170 x 120 grid and the folder's name under it
         $acc = [System.Drawing.Color]::FromArgb(72, 201, 210)
         $light = [System.Drawing.Color]::FromArgb(226, 232, 236)
         $grey = [System.Drawing.Color]::FromArgb(134, 147, 156)
@@ -5235,7 +5819,7 @@ function Get-PlaceholderImage([ValidateSet('tv', 'radio', 'recent', 'fav', 'new'
         $pW = & $mkPen $light 6; $pA = & $mkPen $acc 6
         $bA = New-Object System.Drawing.SolidBrush($acc); $bW = New-Object System.Drawing.SolidBrush($light)
         $quad = { param($gp, $x0, $y0, $cx, $cy, $x1, $y1) $gp.AddBezier([float]$x0, [float]$y0, [float]($x0 + 2 / 3 * ($cx - $x0)), [float]($y0 + 2 / 3 * ($cy - $y0)), [float]($x1 + 2 / 3 * ($cx - $x1)), [float]($y1 + 2 / 3 * ($cy - $y1)), [float]$x1, [float]$y1) }
-        $label = switch ($Kind) { 'radio' { 'Radio' } 'recent' { 'Recently played' } 'fav' { 'Favourites' } 'new' { 'New this week' } 'last' { 'Last chance' } default { 'TV' } }
+        $label = switch ($Kind) { 'radio' { 'Radio' } 'recent' { 'Recently played' } 'fav' { 'Favourites' } 'new' { 'New this week' } 'last' { 'Last chance' } 'continue' { 'Continue watching' } 'watchlater' { 'Watch later' } default { 'TV' } }
         switch ($Kind) {
             'recent' {
                 # a clock turning back
@@ -5275,6 +5859,33 @@ function Get-PlaceholderImage([ValidateSet('tv', 'radio', 'recent', 'fav', 'new'
                 $s2 = New-Object System.Drawing.Drawing2D.GraphicsPath
                 & $quad $s2 85 82 100 92 103 108; $s2.AddLine(103, 108, 67, 108); & $quad $s2 67 108 70 92 85 82; $s2.CloseFigure(); $g.FillPath($bA, $s2); $s2.Dispose()
             }
+            'watchlater' {
+                # a bookmark with a clock (pictures\watch-later.png)
+                $bm = New-Object System.Drawing.Drawing2D.GraphicsPath
+                $bm.AddLines([System.Drawing.PointF[]]@((& $pt 52 8), (& $pt 118 8), (& $pt 118 112), (& $pt 85 88), (& $pt 52 112))); $bm.CloseFigure()
+                $g.DrawPath($pW, $bm); $bm.Dispose()
+                $g.DrawEllipse($pA, 66, 26, 38, 38)
+                $pH = & $mkPen $acc 5; $g.DrawLine($pH, 85, 45, 85, 33); $g.DrawLine($pH, 85, 45, 94, 50); $pH.Dispose()
+            }
+            'continue' {
+                # a screen with a play sign and a progress line half way (pictures\continue-watching.png)
+                $rr2 = New-Object System.Drawing.Drawing2D.GraphicsPath; $d = 24
+                $rr2.AddArc(14, 12, $d, $d, 180, 90); $rr2.AddArc(156 - $d, 12, $d, $d, 270, 90); $rr2.AddArc(156 - $d, 96 - $d, $d, $d, 0, 90); $rr2.AddArc(14, 96 - $d, $d, $d, 90, 90); $rr2.CloseFigure()
+                $g.DrawPath($pW, $rr2); $rr2.Dispose()
+                $g.FillPolygon($bA, [System.Drawing.PointF[]]@((& $pt 74 34), (& $pt 74 74), (& $pt 106 54)))
+                $pG = & $mkPen $grey 6; $g.DrawLine($pG, 20, 112, 150, 112); $pG.Dispose()
+                $g.DrawLine($pA, 20, 112, 88, 112); $g.FillEllipse($bA, 82, 106, 12, 12)
+            }
+            'tv' {
+                # an old-style TV set (pictures\tv.png)
+                $pAnt = & $mkPen $grey 4; $g.DrawLine($pAnt, 70, 20, 52, 2); $g.DrawLine($pAnt, 70, 20, 90, 4); $pAnt.Dispose()
+                $rr = { param($x, $y, $wd, $ht, $r) $gp = New-Object System.Drawing.Drawing2D.GraphicsPath; $d = 2 * $r
+                        $gp.AddArc($x, $y, $d, $d, 180, 90); $gp.AddArc($x + $wd - $d, $y, $d, $d, 270, 90); $gp.AddArc($x + $wd - $d, $y + $ht - $d, $d, $d, 0, 90); $gp.AddArc($x, $y + $ht - $d, $d, $d, 90, 90); $gp.CloseFigure(); $gp }
+                $box = & $rr 10 20 150 90 14; $g.DrawPath($pW, $box); $box.Dispose()
+                $pS = & $mkPen $acc 5; $scr = & $rr 24 34 92 62 8; $g.DrawPath($pS, $scr); $scr.Dispose()
+                $g.FillPolygon($bA, [System.Drawing.PointF[]]@((& $pt 62 50), (& $pt 62 80), (& $pt 86 65)))
+                $pL = & $mkPen $light 5; $g.DrawEllipse($pL, 130, 40, 16, 16); $g.DrawLine($pL, 128, 72, 148, 72); $g.DrawLine($pL, 128, 86, 148, 86); $pL.Dispose(); $pS.Dispose()
+            }
             default {
                 # an old-style radio set (B)
                 $pAnt = & $mkPen $grey 4; $g.DrawLine($pAnt, 40, 30, 118, 4); $pAnt.Dispose()
@@ -5300,7 +5911,7 @@ function Get-PlaceholderImage([ValidateSet('tv', 'radio', 'recent', 'fav', 'new'
 
 function Get-FolderPlaceholderKind($Tag) {
     if (-not $Tag) { return $null }
-    switch ($Tag.Kind) { 'recent' { return 'recent' } 'favourites' { return 'fav' } 'newweek' { return 'new' } 'expiring' { return 'last' } }
+    switch ($Tag.Kind) { 'recent' { return 'recent' } 'favourites' { return 'fav' } 'newweek' { return 'new' } 'expiring' { return 'last' } 'continue' { return 'continue' } 'watchlater' { return 'watchlater' } }
     if ($Tag.Kind -in 'radiolive', 'radiocategory', 'radioletter', 'radioseries', 'radioseason') { return 'radio' }
     if ($Tag.Kind -in 'live', 'category', 'letter', 'series', 'season') { return 'tv' }
     if ($Tag.Kind -eq 'group') { if ([string]$Tag.Title -match '^Radio') { return 'radio' } elseif ([string]$Tag.Title -match '^(TV|Categories|A - )') { return 'tv' } }
@@ -5360,6 +5971,12 @@ function Show-FolderPreview {
         'expiring' {
             Set-Preview 'Last chance' ('{0} programmes and episodes' -f @($script:Files).Count) ('What leaves NRK TV and radio within 14 days, soonest first: watch or download it before it is gone. Made from the indexer''s list.') $null
         }
+        'continue' {
+            Set-Preview 'Continue watching' ('{0} item(s)' -f @($script:Files).Count) 'What you started and did not finish, newest first, and the next episode of the series you are watching (looked up in the background).' $null
+        }
+        'watchlater' {
+            Set-Preview 'Watch later' ('{0} item(s)  ·  newest first' -f @($script:Files).Count) 'Programmes and episodes you put aside: right-click one in any list > Watch later. Separate from Favourites (which are whole series).' $null
+        }
         'recent' {
             Set-Preview 'Recently played' ('{0} item(s)  ·  newest first' -f @($script:Files).Count) 'What you played last, from any folder: double-click to play it again. Right-click this folder to clear the list.' $null
         }
@@ -5385,12 +6002,21 @@ function Open-Folder {
     Write-Log INFO ("UI: folder {0} '{1}'" -f $tag.Kind, $tag.Title)
     $script:SelectedFile = $null
     $script:Files = @()
-    $script:FilesNoSort = ($tag.Kind -in 'search', 'recent', 'newweek', 'expiring')   # newest first / best match first / soonest gone first
+    $script:FilesNoSort = ($tag.Kind -in $script:MixedKinds)   # newest first / best match first / soonest gone first
     $loaded = @{ Ok = $false }
     switch ($tag.Kind) {
         'recent' {
             $script:Files = @(Get-RecentFiles)
             Set-Status $(if ($script:Files.Count) { 'Recently played: {0}  ·  newest first  ·  double-click to play again' -f $script:Files.Count } else { 'Nothing played yet' })
+        }
+        'continue' {
+            $script:Files = @(Get-ContinueFiles | Where-Object { Test-ChildAllowed $_ -Quiet })
+            Set-Status $(if ($script:Files.Count) { 'Continue watching: {0}  ·  started ones first, then the next episode of series you watch' -f $script:Files.Count } else { 'Nothing started yet: what you stop halfway shows up here' })
+            Start-ContinueNextJob
+        }
+        'watchlater' {
+            $script:Files = @(Get-WatchLaterFiles)
+            Set-Status $(if ($script:Files.Count) { 'Watch later: {0}  ·  right-click > Remove from Watch later' -f $script:Files.Count } else { 'Nothing here yet: right-click a programme or episode > Watch later' })
         }
         'favourites' {
             $script:Files = @()
@@ -5487,7 +6113,7 @@ function Show-FileDetails {
     Set-Preview $File.Title $meta $File.Description $img
     Add-Meta 'Type' $kind
     if ($File.Type -eq 'episode') { Add-Meta 'Series' $File.SeriesItem.Title; Add-Meta 'Season' $File.Season }
-    Add-Meta 'Id' $File.Id
+    if ($File.Type -ne 'live') { Add-Meta 'Id' $File.Id }   # (live: shown as Channel id)
     if ($null -ne $File.GeoBlocked) { Add-Meta 'Region' $(if ($File.GeoBlocked) { 'Norway only' } else { 'Worldwide' }) }
     Add-Meta 'Available until' (Format-AvailableUntil $File)
     Update-Actions; Update-Crumb
@@ -5579,7 +6205,7 @@ function Set-VideoQueue($File) {
     $script:VideoQueue = @(); $script:VideoIndex = -1
     $script:VideoQueueNode = $folderTree.SelectedNode   # the folder the queue came from (for "continue where you left off")
     if (-not $File -or $File.Type -notin 'episode', 'program') { return }
-    if ((Get-FolderTag).Kind -in 'recent', 'search', 'newweek', 'expiring') { return }   # a mixed list: no "next episode"
+    if ((Get-FolderTag).Kind -in $script:MixedKinds) { return }   # a mixed list: no "next episode"
     $q = @($script:Files | Where-Object { $_.Type -in 'episode', 'program' -and (Test-FileAvailable $_) })
     for ($i = 0; $i -lt $q.Count; $i++) { if ([object]::ReferenceEquals($q[$i], $File)) { $script:VideoIndex = $i; break } }
     if ($script:VideoIndex -ge 0 -and $q.Count -gt 1) { $script:VideoQueue = $q } else { $script:VideoIndex = -1 }
@@ -5590,7 +6216,7 @@ function Update-PlayerNav {
     if (-not $pw -or $pw.Form.IsDisposed) { return }
     $q = $script:VideoQueue; $i = $script:VideoIndex
     $on = (@($q).Count -gt 1 -and $i -ge 0)
-    $pw.Prev.Visible = $on; $pw.Next.Visible = $on
+    $pw.Prev.Visible = ($on -and -not $pw.Mini); $pw.Next.Visible = ($on -and -not $pw.Mini)
     if (-not $on) { return }
     $pw.Prev.Enabled = ($i -gt 0); $pw.Next.Enabled = ($i -lt $q.Count - 1)
     $pw.Tips.SetToolTip($pw.Prev, $(if ($i -gt 0) { "Previous: $($q[$i - 1].Title)" } else { 'This is the first one' }))
@@ -5658,8 +6284,18 @@ function Show-LiveDetails {
     param($Item)
     Add-Meta 'Channel id' $Item.Id
     if ($Item.District) { Add-Meta 'Kind' 'Regional NRK1' }
-    Invoke-Ui "Loading schedule for $($Item.Id)" {
-        $epg = @(Get-NrkEpg -ChannelId $Item.Id)
+    $hdrSchedule.Text = 'Schedule today  (loading...)'
+    if ($script:EpgJob) { $script:EpgJob.Canceled = $true }
+    $script:EpgJob = Start-ApiJob "Schedule for $($Item.Id)" { param($it) ,@(Get-NrkEpg -ChannelId $it.Id) } {
+        param($epg, $Item)
+        $script:EpgJob = $null
+        if (-not $script:SelectedFile -or $script:SelectedFile.Id -ne $Item.Id -or $script:SelectedFile.Type -ne 'live') { return }   # (another file was picked meanwhile)
+        Show-LiveSchedule $Item @($epg)
+    } { param($err, $Item) $script:EpgJob = $null; Write-LogException $err "Loading schedule for $($Item.Id)"; $hdrSchedule.Text = 'Schedule today  (not available)'; Set-Status "Schedule for $($Item.Title) failed: $($err.Exception.Message)  (details in Logs)" } $Item
+}
+
+function Show-LiveSchedule($Item, $epg) {
+    & {
         $now = Get-Date
         $cur = $epg | Where-Object { $_.Start -le $now -and $_.End -gt $now } | Select-Object -First 1
         $next = $epg | Where-Object { $_.Start -gt $now } | Select-Object -First 1
@@ -6051,14 +6687,19 @@ video::cue{font-size:120%;background:rgba(0,0,0,.72)}
 #ch button.on{border-color:#48c9d2;color:#fff}
 #msg{position:absolute;inset:0;display:none;align-items:center;justify-content:center;text-align:center;padding:24px;background:#000;color:#8a949b}
 #msg b{display:block;color:#fff;font-size:16px;margin-bottom:8px;font-weight:600}
+#up{position:absolute;right:24px;bottom:72px;display:none;background:rgba(14,20,24,.94);border:1px solid #33434b;border-radius:8px;padding:14px 16px;min-width:280px;max-width:420px;color:#d6dde0;box-shadow:0 6px 24px rgba(0,0,0,.5)}
+#up .k{font-size:12px;color:#8a949b;margin-bottom:4px}#up .t{font-weight:600;font-size:15px;margin-bottom:12px;color:#fff}
+#up button{background:#48c9d2;color:#0a1e22;border:0;border-radius:4px;padding:7px 14px;font:inherit;font-weight:600;cursor:pointer;margin-right:8px}
+#up button.c{background:none;color:#c5ced2;border:1px solid #33434b;font-weight:400}
 </style></head><body>
-<div id="wrap"><div id="stage"><video id="v" controls autoplay playsinline crossorigin="anonymous"></video><div id="msg"></div></div><div id="ch"></div></div>
+<div id="wrap"><div id="stage"><video id="v" controls autoplay playsinline crossorigin="anonymous"></video><div id="msg"></div>
+<div id="up"><div class="k" id="upk">Next episode</div><div class="t" id="upt"></div><button id="upgo">Play now</button><button class="c" id="upno">Cancel</button></div></div><div id="ch"></div></div>
 <script src="/__nrkb/hls.min.js"></script>
 <script>
 (() => {
   const v = document.getElementById('v'), ch = document.getElementById('ch'), msg = document.getElementById('msg');
   const post = m => { try { window.chrome.webview.postMessage(JSON.stringify(m)); } catch (e) {} };
-  const CDN = 'https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js';
+  const CDN = 'https://cdn.jsdelivr.net/npm/hls.js@__HLSVER__/dist/hls.min.js';
   let hls = null, cur = null, chapters = [];
   function show(title, text) {
     msg.innerHTML = '<div><b></b><span></span></div>';
@@ -6109,6 +6750,14 @@ video::cue{font-size:120%;background:rgba(0,0,0,.72)}
         };
         hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, tracks);
         hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, tracks);
+        // the picture qualities NRK offers: to the app's Quality menu (Auto = hls.js picks)
+        const levels = () => {
+          if (!hls) return;
+          const list = (hls.levels || []).map((l, i) => ({ i, h: l.height || 0, w: l.width || 0, br: l.bitrate || 0 }));
+          post({ type: 'levels', list, cur: hls.manualLevel === undefined ? (hls.autoLevelEnabled ? -1 : hls.currentLevel) : hls.manualLevel, now: hls.currentLevel });
+        };
+        hls.on(Hls.Events.MANIFEST_PARSED, levels);
+        hls.on(Hls.Events.LEVEL_SWITCHED, levels);
         hls.on(Hls.Events.ERROR, (e, d) => {
           if (!d.fatal) return;
           if (d.type === Hls.ErrorTypes.NETWORK_ERROR && netRetry < 3) { netRetry++; post({ type: 'verror', retry: netRetry, details: d.details }); setTimeout(() => { if (!hls) return; if (/manifest/i.test(d.details)) hls.loadSource(c.url); else hls.startLoad(); }, 1500 * netRetry); return; }
@@ -6131,11 +6780,57 @@ video::cue{font-size:120%;background:rgba(0,0,0,.72)}
   const liveEdge = () => { if (hls && hls.liveSyncPosition) return hls.liveSyncPosition; const r = v.seekable; return r.length ? r.end(r.length - 1) : v.currentTime; };
   const liveStart = () => { const r = v.seekable; return r.length ? r.start(0) : 0; };
   setInterval(() => { if (cur && cur.live && v.readyState > 0) post({ type: 'vlive', behind: Math.max(0, liveEdge() - v.currentTime), window: Math.max(0, liveEdge() - liveStart()) }); }, 3000);
-  let cueStyle = null;
-  function setSubSize(pct) {
+  // subtitles: size, colour, background and height on the picture
+  let cueStyle = null, sub = { size: 120, color: 'white', bg: 'box', pos: 'bottom' };
+  const SUBCOLOR = { white: '#ffffff', yellow: '#ffe14d', cyan: '#7fe6ee', green: '#9be37a' };
+  const SUBBG = { none: 'transparent', shadow: 'transparent', box: 'rgba(0,0,0,.72)', solid: '#000' };
+  function setSubStyle(o) {
+    sub = Object.assign(sub, o || {});
     if (!cueStyle) { cueStyle = document.createElement('style'); document.head.appendChild(cueStyle); }
-    cueStyle.textContent = 'video::cue{font-size:' + (pct || 120) + '% !important}';
+    const shadow = sub.bg === 'shadow' || sub.bg === 'none' ? 'text-shadow:0 0 4px #000,0 0 2px #000,1px 1px 2px #000;' : '';
+    cueStyle.textContent = 'video::cue{font-size:' + (sub.size || 120) + '% !important;color:' + (SUBCOLOR[sub.color] || '#fff') + ' !important;background-color:' + (SUBBG[sub.bg] || SUBBG.box) + ' !important;' + shadow + '}';
+    placeCues();
   }
+  function setSubSize(pct) { setSubStyle({ size: pct || 120 }); }
+  function placeCues() {
+    // bottom: where NRK puts them; raised: above the controls; top: at the top of the picture
+    const line = sub.pos === 'top' ? 1 : (sub.pos === 'raised' ? -4 : 'auto');
+    const tr = v.textTracks;
+    for (let k = 0; k < tr.length; k++) { const cs = tr[k].cues; if (!cs) continue; for (let i = 0; i < cs.length; i++) { try { cs[i].snapToLines = true; cs[i].line = line; } catch (e) {} } }
+  }
+  v.textTracks.addEventListener('addtrack', e => { e.track.addEventListener('cuechange', placeCues); });
+  // the next episode: a card at the end that counts down (Play now / Cancel)
+  let upTimer = null, upLeft = 0;
+  const up = document.getElementById('up');
+  function hideUp() { clearInterval(upTimer); upTimer = null; up.style.display = 'none'; }
+  function showUp() {
+    if (!cur || !cur.next) return false;
+    upLeft = cur.nextIn || 10;
+    document.getElementById('upt').textContent = cur.next;
+    const k = document.getElementById('upk');
+    const tick = () => { k.textContent = 'Next episode in ' + upLeft + ' s'; if (upLeft-- <= 0) { hideUp(); post({ type: 'upnext', go: true }); } };
+    up.style.display = 'block'; tick(); clearInterval(upTimer); upTimer = setInterval(tick, 1000);
+    return true;
+  }
+  document.getElementById('upgo').onclick = () => { hideUp(); post({ type: 'upnext', go: true }); };
+  document.getElementById('upno').onclick = () => { hideUp(); post({ type: 'upnext', go: false }); };
+  // a picture of the frame you see (PNG, full size)
+  function shot() {
+    try {
+      if (!v.videoWidth) { post({ type: 'shot', error: 'nothing to save yet' }); return; }
+      const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
+      c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+      post({ type: 'shot', data: c.toDataURL('image/png').split(',')[1], t: v.currentTime });
+    } catch (e) { post({ type: 'shot', error: String(e && e.message || e) }); }
+  }
+  // fade out (sleep timer): the volume goes down over sec seconds; unfade() puts it back
+  let fadeTimer = null, fadeFrom = null;
+  function fade(sec) {
+    clearInterval(fadeTimer); if (fadeFrom === null) fadeFrom = v.volume;
+    const steps = Math.max(1, Math.round(sec * 4)); let n = 0;
+    fadeTimer = setInterval(() => { n++; v.volume = Math.max(0, fadeFrom * (1 - n / steps)); if (n >= steps) clearInterval(fadeTimer); }, 250);
+  }
+  function unfade() { clearInterval(fadeTimer); if (fadeFrom !== null) { v.volume = fadeFrom; fadeFrom = null; } }
   window.nrkb = {
     load(c) {
       cur = c; msg.style.display = 'none'; stop();
@@ -6149,7 +6844,8 @@ video::cue{font-size:120%;background:rgba(0,0,0,.72)}
       // a track added from script is not switched on by "default": do it once it exists
       setTimeout(() => { const tr = v.querySelectorAll('track'); (c.subtitles || []).forEach((s, i) => { if (tr[i]) tr[i].track.mode = (c.subIndex === undefined ? s.default : c.subIndex === i) ? 'showing' : 'hidden'; }); }, 0);
       if (c.poster) v.poster = c.poster; else v.removeAttribute('poster');
-      setSubSize(c.subSize);
+      hideUp();
+      setSubStyle(Object.assign({ size: c.subSize || 120 }, c.subStyle || {}));
       document.title = c.title || 'NRK';
       setChapters(c.chapters);
       ensureHls(() => start(c));
@@ -6159,12 +6855,18 @@ video::cue{font-size:120%;background:rgba(0,0,0,.72)}
     rate(r) { v.defaultPlaybackRate = v.playbackRate = r; },
     subs(i) { const tr = v.textTracks; for (let k = 0; k < tr.length; k++) tr[k].mode = (k === i) ? 'showing' : 'hidden'; },
     subSize(p) { setSubSize(p); },
+    subStyle(o) { setSubStyle(o); },
+    level(i) { if (hls) { hls.currentLevel = i; hls.manualLevel = i; } },
+    shot() { shot(); },
+    fade(s) { fade(s); }, unfade() { unfade(); },
+    setNext(t) { if (cur) cur.next = t; if (!t) hideUp(); },
     audio(i) { if (hls) hls.audioTrack = i; },
     liveBack(sec) { v.currentTime = Math.max(liveStart(), v.currentTime - sec); },
     toLive() { v.currentTime = Math.max(liveStart(), liveEdge() - 1); const p = v.play(); if (p && p.catch) p.catch(() => {}); },
     startOver(sec) { v.currentTime = Math.max(liveStart(), liveEdge() - sec); const p = v.play(); if (p && p.catch) p.catch(() => {}); }
   };
-  v.addEventListener('ended', () => post({ type: 'ended', t: v.currentTime, d: v.duration || 0 }));
+  v.addEventListener('ended', () => post({ type: 'ended', t: v.currentTime, d: v.duration || 0, card: showUp() }));
+  v.addEventListener('seeking', () => { if (upTimer && v.currentTime < (v.duration || 0) - 1) hideUp(); });
   v.addEventListener('playing', () => post({ type: 'vplaying' }));
   // where you are, every 5 s (and when you pause or jump), so the app can continue there next time
   let lastPos = 0;
@@ -6384,11 +7086,18 @@ function New-WebViewControl {
                     }
                     'ended' {
                         if ($script:PlayerWin -and $script:PlayerWin.Target) { Set-PlayPosition $script:PlayerWin.Target.File ([double]$m.t) ([double]$m.d) -Ended }
-                        if (Test-SleepAtEnd) { return }
+                        if (Test-SleepAtEnd) { Invoke-PlayerScript 'nrkb.setNext(null)'; return }
                         if (-not (Get-AppSettings).AutoNext) { return }
+                        if ($m.card) { Write-Log INFO 'Built-in player: finished, the next-episode card counts down'; return }   # (the card says go or cancel)
                         # next episode, like NRK's own player
                         if (@($script:VideoQueue).Count -gt 1 -and $script:VideoIndex -lt @($script:VideoQueue).Count - 1) { Write-Log INFO 'Built-in player: finished, playing the next episode'; Start-PlayerStep 1 }
                     }
+                    'upnext' {
+                        if ($m.go -and @($script:VideoQueue).Count -gt 1 -and $script:VideoIndex -lt @($script:VideoQueue).Count - 1) { Write-Log INFO 'Built-in player: next episode (card)'; Start-PlayerStep 1 }
+                        elseif (-not $m.go) { Write-Log INFO 'Built-in player: next episode canceled' }
+                    }
+                    'levels' { if ($script:PlayerWin) { $script:PlayerWin.Levels = @($m.list); $script:PlayerWin.Level = [int]$m.cur; $script:PlayerWin.LevelNow = [int]$m.now; Update-PlayerExtras } }
+                    'shot' { Save-PlayerShot $m }
                     'isolated' { Write-Log INFO ("Player only: isolated <{0} class='{1}'>{2} on {3}" -f $m.tag, $m.cls, $(if ($m.chapters) { ' + chapter row' } else { '' }), $m.url) }
                     'chapters' { Write-Log INFO ("Player only: chapter row added ({0} buttons) on {1}" -f $m.n, $m.url) }
                     'autostart' {
@@ -6482,12 +7191,21 @@ function Get-PlayerWindow {
     $bSubs = New-FlatButton ("Subtitles  {0}" -f [char]0x25BE) 0
     $bAudio = New-FlatButton ("Audio  {0}" -f [char]0x25BE) 0
     $bSleep = New-FlatButton ("Sleep  {0}" -f [char]0x25BE) 0
+    $bQual = New-FlatButton ("Quality  {0}" -f [char]0x25BE) 0; $bQual.Visible = $false
+    $bShot = New-FlatButton 'Screenshot' 0; $bShot.Visible = $false
+    $bMini = New-FlatButton 'Mini' 0
     $bStartOver = New-FlatButton ("{0}  Start over" -f [char]0x21E4) 0
     $bLiveBack = New-FlatButton ("{0} 1 min" -f [char]0x21BA) 0
     $bLiveGo = New-FlatButton ("{0} LIVE" -f [char]0x25CF) 0
     foreach ($x in $bSpeed, $bSubs, $bAudio, $bStartOver, $bLiveBack, $bLiveGo) { $x.Visible = $false }
     $hint.ForeColor = $T.Muted; $hint.AutoEllipsis = $true
-    $bar.Controls.AddRange(@($bPrev, $bNext, $bStartOver, $bLiveBack, $bLiveGo, $bSpeed, $bSubs, $bAudio, $bSleep, $bMode, $bTop, $bFull, $bReload, $bExt, $bCast, $hint))
+    $bar.Controls.AddRange(@($bPrev, $bNext, $bStartOver, $bLiveBack, $bLiveGo, $bSpeed, $bSubs, $bAudio, $bQual, $bSleep, $bMode, $bTop, $bFull, $bMini, $bShot, $bReload, $bExt, $bCast, $hint))
+    $navTips.SetToolTip($bQual, 'Picture quality (Auto: picked by your connection)')
+    $navTips.SetToolTip($bShot, 'Save the picture you see now (Pictures\NRK-Browser)')
+    $navTips.SetToolTip($bMini, 'A small window that stays on top (again: back to normal size)')
+    $bQual.Add_Click({ Show-PlayerQualityMenu })
+    $bShot.Add_Click({ Invoke-PlayerScript 'nrkb.shot()' })
+    $bMini.Add_Click({ Set-PlayerMini (-not $script:PlayerWin.Mini) })
     $navTips.SetToolTip($bStartOver, 'The programme on now, from its beginning (live TV keeps about 3 hours)')
     $navTips.SetToolTip($bLiveGo, 'Back to live')
     $bSpeed.Add_Click({
@@ -6520,7 +7238,8 @@ function Get-PlayerWindow {
     $script:PlayerWin = @{ Form = $f; WebView = $wv; Bar = $bar; BtnMode = $bMode; BtnTop = $bTop; Hint = $hint; Full = $null; Url = $null
                            Prev = $bPrev; Next = $bNext; Tips = $navTips; Mode = 'web'; Pending = $null; VReady = $false; Target = $null
                            Speed = $bSpeed; Subs = $bSubs; Audio = $bAudio; Sleep = $bSleep; StartOver = $bStartOver; LiveBack = $bLiveBack; LiveGo = $bLiveGo
-                           SubList = @(); SubIndex = -1; ATracks = @(); ATrack = -1; Versions = @() }
+                           SubList = @(); SubIndex = -1; ATracks = @(); ATrack = -1; Versions = @()
+                           Qual = $bQual; Shot = $bShot; MiniBtn = $bMini; Mini = $null; Levels = @(); Level = -1; LevelNow = -1 }
     $bPrev.Add_Click({ Start-PlayerStep -1 })
     $bNext.Add_Click({ Start-PlayerStep 1 })
 
@@ -6555,11 +7274,28 @@ function Get-PlayerWindow {
     # Maximize must respect the taskbar on whichever monitor the window is on
     $f.Add_Shown({ Update-MaxBounds $script:PlayerWin.Form ([bool]$script:PlayerWin.Full) })
     $f.Add_LocationChanged({ if ($script:PlayerWin -and $script:PlayerWin.Form.WindowState -eq 'Normal') { Update-MaxBounds $script:PlayerWin.Form ([bool]$script:PlayerWin.Full) } })
+    # (the window is hidden and shown again, so Shown runs only once: check again when it shows)
+    $f.Add_VisibleChanged({ $pw = $script:PlayerWin; if ($pw -and $pw.Form.Visible) { Update-MaxBounds $pw.Form ([bool]$pw.Full) } })
+    $f.Add_Resize({
+        # maximized over the taskbar (bounds from another monitor, or left over from full screen): once more with the right ones
+        $pw = $script:PlayerWin
+        if (-not $pw -or $pw.Full -or $pw.FixingMax -or $pw.Form.WindowState -ne 'Maximized') { return }
+        try {
+            $wa = [System.Windows.Forms.Screen]::FromHandle($pw.Form.Handle).WorkingArea
+            $slack = [NrkNative]::GetSystemMetrics(33) + [NrkNative]::GetSystemMetrics(92) + 2
+            if ($pw.Form.Bounds.Bottom -gt $wa.Bottom + $slack -or $pw.Form.Bounds.Top -lt $wa.Top - $slack) {
+                $pw.FixingMax = $true
+                Write-Log DEBUG ('Player maximized over the taskbar ({0}); fitting it to the work area {1}' -f $pw.Form.Bounds, $wa)
+                $pw.Form.WindowState = 'Normal'; Update-MaxBounds $pw.Form $false; $pw.Form.WindowState = 'Maximized'
+            }
+        } catch { } finally { $pw.FixingMax = $false }
+    })
     $f.Add_FormClosing({
         param($s, $e)
         # Closing the player only hides it (and stops playback); the WebView is reused next time.
         if ($e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
             $e.Cancel = $true
+            if ($script:PlayerWin.Full) { Set-PlayerFullScreen $false }   # (next time it opens as a normal window)
             Stop-Player
         }
     })
@@ -6569,66 +7305,68 @@ function Get-PlayerWindow {
 
 function Start-Player {
     param($Target = $null, [switch] $FromQueue)
-    # (PowerShell names are case-insensitive: $target below IS $Target, so remember now
-    #  whether this play came from the selected file in the list)
+    # (whether this play came from the selected file in the list)
     $listFile = if (-not $Target) { $script:SelectedFile } else { $null }
-    $target = if ($Target) { $Target } else { Get-PlayTarget }
-    if ($target -and $target.File -and -not (Test-ChildAllowed $target.File)) { return }   # (child mode: too old for it)
-    if ($target -and $target.Audio) { Start-AudioPlayer $target.Audio; return }   # radio: audio bar, no window
-    if (-not $FromQueue) { Set-VideoQueue $(if ($target) { $target.File } else { $null }) }
+    $playTarget = if ($Target) { $Target } else { Get-PlayTarget }
+    if ($playTarget -and $playTarget.File -and -not (Test-ChildAllowed $playTarget.File)) { return }   # (child mode: too old for it)
+    if ($playTarget -and $playTarget.Audio) { Start-AudioPlayer $playTarget.Audio; return }   # radio: audio bar, no window
+    if (-not $FromQueue) { Set-VideoQueue $(if ($playTarget) { $playTarget.File } else { $null }) }
     # one thing at a time: a video closes the radio (another video simply replaces the current one)
-    if ($target -and $target.Url -and $script:AudioUi.Current -and (Get-AppSettings).OnePlayer) { Write-Log INFO 'Playback: closing the radio for the video'; Stop-AudioPlayer }
-    if (-not $target -or -not $target.Url) { return }
-    Write-Log INFO "UI: play $($target.Url)"
+    if ($playTarget -and $playTarget.Url -and $script:AudioUi.Current -and (Get-AppSettings).OnePlayer) { Write-Log INFO 'Playback: closing the radio for the video'; Stop-AudioPlayer }
+    if (-not $playTarget -or -not $playTarget.Url) { return }
+    Write-Log INFO "UI: play $($playTarget.Url)"
+    if ($playTarget.File -and $playTarget.File.Type -eq 'live') { try { Add-RecentChannel $playTarget.File } catch { } }   # (2.9.0: jump list, phone remote)
     if (-not (Initialize-WebView2)) {
         $msg = "The embedded player is not available:`n`n$($script:WebView2.Error)`n`nOpen the programme in your web browser instead?"
-        if ([System.Windows.Forms.MessageBox]::Show($form, $msg, 'Embedded player', 'YesNo', 'Warning') -eq 'Yes') { Start-Process $target.Url }
+        if ([System.Windows.Forms.MessageBox]::Show($form, $msg, 'Embedded player', 'YesNo', 'Warning') -eq 'Yes') { Start-Process $playTarget.Url }
         return
     }
     # programmes and episodes: the built-in player, when NRK offers a stream it can play
-    $mode = Get-VideoPlayerMode $target
+    $mode = Get-VideoPlayerMode $playTarget
     $config = $null; $note = ''
     if ($mode -eq 'builtin') {
         $res = @{ S = $null }
-        $kind = if ($target.File.Type -eq 'live') { 'channel' } else { 'program' }
-        Invoke-Ui "Loading the stream for $($target.File.Id)" { $res.S = Get-NrkVideoStream -Id $target.File.Id -Kind $kind -Manifest ([string]$target.Manifest) }
+        $kind = if ($playTarget.File.Type -eq 'live') { 'channel' } else { 'program' }
+        Invoke-Ui "Loading the stream for $($playTarget.File.Id)" { $res.S = Get-NrkVideoStream -Id $playTarget.File.Id -Kind $kind -Manifest ([string]$playTarget.Manifest) }
         $st = $res.S
         if ($st -and -not $st.Playable -and $st.Reason -and -not $st.Encrypted) {
-            Set-Status "Cannot play $($target.Title): $($st.Reason)"
-            [void][System.Windows.Forms.MessageBox]::Show($form, "$($target.Title)`n`n$($st.Reason)", 'Not playable', 'OK', 'Information')
+            Set-Status "Cannot play $($playTarget.Title): $($st.Reason)"
+            [void][System.Windows.Forms.MessageBox]::Show($form, "$($playTarget.Title)`n`n$($st.Reason)", 'Not playable', 'OK', 'Information')
             return
         }
         if ($st -and $st.Playable) {
             $stv = Get-AppSettings
             $config = [ordered]@{
-                url = $st.Url; mime = $st.Mime; title = $target.Title; poster = $st.Poster
+                url = $st.Url; mime = $st.Mime; title = $playTarget.Title; poster = $st.Poster
                 subtitles = @($st.Subtitles | ForEach-Object { [ordered]@{ url = '/__nrkb/sub?u=' + [uri]::EscapeDataString($_.url); label = $_.label; language = $_.language; default = $_.default } })
                 chapters = @($st.Chapters)
-                start = [double](Get-ResumePosition $target.File)
-                live = ($target.File.Type -eq 'live'); rate = [double]$stv.VideoRate; subSize = [int]$stv.SubSize; preferAd = [bool]$stv.PreferAD
+                start = [double](Get-ResumePosition $playTarget.File)
+                live = ($playTarget.File.Type -eq 'live'); rate = [double]$stv.VideoRate; subSize = [int]$stv.SubSize; preferAd = [bool]$stv.PreferAD
+                subStyle = [ordered]@{ color = [string]$stv.SubColor; bg = [string]$stv.SubBg; pos = [string]$stv.SubPos }
+                next = (Get-UpNextTitle $playTarget); nextIn = [Math]::Max(3, [int]$stv.UpNextSeconds)
             }
             if ($stv.SubsOff) { $config.subIndex = -1 }
             $script:PlayerExtra = @{ Subs = @($st.Subtitles); SubIndex = $(if ($stv.SubsOff) { -1 } else { [Math]::Max(-1, [array]::IndexOf(@($st.Subtitles | ForEach-Object { [bool]$_.default }), $true)) }); Versions = @($st.Versions) }
             $config = $config | ConvertTo-Json -Compress -Depth 4
-            $resumeAt = Get-ResumePosition $target.File
-            if ($resumeAt -gt 0) { $note = 'Continuing at {0}' -f (Format-PlayTime $resumeAt); Write-Log INFO "Player: continuing $($target.File.Id) at $resumeAt s" }
+            $resumeAt = Get-ResumePosition $playTarget.File
+            if ($resumeAt -gt 0) { $note = 'Continuing at {0}' -f (Format-PlayTime $resumeAt); Write-Log INFO "Player: continuing $($playTarget.File.Id) at $resumeAt s" }
         } else {
             $mode = 'web'
             $note = if ($st -and $st.Encrypted) { 'Protected programme: playing on the NRK page' } else { 'No stream for the built-in player: playing on the NRK page' }
-            Write-Log INFO "Player: $note ($($target.File.Id))"
+            Write-Log INFO "Player: $note ($($playTarget.File.Id))"
         }
     }
     try {
         $pw = Get-PlayerWindow
-        $pw.Url = $target.Url
-        $pw.Target = $target; $pw.Mode = $mode
+        $pw.Url = $playTarget.Url
+        $pw.Target = $playTarget; $pw.Mode = $mode
         $x = $script:PlayerExtra; $script:PlayerExtra = $null
         $pw.SubList = if ($mode -eq 'builtin' -and $x) { $x.Subs } else { @() }; $pw.SubIndex = if ($x) { $x.SubIndex } else { -1 }
         $pw.Versions = if ($mode -eq 'builtin' -and $x) { $x.Versions } else { @() }; $pw.ATracks = @(); $pw.ATrack = -1
         Update-PlayerExtras
         $pw.Hint.Text = if ($note) { $note } else { 'Loading...' }
         $pw.BtnMode.Text = if ($mode -eq 'builtin') { 'Open NRK page' } elseif ($script:PlayerOnly) { 'Show full page' } else { 'Player only' }
-        $pw.Form.Text = "$($target.Title)  -  NRK"
+        $pw.Form.Text = "$($playTarget.Title)  -  NRK"
         if (-not $pw.Form.Visible) {
             $pw.Form.Show()
             Enable-DarkTitleBar $pw.Form
@@ -6636,15 +7374,15 @@ function Start-Player {
         if ($pw.Form.WindowState -eq 'Minimized') { $pw.Form.WindowState = 'Normal' }
         $pw.Form.Activate()
         Update-PlayerNav
-        $go = if ($mode -eq 'builtin') { $script:VideoPlayerUrl } else { $target.Url }
+        $go = if ($mode -eq 'builtin') { $script:VideoPlayerUrl } else { $playTarget.Url }
         $pw.Pending = $config
         if ($mode -eq 'builtin' -and $pw.VReady -and $pw.WebView.CoreWebView2 -and [string]$pw.WebView.Source -eq $script:VideoPlayerUrl) {
             Send-VideoConfig                                    # the page is already up: just switch stream
         } elseif ($pw.WebView.CoreWebView2) { $pw.WebView.CoreWebView2.Navigate($go) }
         else { $pw.WebView.Source = [Uri]$go }                   # first use: also initializes WebView2
-        Set-Status $(if ($mode -eq 'builtin') { "Playing $($target.Title) in the built-in player" } else { "Opening NRK player: $($target.Url)" })
+        Set-Status $(if ($mode -eq 'builtin') { "Playing $($playTarget.Title) in the built-in player" } else { "Opening NRK player: $($playTarget.Url)" })
         # live channels have no .File; a finished programme from a channel's schedule keeps the channel
-        $played = if ($target.File) { $target.File } elseif ($listFile) { $listFile } elseif ($script:SelectedFile -and $script:SelectedFile.Type -eq 'live') { $script:SelectedFile } else { $null }
+        $played = if ($playTarget.File) { $playTarget.File } elseif ($listFile) { $listFile } elseif ($script:SelectedFile -and $script:SelectedFile.Type -eq 'live') { $script:SelectedFile } else { $null }
         Save-LastPlayed $played 'video' $(if ($FromQueue) { $script:VideoQueueNode } else { $null })
         Add-RecentPlayed $played
     } catch {
@@ -6806,6 +7544,7 @@ function Set-PlayerFullScreen([bool] $On) {
 # own player.
 
 $script:AudioPlayerUrl = 'https://radio.nrk.no/__nrkb/player.html'
+$script:VideoPlayerHtml = $script:VideoPlayerHtml.Replace('__HLSVER__', $script:HlsJsVersion)   # (the fallback link: the same hls.js version as the component)
 $script:AudioPlayerHtml = @'
 <!doctype html>
 <html><head><meta charset="utf-8"><title>NRK audio</title>
@@ -6825,7 +7564,7 @@ html, body { margin:0; height:100%; background:var(--bg); color:var(--text); fon
 .nav { display:none; } body.has-nav .nav { display:inline-flex; }
 button { background:none; border:0; color:var(--text); cursor:pointer; padding:5px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; font:inherit; }
 button:hover { background:var(--hover); }
-#sleep.on { color:var(--accent); }
+#sleep.on, #fx.on { color:var(--accent); }
 button:disabled { opacity:.35; cursor:default; background:none; }
 button svg { width:24px; height:24px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
 button svg text { fill:currentColor; stroke:none; font:700 7px "Segoe UI", sans-serif; }
@@ -6869,6 +7608,8 @@ body.is-live .live { display:inline-block; }
     </div>
   </div>
   <div class="right">
+    <button id="fx" title="Sound: skip silences, voice boost, settings for this series"><svg viewBox="0 0 24 24"><path d="M4 14v-4M8 17V7M12 20V4M16 16V8M20 13v-2"/></svg></button>
+    <button id="mini" title="Small radio window that stays on top"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><rect x="12" y="12" width="7" height="5" rx="1" fill="currentColor"/></svg></button>
     <button id="sleep" title="Sleep timer"><svg viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></svg></button>
     <button id="speed" title="Playback speed">1x</button>
     <button id="mute" title="Mute"></button>
@@ -6879,11 +7620,12 @@ body.is-live .live { display:inline-block; }
 </div>
 <audio id="a" preload="auto"></audio>
 <script src="hls.min.js"></script>
-<script>if (!window.Hls) document.write('<script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js"><\/script>');</script>
+<script>if (!window.Hls) document.write('<script src="https://cdn.jsdelivr.net/npm/hls.js@__HLSVER__/dist/hls.min.js"><\/script>');</script>
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  const a = $('a'), seek = $('seek'), vol = $('vol');
+  let a = $('a');
+  const seek = $('seek'), vol = $('vol');
   const post = m => { try { window.chrome.webview.postMessage(JSON.stringify(m)); } catch (e) { } };
   const ICON = {
     play:  '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>',
@@ -6897,6 +7639,11 @@ body.is-live .live { display:inline-block; }
     set(k, v) { try { localStorage.setItem('nrkb.' + k, JSON.stringify(v)); } catch (e) { } }
   };
   let hls = null, cur = null, live = false, dragging = false, retries = 0, announced = false, reconnects = 0, reconnectTimer = null;
+  // 2.9.0: base speed (skip silences speeds up only the quiet parts), sound effects, songs
+  let base = 1, outroHit = false, songs = [];
+  const fx = { silence: false, boost: false };
+  let ctx = null, noFx = false, fast = false, quiet = 0, saved = 0;
+  const graphs = new WeakMap();
   a.volume = Math.min(1, Math.max(0, store.get('vol', 1)));
   a.muted = !!store.get('muted', false);
 
@@ -6934,6 +7681,7 @@ body.is-live .live { display:inline-block; }
   }
   function message(text, isError) {
     const t2 = $('t2');
+    if (!isError && songs.length && live) text = (text ? text + '   ·   ' : '') + '\u266a ' + songs[0];
     t2.textContent = text; t2.title = text; t2.classList.toggle('err', !!isError);
   }
   function fail(text) {
@@ -6979,9 +7727,14 @@ body.is-live .live { display:inline-block; }
     $('t1').textContent = o.title || ''; $('t1').title = o.title || '';
     message(o.subtitle || '', false);
     $('art').style.backgroundImage = o.image ? 'url("' + String(o.image).replace(/"/g, '%22') + '")' : 'none';
-    a.defaultPlaybackRate = a.playbackRate = live ? 1 : store.get('rate', 1);
+    base = live ? 1 : (o.rate > 0 ? o.rate : store.get('rate', 1)); fast = false; quiet = 0; outroHit = false;
+    if (!o.live) songs = [];
+    a.defaultPlaybackRate = a.playbackRate = base;
     $('speed').disabled = live;
-    $('speed').textContent = fmtRate(a.playbackRate);
+    $('speed').textContent = fmtRate(base);
+    // skip the intro (this series' setting): start there unless you were further already
+    if (!live && o.intro > 0 && !(o.start > o.intro)) { o.start = o.intro; }
+    const wantFx = (fx.silence || fx.boost) && !noFx;
     const isHls = /hls|mpegurl/i.test((o.format || '') + ' ' + (o.mime || '')) || /\.m3u8/i.test(o.url || '');
     if (isHls && !a.canPlayType('application/vnd.apple.mpegurl')) {
       if (!window.Hls || !window.Hls.isSupported()) { fail('Could not load the HLS player (hls.js from cdn.jsdelivr.net). Check the internet connection.'); return; }
@@ -6997,25 +7750,101 @@ body.is-live .live { display:inline-block; }
       hls.loadSource(o.url);
       hls.attachMedia(a);
     } else {
-      a.src = o.url;
-      if (o.start) a.addEventListener('loadedmetadata', () => { try { a.currentTime = o.start; } catch (e) { } }, { once: true });
+      // a plain file from another site: the sound effects need it fetched with CORS. A tiny test
+      // request first; if that site says no, it plays without them (and the 'error' handler too)
+      const go = cors => {
+        if (cur !== o) return;
+        if (graphs.has(a) && !cors) renewElement();   // (through Web Audio a no-CORS file would play silent)
+        if (cors) a.crossOrigin = 'anonymous'; else a.removeAttribute('crossorigin');
+        if (!cors && wantFx) { o.noCors = true; message((o.subtitle ? o.subtitle + '   ·   ' : '') + 'sound effects not available for this file', false); post({ type: 'log', msg: 'no CORS for this file: playing without the sound effects' }); }
+        a.src = o.url;
+        if (o.start) a.addEventListener('loadedmetadata', () => { try { a.currentTime = o.start; } catch (e) { } }, { once: true });
+        if (cors) useFx();
+        play(); render();
+      };
+      if (wantFx && !o.noCors) fetch(o.url, { headers: { Range: 'bytes=0-1' }, mode: 'cors', cache: 'no-store' }).then(r => go(r.ok || r.status === 206)).catch(() => go(false));
+      else go(false);
+      setSession(o);
+      render();
+      return;
     }
+    if (wantFx) useFx();
     play();
     setSession(o);
     render();
   }
 
+  // ---- sound effects (Web Audio): voice boost (a compressor that lifts quiet speech) and skip
+  // silences (the quiet parts play faster; the speed button keeps your own speed)
+  function graph() {
+    if (graphs.has(a)) return graphs.get(a);
+    if (!ctx) { const C = window.AudioContext || window.webkitAudioContext; if (!C) return null; ctx = new C(); }
+    const g = { src: ctx.createMediaElementSource(a), comp: ctx.createDynamicsCompressor(), gain: ctx.createGain(), an: ctx.createAnalyser() };
+    g.comp.threshold.value = -30; g.comp.knee.value = 12; g.comp.ratio.value = 5; g.comp.attack.value = 0.004; g.comp.release.value = 0.25;
+    g.an.fftSize = 2048; g.buf = new Float32Array(g.an.fftSize);
+    graphs.set(a, g); sinkSync(true);
+    return g;
+  }
+  function route() {
+    const g = graphs.get(a); if (!g) return;
+    try { g.src.disconnect(); g.comp.disconnect(); g.gain.disconnect(); g.an.disconnect(); } catch (e) { }
+    if (fx.boost) { g.src.connect(g.comp); g.comp.connect(g.gain); g.gain.gain.value = 1.8; g.gain.connect(g.an); }
+    else g.src.connect(g.an);
+    g.an.connect(ctx.destination);
+  }
+  function useFx() { try { if (graph()) { route(); if (ctx.state !== 'running') ctx.resume(); } } catch (e) { post({ type: 'log', msg: 'sound effects not available: ' + e }); } }
+  function sinkSync(force) {
+    // the chosen sound output (Options > Playback) also for the effects' path
+    try { const s = window.__nrkbSink; if (ctx && s && typeof ctx.setSinkId === 'function' && (force || ctx.sinkId !== s.id)) ctx.setSinkId(s.id || '').catch(() => { }); } catch (e) { }
+  }
+  setInterval(() => sinkSync(false), 3000);
+  setInterval(() => {
+    const g = graphs.get(a);
+    if (!fx.silence || live || !g || a.paused || !cur) { if (fast) { fast = false; a.playbackRate = base; } return; }
+    g.an.getFloatTimeDomainData(g.buf);
+    let sum = 0; for (let i = 0; i < g.buf.length; i++) sum += g.buf[i] * g.buf[i];
+    const rms = Math.sqrt(sum / g.buf.length);
+    if (rms < 0.008) quiet += 100; else if (rms > 0.012) quiet = 0;
+    if (!fast && quiet >= 400) { fast = true; a.playbackRate = Math.min(4, base * 2.5); }
+    else if (fast && quiet === 0) { fast = false; a.playbackRate = base; }
+    if (fast) saved += 0.1 * (a.playbackRate / base - 1);
+    $('fx').title = 'Sound: skip silences' + (fx.boost ? ', voice boost' : '') + (saved >= 1 ? '  (saved ' + fmt(saved) + ')' : '');
+  }, 100);
+  function renewElement() {
+    // a fresh <audio> (one that went through Web Audio can't play a no-CORS file with sound)
+    const old = a, n = document.createElement('audio');
+    n.preload = 'auto'; n.volume = old.volume; n.muted = old.muted;
+    try { old.pause(); old.removeAttribute('src'); old.load(); } catch (e) { }
+    old.replaceWith(n); n.id = 'a'; a = n; wire(a);
+  }
+  let lastPos = 0;
+  const pos = force => { const n = Date.now(); if (!cur || live || !(a.currentTime > 0)) return; if (!force && n - lastPos < 5000) return; lastPos = n; post({ type: 'apos', t: a.currentTime, d: isFinite(a.duration) ? a.duration : 0 }); };
+  function wire(a) {
   ['timeupdate', 'play', 'pause', 'durationchange', 'progress', 'volumechange', 'ratechange', 'loadedmetadata', 'seeked'].forEach(n => a.addEventListener(n, render));
   a.addEventListener('playing', () => { if (reconnects) { message(cur && cur.subtitle || '', false); reconnects = 0; } if (!announced) { announced = true; post({ type: 'playing' }); } });
   a.addEventListener('ended', () => { render(); post({ type: 'ended', t: a.currentTime, d: a.duration || 0 }); });
   // where you are (not for live radio), every 5 s and on pause/seek, so it continues there next time
-  let lastPos = 0;
-  const pos = force => { const n = Date.now(); if (!cur || live || !(a.currentTime > 0)) return; if (!force && n - lastPos < 5000) return; lastPos = n; post({ type: 'apos', t: a.currentTime, d: isFinite(a.duration) ? a.duration : 0 }); };
   a.addEventListener('timeupdate', () => pos(false));
+  // skip the outro (this series' setting): the last N seconds count as the end
+  a.addEventListener('timeupdate', () => {
+    if (!cur || live || outroHit || !(cur.outro > 0) || !isFinite(a.duration) || a.duration < cur.outro * 2 + 10) return;   // (not on files hardly longer than the part to skip)
+    if (a.duration - a.currentTime <= cur.outro) { outroHit = true; a.pause(); render(); post({ type: 'ended', t: a.duration, d: a.duration, outro: true }); }
+  });
   a.addEventListener('pause', () => pos(true));
   a.addEventListener('seeked', () => pos(true));
   ['play', 'pause', 'volumechange'].forEach(n => a.addEventListener(n, () => post({ type: 'state', paused: a.paused, muted: a.muted })));
-  a.addEventListener('error', () => { if (!hls && cur) fail('Could not play this file (media error ' + (a.error ? a.error.code : '?') + ')'); });
+  a.addEventListener('error', () => {
+    if (!hls && cur && a.crossOrigin && !cur.noCors) {
+      // the file's site doesn't allow the sound effects: play it without them
+      post({ type: 'log', msg: 'no CORS for this file: playing without the sound effects' });
+      const o = Object.assign({}, cur, { noCors: true, start: a.currentTime || cur.start }); renewElement(); load(o, true);
+      message((o.subtitle ? o.subtitle + '   ·   ' : '') + 'sound effects not available for this file', false);
+      return;
+    }
+    if (!hls && cur) fail('Could not play this file (media error ' + (a.error ? a.error.code : '?') + ')');
+  });
+  }
+  wire(a);
 
   seek.addEventListener('input', () => { dragging = true; render(); });
   seek.addEventListener('change', () => {
@@ -7030,11 +7859,15 @@ body.is-live .live { display:inline-block; }
   $('fwd').onclick = () => skip(15);
   $('live').onclick = () => { const [, e] = span(); if (e) a.currentTime = e - 3; play(); };
   $('speed').onclick = () => {
-    const i = SPEEDS.indexOf(a.playbackRate);
-    a.playbackRate = SPEEDS[(i + 1) % SPEEDS.length];
-    store.set('rate', a.playbackRate);
-    $('speed').textContent = fmtRate(a.playbackRate);
+    const i = SPEEDS.indexOf(base);
+    base = SPEEDS[(i + 1) % SPEEDS.length];
+    fast = false; a.playbackRate = base;
+    // a series with its own speed keeps it there (the app saves it); otherwise the general one
+    if (cur && cur.key) post({ type: 'rate', key: cur.key, rate: base }); else store.set('rate', base);
+    $('speed').textContent = fmtRate(base);
   };
+  $('fx').onclick = () => { const r = $('fx').getBoundingClientRect(); post({ type: 'fx', x: r.left, y: r.top }); };
+  $('mini').onclick = () => post({ type: 'mini' });
   $('mute').onclick = () => { a.muted = !a.muted; if (!a.muted && a.volume === 0) a.volume = 0.5; store.set('muted', a.muted); };
   vol.addEventListener('input', () => { a.volume = vol.value / 100; a.muted = a.volume === 0; store.set('vol', a.volume); store.set('muted', a.muted); });
   $('open').onclick = () => { if (cur && cur.webUrl) post({ type: 'open', url: cur.webUrl }); };
@@ -7061,14 +7894,33 @@ body.is-live .live { display:inline-block; }
       $('next').title = n && n.next ? 'Next: ' + n.next : 'This is the last one';
     },
     theme(t) { for (const k in t) document.documentElement.style.setProperty('--' + k, t[k]); },
-    setSleep(on, label) { $('sleep').classList.toggle('on', !!on); $('sleep').title = on ? 'Sleep timer: ' + label : 'Sleep timer'; }
+    setSleep(on, label) { $('sleep').classList.toggle('on', !!on); $('sleep').title = on ? 'Sleep timer: ' + label : 'Sleep timer'; },
+    // 2.9.0
+    skip(sec) { skip(sec); },
+    setFx(o) {
+      fx.silence = !!o.silence; fx.boost = !!o.boost;
+      $('fx').classList.toggle('on', fx.silence || fx.boost);
+      if ((fx.silence || fx.boost) && cur && !hls && !cur.noCors && !a.crossOrigin) { const p = Object.assign({}, cur, { start: a.currentTime }); load(p, true); return; }   // (a plain file needs to be fetched again with CORS)
+      if (fx.silence || fx.boost) { if (cur && !(cur.noCors && !hls)) useFx(); } else route();
+      if (!fx.silence && fast) { fast = false; a.playbackRate = base; }
+    },
+    setRate(r) { if (live || !(r > 0)) return; base = r; fast = false; a.playbackRate = r; $('speed').textContent = fmtRate(r); },
+    setSkip(o) { if (cur) { cur.intro = +o.intro || 0; cur.outro = +o.outro || 0; } },
+    song(list) { songs = list || []; if (cur) message(cur.subtitle || '', false); $('t2').title = songs.length ? 'Played on ' + (cur && cur.title || '') + ':\n' + songs.join('\n') : ''; },
+    fade(sec) { if (fadeFrom === null) fadeFrom = a.volume; clearInterval(fadeTimer); const steps = Math.max(1, Math.round(sec * 4)); let n = 0; fadeTimer = setInterval(() => { n++; a.volume = Math.max(0, fadeFrom * (1 - n / steps)); if (n >= steps) clearInterval(fadeTimer); }, 250); },
+    unfade() { clearInterval(fadeTimer); if (fadeFrom !== null) { a.volume = fadeFrom; fadeFrom = null; } },
+    fadeIn(sec) { const to = a.volume || 1; a.volume = 0; clearInterval(fadeTimer); const steps = Math.max(1, Math.round(sec * 4)); let n = 0; fadeTimer = setInterval(() => { n++; a.volume = Math.min(to, to * n / steps); if (n >= steps) clearInterval(fadeTimer); }, 250); },
+    vol(d) { a.muted = false; a.volume = Math.min(1, Math.max(0, a.volume + d)); store.set('vol', a.volume); store.set('muted', false); },
+    state() { return JSON.stringify({ title: cur ? cur.title : '', sub: cur ? (live && songs.length ? '\u266a ' + songs[0] : cur.subtitle) : '', paused: a.paused, live: live, t: a.currentTime || 0, d: isFinite(a.duration) ? a.duration : 0 }); }
   };
+  let fadeTimer = null, fadeFrom = null;
   render();
   post({ type: 'ready', hls: !!window.Hls });
 })();
 </script>
 </body></html>
 '@
+$script:AudioPlayerHtml = $script:AudioPlayerHtml.Replace('__HLSVER__', $script:HlsJsVersion)
 
 function ConvertTo-CssColor([System.Drawing.Color] $Color) { '#{0:x2}{1:x2}{2:x2}' -f $Color.R, $Color.G, $Color.B }
 
@@ -7102,6 +7954,7 @@ function Invoke-AudioMessage {
             Write-Log INFO "Audio player page ready (hls.js loaded: $($Message.hls))"
             if ((Get-AppSettings).AudioDevice) { Set-AudioSinkPermission $true; Send-AudioSink }
             Update-AudioTheme
+            Send-AudioFx
             if ($u.Last) { Invoke-AudioScript "nrkb.load($($u.Last))"; Invoke-AudioScript "nrkb.setNav($(Get-AudioNavJson))" }
         }
         'playing' { Write-Log INFO "Audio: playing $($u.Current.Title)"; Set-Status "Playing: $($u.Current.Title)"; Set-TrayText $u.Current.Title }
@@ -7113,6 +7966,9 @@ function Invoke-AudioMessage {
             if ((Get-AppSettings).AutoNext -or ($u.UserQueue -and $u.UserQueue.Count)) { Start-NextAudio 1 }
         }
         'sleep'   { Show-SleepMenu $null }
+        'rate'    { if ($Message.key -and $u.Current) { Set-SeriesPref ([string]$Message.key) ([string]$(if ($u.Current.SeriesTitle) { $u.Current.SeriesTitle } else { $u.Current.Title })) @{ Rate = [double]$Message.rate }; Write-Log INFO "Audio: speed $($Message.rate)x kept for $($Message.key)" } }
+        'fx'      { Show-AudioFxMenu }
+        'mini'    { Show-RadioMini }
         'next'    { Start-NextAudio 1 }
         'prev'    { Start-NextAudio -1 }
         'error'   { Write-Log ERROR "Audio player: $($Message.msg) ($($u.Current.ManifestPath))"; Set-Status "Audio: $($Message.msg)" }
@@ -7225,24 +8081,29 @@ function Start-AudioPlayer {
         # the list it was started from, so the next episode follows automatically
         $u.Queue = @($script:Files | Where-Object { $_.Type -eq 'audio' -and $_.Playable })
         $u.QueueNode = $folderTree.SelectedNode
-        if ((Get-FolderTag).Kind -in 'recent', 'search', 'newweek', 'expiring') { $u.Queue = @() }   # a mixed list: no "next episode"
+        if ((Get-FolderTag).Kind -in $script:MixedKinds) { $u.Queue = @() }   # a mixed list: no "next episode"
         $u.Index = -1
         for ($i = 0; $i -lt $u.Queue.Count; $i++) { if ([object]::ReferenceEquals($u.Queue[$i], $File)) { $u.Index = $i; break } }
         if ($File.Type -ne 'audio' -or $u.Index -lt 0) { $u.Queue = @(); $u.Index = -1 }
     }
     $u.Current = $File
+    $pref = if ($File.Type -eq 'audio') { Get-SeriesPref (Get-SeriesPrefKey $File) } else { @{ Rate = 0.0; Intro = 0; Outro = 0 } }
     $sub = if ($File.Type -eq 'radiolive') { 'Direkte' } else { (@($File.SeriesTitle, $File.Date) | Where-Object { $_ }) -join '  ·  ' }
     $u.Last = [ordered]@{
         url = $st.Url; format = $st.Format; mime = $st.Mime; live = [bool]$st.Live
         # (live channels: the middle of the wide channel poster, like radio.nrk.no shows it; episodes: the square picture)
         title = $File.Title; subtitle = $sub; image = $(if ($File.Type -eq 'radiolive' -and $File.ImageUrl) { $File.ImageUrl } elseif ($File.SquareUrl) { $File.SquareUrl } else { $File.ImageUrl }); webUrl = $File.WebUrl
         start = $(if ($File.Type -eq 'audio' -and -not $st.Live) { [double](Get-ResumePosition $File) } else { 0 })
+        # 2.9.0: this series' own speed and the parts to skip (seriesprefs.json)
+        key = $(if ($File.Type -eq 'audio') { Get-SeriesPrefKey $File } else { $null }); rate = [double]$pref.Rate; intro = [int]$pref.Intro; outro = [int]$pref.Outro
     } | ConvertTo-Json -Compress
     Show-AudioBar
     Save-LastPlayed $File 'audio' $(if ($FromQueue) { $u.QueueNode } else { $null })
     Add-RecentPlayed $File
+    Send-AudioFx
     Invoke-AudioScript "nrkb.load($($u.Last))"   # not ready yet: sent when the page says 'ready'
     Invoke-AudioScript "nrkb.setNav($(Get-AudioNavJson))"
+    if ($File.Type -eq 'radiolive') { try { Add-RecentChannel $File } catch { }; if ((Get-AppSettings).NowPlaying) { Start-NowPlaying } }
     Set-Status "Loading $($File.Title)..."
 }
 
@@ -7308,7 +8169,7 @@ function Invoke-Back {
 
 #---- Download queue -------------------------------------------------------------
 # Every Download (button, right-click, folder) adds files to a queue; nothing starts until
-# "Download selected" / "Download all" is pressed in the Downloads window. One file is
+# "Download selected" is pressed in the Downloads window. One file is
 # downloaded at a time by a hidden process (FFmpeg, for TV and radio);
 # its output is shown in the window and copied to the app log. Each item remembers the
 # files it created, so a cancelled download can be cleaned up.
@@ -7934,7 +8795,7 @@ function Start-Cast($Device, $File, [object[]] $Queue = $null, [int] $Index = -1
     # the list it came from, so the next episode follows (not for mixed lists: search, recent, new, last chance)
     if ($null -eq $Queue) {
         $QueueNode = $folderTree.SelectedNode
-        if ($File.Type -in 'episode', 'program', 'audio' -and (Get-FolderTag).Kind -notin 'recent', 'search', 'newweek', 'expiring') {
+        if ($File.Type -in 'episode', 'program', 'audio' -and (Get-FolderTag).Kind -notin $script:MixedKinds) {
             $Queue = @($script:Files | Where-Object { $_.Type -eq $File.Type -and (Test-FileAvailable $_) })
             $Index = -1; for ($i = 0; $i -lt $Queue.Count; $i++) { if ([object]::ReferenceEquals($Queue[$i], $File)) { $Index = $i; break } }
             if ($Index -lt 0) { $Queue = @() }
@@ -8013,6 +8874,8 @@ function Update-CastSession {
     $s = $script:Cast.Session
     if (-not $s) { $script:CastTimer.Stop(); return }
     if ($s.Device.Kind -eq 'dlna') { Update-DlnaSession $s; Update-CastBar; return }
+    $srv = $script:Cast.Server
+    if ($srv) { $l = $null; while ($srv.Log.TryDequeue([ref]$l)) { } }   # (a line per stream piece: not kept)
     $msg = $null
     while ($s.Link.Inbox.TryDequeue([ref]$msg)) {
         $parts = $msg.Split("`n", 3)
@@ -8298,7 +9161,7 @@ function New-CastBar {
     $bar.Controls.Add($mid); $bar.Controls.Add($right); $bar.Controls.Add($info); $bar.Controls.Add($line)
     $tips = New-Object System.Windows.Forms.ToolTip
     $tips.SetToolTip($bBack, 'Back 30 seconds'); $tips.SetToolTip($bFwd, 'Forward 30 seconds'); $tips.SetToolTip($bSubs, 'Subtitles on/off (Chromecast)'); $tips.SetToolTip($bMute, 'Mute on the device')
-    $script:CastUi = @{ Bar = $bar; Info = $info; Play = $bPlay; Time = $time; Subs = $bSubs; Mute = $bMute; Vol = $vol; Seek = $seek; Dragging = $false; Tips = $tips; Back = $bBack; Fwd = $bFwd }
+    $script:CastUi = @{ Bar = $bar; Stop = $bStop; Info = $info; Play = $bPlay; Time = $time; Subs = $bSubs; Mute = $bMute; Vol = $vol; Seek = $seek; Dragging = $false; Tips = $tips; Back = $bBack; Fwd = $bFwd }
     $bBack.Add_Click({ Invoke-CastCommand 'rel' -30 })
     $bFwd.Add_Click({ Invoke-CastCommand 'rel' 30 })
     $bPlay.Add_Click({ Invoke-CastCommand 'toggle' })
@@ -8324,6 +9187,7 @@ function Show-CastBar {
         $form.Controls.SetChildIndex($bar, $form.Controls.GetChildIndex($audioBar))
         Set-DarkTheme $bar
         foreach ($c in @($bar) + @($bar.Controls)) { if ($c -is [System.Windows.Forms.Panel] -and $c.Height -ne 1) { $c.BackColor = $T.Panel } }
+        $script:CastUi.Stop.ForeColor = $T.Bad   # (the theme pass made it plain)
     }
     $script:CastUi.Bar.Visible = $true; Update-CastBar
 }
@@ -8366,12 +9230,19 @@ function Set-SleepTimer([int] $Minutes = 0, [switch] $EndOfItem) {
     $z = $script:Sleep
     $z.EndOfItem = [bool]$EndOfItem
     $z.Until = if ($Minutes -gt 0) { (Get-Date).AddMinutes($Minutes) } else { $null }
+    Stop-SleepFade; if ($z.Timer) { $z.Timer.Interval = 15000 }
     if (-not $z.Timer) {
         $z.Timer = New-Object System.Windows.Forms.Timer; $z.Timer.Interval = 15000
         $z.Timer.Add_Tick({
             $z = $script:Sleep
             if ($z.Until -and (Get-Date) -ge $z.Until) { Invoke-SleepNow }
-            else { Update-SleepUi }
+            else {
+                # 2.9.0: the last minute gets quieter (Options > Listening); the timer looks every second then
+                $left = if ($z.Until) { ($z.Until - (Get-Date)).TotalSeconds } else { 999 }
+                if ($left -le 75) { $z.Timer.Interval = 1000 }
+                if ($left -le 60 -and (Get-AppSettings).SleepFade) { Start-SleepFade ([Math]::Max(1, $left)) }
+                Update-SleepUi
+            }
         })
     }
     if ($z.Until -or $z.EndOfItem) { $z.Timer.Start(); Write-Log INFO "Sleep timer: $(Get-SleepLabel)"; Set-Status "Sleep timer: $(Get-SleepLabel)" }
@@ -8393,6 +9264,8 @@ function Invoke-SleepNow {
     Write-Log INFO 'Sleep timer: pausing'
     if ($script:Cast.Session) { Invoke-CastCommand 'pause' }
     else { $m = Get-MediaState; if ($m.Playing) { Invoke-MediaCommand 'pause' } }
+    Stop-SleepFade   # (paused: the volume back for next time)
+    if ($script:Sleep.Timer) { $script:Sleep.Timer.Interval = 15000 }
     Update-SleepUi
     Set-Status 'Sleep timer: paused'
     if ($script:TrayUi -and $script:TrayUi.Icon.Visible) { $script:TrayUi.Icon.ShowBalloonTip(3000, 'NRK Browser', 'Sleep timer: paused', [System.Windows.Forms.ToolTipIcon]::None) }
@@ -8445,6 +9318,76 @@ function Invoke-PlayerScript([string] $Js) {
     if ($pw -and $pw.WebView.CoreWebView2) { try { [void]$pw.WebView.CoreWebView2.ExecuteScriptAsync("window.nrkb && $Js") } catch { } }
 }
 
+function Get-UpNextTitle($Target) {
+    # the title for the "next episode" card, or $null (no card: off, live, last one, or not from a list)
+    $st = Get-AppSettings
+    if (-not $st.UpNextCard -or -not $st.AutoNext -or -not $Target -or -not $Target.File -or $Target.File.Type -eq 'live') { return $null }
+    $q = @($script:VideoQueue); $i = $script:VideoIndex
+    if ($q.Count -lt 2 -or $i -lt 0 -or $i -ge $q.Count - 1) { return $null }
+    return [string]$q[$i + 1].Title
+}
+
+function Show-PlayerQualityMenu {
+    $pw = $script:PlayerWin
+    if (-not $script:QualMenu) { $script:QualMenu = New-ThemedMenu }
+    $m = $script:QualMenu; $m.Items.Clear()
+    $now = @($pw.Levels | Where-Object { [int]$_.i -eq [int]$pw.LevelNow }) | Select-Object -First 1
+    $auto = New-ThemedMenuItem $(if ($now -and $now.h) { 'Auto  (now {0}p)' -f $now.h } else { 'Auto' }); $auto.Tag = -1; $auto.Checked = ($pw.Level -lt 0)
+    $auto.Add_Click({ Invoke-PlayerScript 'nrkb.level(-1)'; $script:PlayerWin.Level = -1 }); [void]$m.Items.Add($auto)
+    foreach ($l in @($pw.Levels | Sort-Object { [int]$_.h }, { [int]$_.br } -Descending)) {
+        $label = if ($l.h) { '{0}p' -f $l.h } else { 'Level {0}' -f ([int]$l.i + 1) }
+        if ($l.br) { $label += '   ({0:N1} Mbit/s)' -f ([double]$l.br / 1e6) }
+        $it = New-ThemedMenuItem $label; $it.Tag = [int]$l.i; $it.Checked = ([int]$pw.Level -eq [int]$l.i)
+        $it.Add_Click({ Invoke-PlayerScript "nrkb.level($($this.Tag))"; $script:PlayerWin.Level = [int]$this.Tag; Write-Log INFO "Player: quality $($this.Text)" }); [void]$m.Items.Add($it)
+    }
+    $m.Show($pw.Qual, (New-Object System.Drawing.Point(0, ($pw.Qual.Height + 2))))
+}
+
+function Save-PlayerShot($M) {
+    # the picture from the page (PNG, base64) into Pictures\NRK-Browser
+    if ($M.error) { Set-Status "Screenshot not saved: $($M.error)"; Write-Log WARN "Screenshot: $($M.error)"; return }
+    try {
+        $dir = Join-Path ([Environment]::GetFolderPath('MyPictures')) 'NRK-Browser'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $pw = $script:PlayerWin
+        $title = if ($pw.Target -and $pw.Target.Title) { [string]$pw.Target.Title } else { 'NRK' }
+        $f = Join-Path $dir ('{0} {1}.png' -f (Get-SafeFileName $title), (Format-PlayTime ([double]$M.t)).Replace(':', '.'))
+        [IO.File]::WriteAllBytes($f, [Convert]::FromBase64String([string]$M.data))
+        Write-Log INFO "Screenshot saved: $f"
+        Set-Status "Screenshot saved: $f"
+        if ($pw.Hint) { $pw.Hint.Text = 'Screenshot saved in Pictures\NRK-Browser' }
+    } catch { Write-LogException $_ 'Screenshot' }
+}
+
+function Set-PlayerMini([bool] $On) {
+    # a small player that stays on top in the corner (again: back to how it was)
+    $pw = $script:PlayerWin
+    if (-not $pw -or $pw.Form.IsDisposed) { return }
+    $f = $pw.Form
+    if ($On -and -not $pw.Mini) {
+        if ($pw.Full) { Set-PlayerFullScreen $false }
+        $pw.Mini = @{ Bounds = $(if ($f.WindowState -eq 'Normal') { $f.Bounds } else { $f.RestoreBounds }); State = $f.WindowState; TopMost = $f.TopMost; Border = $f.FormBorderStyle; Min = $f.MinimumSize }
+        $f.WindowState = 'Normal'
+        $f.FormBorderStyle = 'SizableToolWindow'; $f.MinimumSize = New-Object System.Drawing.Size(320, 220)
+        $wa = [System.Windows.Forms.Screen]::FromHandle($f.Handle).WorkingArea
+        $w = 520; $h = 340
+        $f.Bounds = New-Object System.Drawing.Rectangle(($wa.Right - $w - 16), ($wa.Bottom - $h - 16), $w, $h)
+        $f.TopMost = $true
+        $pw.MiniBtn.Text = 'Normal size'
+        Write-Log INFO 'Player: mini player'
+    } elseif (-not $On -and $pw.Mini) {
+        $prev = $pw.Mini; $pw.Mini = $null
+        $f.FormBorderStyle = $prev.Border; $f.MinimumSize = $prev.Min; $f.TopMost = $prev.TopMost
+        $f.Bounds = $prev.Bounds
+        if ($prev.State -eq 'Maximized') { $f.WindowState = 'Maximized' }
+        $pw.MiniBtn.Text = 'Mini'
+        foreach ($c in $pw.Bar.Controls) { $c.Visible = $true }
+        Update-PlayerNav
+        Write-Log INFO 'Player: normal size'
+    }
+    Update-PlayerExtras
+}
+
 function Format-Rate([double] $R) { return ('{0}x' -f $R.ToString('0.##', [Globalization.CultureInfo]::InvariantCulture)) }
 
 function Update-PlayerExtras {
@@ -8457,6 +9400,8 @@ function Update-PlayerExtras {
     $pw.Subs.Visible = ($b -and @($pw.SubList).Count -gt 0)
     $pw.Audio.Visible = ($b -and (@($pw.ATracks).Count -gt 1 -or @($pw.Versions).Count -gt 0))
     foreach ($x in $pw.StartOver, $pw.LiveBack, $pw.LiveGo) { $x.Visible = ($b -and $live) }
+    if ($pw.Qual) { $pw.Qual.Visible = ($b -and @($pw.Levels).Count -gt 1); $pw.Shot.Visible = $b }
+    if ($pw.Mini) { foreach ($c in $pw.Bar.Controls) { if ($c -ne $pw.MiniBtn) { $c.Visible = $false } } }   # (mini: only the way back)
     Update-SleepUi
 }
 
@@ -8476,6 +9421,17 @@ function Show-PlayerSubsMenu {
     foreach ($k in $script:SubSizes.Keys) {
         $z = New-ThemedMenuItem ('   ' + $script:SubSizes[$k]); $z.Tag = $k; $z.Checked = ([string]$st.SubSize -eq $k)
         $z.Add_Click({ $s = Get-AppSettings; $s.SubSize = [int]$this.Tag; Save-AppSettings $s; Invoke-PlayerScript "nrkb.subSize($($this.Tag))" }); [void]$m.Items.Add($z)
+    }
+    # colour, background and height (kept for every programme)
+    foreach ($grp in @(@('Colour', 'SubColor', 'color', [ordered]@{ white = 'White'; yellow = 'Yellow'; cyan = 'Light blue'; green = 'Green' }),
+                       @('Background', 'SubBg', 'bg', [ordered]@{ box = 'Dark box (as NRK)'; solid = 'Black box'; shadow = 'No box, shadow' }),
+                       @('Position', 'SubPos', 'pos', [ordered]@{ bottom = 'Bottom'; raised = 'A bit higher'; top = 'Top' }))) {
+        [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+        $h = New-ThemedMenuItem $grp[0]; $h.Enabled = $false; [void]$m.Items.Add($h)
+        foreach ($k in $grp[3].Keys) {
+            $z = New-ThemedMenuItem ('   ' + $grp[3][$k]); $z.Tag = @{ Key = $grp[1]; Js = $grp[2]; Val = $k }; $z.Checked = ([string]$st.($grp[1]) -eq $k)
+            $z.Add_Click({ $t = $this.Tag; $s = Get-AppSettings; $s.($t.Key) = $t.Val; Save-AppSettings $s; Invoke-PlayerScript ("nrkb.subStyle({{""{0}"":""{1}""}})" -f $t.Js, $t.Val) }); [void]$m.Items.Add($z)
+        }
     }
     $m.Show($pw.Subs, (New-Object System.Drawing.Point(0, ($pw.Subs.Height + 2))))
 }
@@ -8561,7 +9517,7 @@ function Clear-DlHistory { $script:DlHist = @{}; Remove-Item -LiteralPath $scrip
 
 # ---- download hours, speed, space, a note when the queue is done -----------------------------
 function Test-DownloadWindow {
-    # Options > Downloads > "Only download between": '' = any time; '01:00-07:00' (may pass midnight)
+    # Options > Download rules > "Only download between": '' = any time; '01:00-07:00' (may pass midnight)
     $w = [string](Get-AppSettings).DlWindow
     if ($w -notmatch '^\s*(\d{1,2}):(\d\d)\s*-\s*(\d{1,2}):(\d\d)\s*$') { return $true }
     $a = [int]$Matches[1] * 60 + [int]$Matches[2]; $b = [int]$Matches[3] * 60 + [int]$Matches[4]
@@ -8616,7 +9572,7 @@ function Show-AppNotification([string] $Title, [string] $Text, [string] $Icon = 
     } catch { Write-Log DEBUG "Notification: $($_.Exception.Message)" }
 }
 
-# ---- whole series: only the newest N / only after a date (Options > Downloads) ---------------
+# ---- whole series: only the newest N / only after a date (Options > Download rules) ---------------
 function Select-SeriesFiles([object[]] $Files) {
     $st = Get-AppSettings
     $list = @($Files)
@@ -8680,6 +9636,28 @@ function Write-DownloadNfo($Plan, $Item) {
 }
 
 # ---- radio in pieces (pause/resume like TV), then one pass: format, tags, cover ----------------
+function Wait-FinishProcess($Proc, [string] $OutFile) {
+    # The finishing FFmpeg (subtitles, chapters, cover; radio format): no fixed time limit - a long
+    # film on a slow disk may take a while - but stopped when its output has not grown for 3 minutes.
+    # The window stays usable meanwhile; Exit, Cancel and the queue know a file is being finished
+    # ($script:DlRun.Finishing) and Exit may stop it ($script:DlRun.FinishProc).
+    $script:DlRun.FinishProc = $Proc
+    try {
+        $ui = [bool]('System.Windows.Forms.Application' -as [type])
+        $lastLen = -1L; $still = [Diagnostics.Stopwatch]::StartNew()
+        while (-not $Proc.HasExited) {
+            if ($ui) { [System.Windows.Forms.Application]::DoEvents() }
+            Start-Sleep -Milliseconds 50
+            if ($still.Elapsed.TotalSeconds -ge 5) {
+                $len = try { (New-Object IO.FileInfo($OutFile)).Length } catch { 0L }
+                if ($len -ne $lastLen) { $lastLen = $len; $still.Restart() }
+                elseif ($still.Elapsed.TotalSeconds -ge 180) { try { $Proc.Kill() } catch { }; throw 'FFmpeg stopped writing for 3 minutes' }
+            }
+        }
+        if ($script:DlRun.FinishStop) { throw 'stopped (the app is closing)' }
+    } finally { $script:DlRun.FinishProc = $null }
+}
+
 function Complete-RadioDownload($Plan, $Item) {
     $ff = (Find-FFmpeg).Path
     $work = Join-Path $script:AppDataDir 'dltmp'; New-Item -ItemType Directory -Path $work -Force | Out-Null
@@ -8696,10 +9674,8 @@ function Complete-RadioDownload($Plan, $Item) {
         $psi.FileName = $ff; $psi.Arguments = ConvertTo-ArgString $argv
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardError = $true
         $p = [System.Diagnostics.Process]::Start($psi); Add-ProcessToJob $p
-        $err = $p.StandardError.ReadToEndAsync(); $sw = [Diagnostics.Stopwatch]::StartNew()
-        $ui = [bool]('System.Windows.Forms.Application' -as [type])
-        while (-not $p.HasExited -and $sw.Elapsed.TotalSeconds -lt 600) { if ($ui) { [System.Windows.Forms.Application]::DoEvents() }; Start-Sleep -Milliseconds 50 }
-        if (-not $p.HasExited) { try { $p.Kill() } catch { }; throw 'took more than 10 minutes' }
+        $err = $p.StandardError.ReadToEndAsync()
+        Wait-FinishProcess $p ([string]$argv[-1])
         if ($p.ExitCode -ne 0) { throw ("ffmpeg exit {0}: {1}" -f $p.ExitCode, (($err.Result -split "`n" | Select-Object -First 3) -join ' ')) }
         Remove-Item -LiteralPath $Plan.Part -Force; $ok = $true
     } catch {
@@ -8714,6 +9690,7 @@ function Complete-RadioDownload($Plan, $Item) {
 # ---- update the tags and cover of a finished TV download ------------------------------------
 function Update-DownloadTags([object[]] $Items) {
     $n = 0
+    if ($script:DlRun.Finishing) { Write-DownloadLog 'Update tags: wait until the file being finished is done'; return }
     foreach ($it in @($Items | Where-Object { $_.Kind -eq 'tv' -and $_.Status -eq 'Done' })) {
         $file = @(Get-DownloadedFileSet $it | Where-Object { $_ -match '\.(mp4|mkv)$' }) | Select-Object -First 1
         if (-not $file) { Write-DownloadLog "Update tags: the file of $($it.Title) is not there"; continue }
@@ -8723,7 +9700,8 @@ function Update-DownloadTags([object[]] $Items) {
             $plan.Out = $file; $plan.Base = [IO.Path]::Combine([IO.Path]::GetDirectoryName($file), [IO.Path]::GetFileNameWithoutExtension($file)); $plan.Folder = [IO.Path]::GetDirectoryName($file)
             $plan.Part = "$($plan.Base).part$([IO.Path]::GetExtension($file))"
             Move-Item -LiteralPath $file -Destination $plan.Part -Force
-            $note = Complete-TvDownload $plan $it
+            $script:DlRun.Finishing = $it
+            try { $note = Complete-TvDownload $plan $it } finally { $script:DlRun.Finishing = $null }
             if ((Get-AppSettings).DlNfo) { try { Write-DownloadNfo $plan $it } catch { } }
             $it.Detail = if ($note) { "tags updated: $note" } else { 'tags updated' }; $n++
         } catch { Write-LogException $_ "Update tags $($it.Title)"; $it.Detail = "tags not updated: $($_.Exception.Message)" }
@@ -8750,11 +9728,23 @@ function Get-FollowFiles($Rec) {
     return ,@($files | Where-Object { $_ -and $_.Id })
 }
 
-function Set-FollowSeries([string] $Key, [bool] $On) {
+function Set-FollowSeries([string] $Key, [bool] $On, [ValidateSet('download', 'notify')] [string] $Mode = 'download') {
     $m = Get-FavMap
     if (-not $m.Contains($Key)) { return }
     $r = $m[$Key]
+    if ($On -and $Mode -eq 'notify') {
+        # only tell: what NRK has now counts as seen; later ones give a notification (nothing is downloaded)
+        $res = @{ Files = @() }
+        Invoke-Ui "Reading the episodes of $($r.Item.Title)" { $res.Files = Get-FollowFiles $r }
+        $r.Seen = @($res.Files | ForEach-Object { [string]$_.Id }); $r.Follow = $true
+        $r | Add-Member -NotePropertyName FollowMode -NotePropertyValue 'notify' -Force
+        Save-FavMap; Update-FavouritesNode
+        Write-Log INFO "Follow (tell only): $($r.Item.Title)"
+        Set-Status "Following $($r.Item.Title): you get a notification when new episodes come (nothing is downloaded)"
+        return
+    }
     if ($On) {
+        $r | Add-Member -NotePropertyName FollowMode -NotePropertyValue 'download' -Force
         $res = @{ Files = @() }
         Invoke-Ui "Reading the episodes of $($r.Item.Title)" { $res.Files = Get-FollowFiles $r }
         $q = [System.Windows.Forms.MessageBox]::Show($form, ("Follow {0}: new episodes are downloaded by themselves.`n`nAlso download the {1} episode(s) NRK has now?" -f $r.Item.Title, $res.Files.Count), 'Follow', 'YesNoCancel', 'Question')
@@ -8770,27 +9760,55 @@ function Set-FollowSeries([string] $Key, [bool] $On) {
     }
 }
 
-function Invoke-FollowCheck([string] $Only = '') {
-    # every followed series: episodes not seen before go to the download queue and start
+function Invoke-FollowCheck([string] $Only = '', [switch] $Background) {
+    # every followed series: episodes not seen before go to the download queue and start.
+    # -Background (the 6-hourly check): the pages are fetched without the window waiting.
     $favs = @((Get-FavMap).Values | Where-Object { $_.Follow -and (-not $Only -or $_.Key -eq $Only) })
     if (-not $favs.Count) { return }
+    if ($Background) {
+        if ($script:FollowRun -and $script:FollowRun.Left -gt 0) { return }   # (still busy with the last one)
+        $script:FollowRun = @{ Left = $favs.Count; Total = 0 }
+        foreach ($r in $favs) {
+            [void](Start-ApiJob "Follow $($r.Item.Title)" { param($rec) ,@(Get-FollowFiles $rec) } {
+                param($files, $rec)
+                $script:FollowRun.Total += (Add-FollowNew $rec @($files))
+                Complete-FollowRun
+            } { param($err, $rec) Write-LogException $err "Follow $($rec.Item.Title)"; Complete-FollowRun } $r)
+        }
+        return
+    }
     $total = 0
     foreach ($r in $favs) {
-        try {
-            $files = Get-FollowFiles $r
-            $seen = New-Object 'System.Collections.Generic.HashSet[string]'; foreach ($x in @($r.Seen)) { [void]$seen.Add([string]$x) }
-            $new = @($files | Where-Object { -not $seen.Contains([string]$_.Id) -and (Test-FileAvailable $_) })
-            if ($new.Count) {
-                Write-Log INFO "Follow: $($new.Count) new in $($r.Item.Title)"
-                $added = Add-ToDownloadQueue -Files $new -Quiet
-                $go = @($added | Where-Object { $_.Status -eq 'Added' })
-                if ($go.Count) { Start-DownloadQueue -Items $go; $total += $go.Count }
-            }
-            $r.Seen = @($files | ForEach-Object { [string]$_.Id }); $r.LastCheck = (Get-Date).ToString('o')
-        } catch { Write-LogException $_ "Follow $($r.Item.Title)" }
+        try { $total += (Add-FollowNew $r @(Get-FollowFiles $r)) } catch { Write-LogException $_ "Follow $($r.Item.Title)" }
     }
     Save-FavMap
     if ($total) { Show-AppNotification 'New episodes' ('{0} new episode(s) of followed series are downloading' -f $total) }
+}
+
+function Add-FollowNew($r, $files) {
+    # the episodes of one followed series not seen before: into the queue, started; returns how many
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'; foreach ($x in @($r.Seen)) { [void]$seen.Add([string]$x) }
+    $new = @($files | Where-Object { $_ -and -not $seen.Contains([string]$_.Id) -and (Test-FileAvailable $_) })
+    $n = 0
+    if ($new.Count -and [string]$r.FollowMode -eq 'notify') {
+        Write-Log INFO "Follow (tell only): $($new.Count) new in $($r.Item.Title)"
+        Show-AppNotification "New in $($r.Item.Title)" ('{0} new episode(s): {1}' -f $new.Count, (($new | Select-Object -First 3 | ForEach-Object { $_.Title }) -join ', '))
+    } elseif ($new.Count) {
+        Write-Log INFO "Follow: $($new.Count) new in $($r.Item.Title)"
+        $added = Add-ToDownloadQueue -Files $new -Quiet
+        $go = @($added | Where-Object { $_.Status -eq 'Added' })
+        if ($go.Count) { Start-DownloadQueue -Items $go; $n = $go.Count }
+    }
+    $r.Seen = @($files | Where-Object { $_ } | ForEach-Object { [string]$_.Id }); $r.LastCheck = (Get-Date).ToString('o')
+    return $n
+}
+
+function Complete-FollowRun {
+    $f = $script:FollowRun
+    $f.Left--
+    if ($f.Left -gt 0) { return }
+    Save-FavMap
+    if ($f.Total) { Show-AppNotification 'New episodes' ('{0} new episode(s) of followed series are downloading' -f $f.Total) }
 }
 
 function Start-FollowTimer {
@@ -8798,7 +9816,7 @@ function Start-FollowTimer {
     if ($script:FollowTimer) { return }
     $script:FollowTimer = New-Object System.Windows.Forms.Timer
     $script:FollowTimer.Interval = 120000
-    $script:FollowTimer.Add_Tick({ $script:FollowTimer.Interval = 6 * 3600000; try { Invoke-FollowCheck } catch { Write-LogException $_ 'Follow' } })
+    $script:FollowTimer.Add_Tick({ $script:FollowTimer.Interval = 6 * 3600000; try { Invoke-FollowCheck -Background } catch { Write-LogException $_ 'Follow' } })
     $script:FollowTimer.Start()
 }
 
@@ -8878,6 +9896,18 @@ function Get-GridThumb([string] $Url) {
     return $null
 }
 
+$script:SmallPlaceholders = @{}
+function Get-SmallPlaceholder([string] $Kind, [int] $W, [int] $H) {
+    # the 960x540 placeholder scaled once to the tile size (drawing the big one for every tile is slow)
+    $key = "$Kind|$($script:ThemeEffective)|$W|$H"
+    if ($script:SmallPlaceholders[$key]) { return $script:SmallPlaceholders[$key] }
+    $big = Get-PlaceholderImage $Kind
+    if (-not $big) { return $null }
+    $sm = New-ScaledImage $big $W $H
+    $script:SmallPlaceholders[$key] = $sm
+    return $sm
+}
+
 function Invoke-DrawGridItem($E) {
     $item = $E.Item; $f = $item.Tag; $g = $E.Graphics
     $r = $E.Bounds
@@ -8888,8 +9918,8 @@ function Invoke-DrawGridItem($E) {
     $th = Get-GridThumb $url
     if ($th) { $g.DrawImage($th, $img.X, $img.Y, $img.Width, $img.Height) }
     else {
-        $ph = try { Get-PlaceholderImage $(if ($f.Medium -eq 'radio') { 'radio' } else { 'tv' }) } catch { $null }
-        if ($ph) { $g.DrawImage($ph, $img) } else { $g.FillRectangle((Get-Brush $T.Surface), $img) }
+        $ph = try { Get-SmallPlaceholder $(if ($f.Medium -eq 'radio') { 'radio' } else { 'tv' }) $img.Width $img.Height } catch { $null }
+        if ($ph) { $g.DrawImageUnscaled($ph, $img.X, $img.Y) } else { $g.FillRectangle((Get-Brush $T.Surface), $img) }
     }
     if ($item.Selected) { $pen = New-Object System.Drawing.Pen($T.Accent, 2); $g.DrawRectangle($pen, ($img.X + 1), ($img.Y + 1), ($img.Width - 2), ($img.Height - 2)); $pen.Dispose() }
     # how far you got / watched
@@ -8995,7 +10025,7 @@ function Set-ChildMode([bool] $On) {
 
 # ---- cleanup on any exit ---------------------------------------------------------------
 # Download tools run inside a Windows job object that is closed when this process ends, so
-# python / ffmpeg never keep running on their own: not after Exit, an update, Windows
+# ffmpeg never keeps running on its own: not after Exit, an update, Windows
 # shutting down, Task Manager or a crash. The download in progress is written down in
 # download-running.json; if the app did not get to clean up, the next start removes that
 # download's unfinished files.
@@ -9077,7 +10107,7 @@ function Clear-Leftovers {
     }
 }
 
-$script:DlRun = @{ Item = $null; Proc = $null; Out = $null; Err = $null; OutTask = $null; ErrTask = $null; Before = $null
+$script:DlRun = @{ Finishing = $null; FinishProc = $null; FinishStop = $false; Item = $null; Proc = $null; Out = $null; Err = $null; OutTask = $null; ErrTask = $null; Before = $null
                    Cancel = $null; Timer = $null; Py = $null; Duration = 0 }
 
 function Get-SafeFileName([string] $Name) {
@@ -9216,6 +10246,8 @@ function Get-NodeFiles {
         }
         'search' { @($tag.Items | Where-Object { $_.Downloadable }) }
         'recent' { @(Get-RecentFiles | Where-Object { $_.Downloadable }) }
+        'continue' { @(Get-ContinueFiles | Where-Object { $_.Downloadable }) }
+        'watchlater' { @(Get-WatchLaterFiles | Where-Object { $_.Downloadable }) }
         { $_ -in 'newweek', 'expiring' } { @(@(Get-DatedFiles $tag.Kind.Replace('newweek', 'new')) | Where-Object { $_ -and $_.Downloadable }) }
         { $_ -in 'category', 'letter', 'radiocategory', 'radioletter' } {
             # the programmes/recordings listed in the folder (not every series inside it)
@@ -9225,7 +10257,7 @@ function Get-NodeFiles {
 }
 
 function Test-NodeDownloadable($Node) {
-    return [bool]($Node -and $Node.Tag -and $Node.Tag.Kind -in 'season', 'series', 'radioseason', 'radioseries', 'category', 'letter', 'radiocategory', 'radioletter', 'search', 'recent', 'newweek', 'expiring')
+    return [bool]($Node -and $Node.Tag -and $Node.Tag.Kind -in 'season', 'series', 'radioseason', 'radioseries', 'category', 'letter', 'radiocategory', 'radioletter', 'search', 'recent', 'newweek', 'expiring', 'continue', 'watchlater')
 }
 
 function Add-ToDownloadQueue {
@@ -9238,7 +10270,7 @@ function Add-ToDownloadQueue {
             if (-not (Test-NodeDownloadable $n)) { continue }
             Set-Status "Collecting files in $($n.Text)..."
             $nf = @(Get-NodeFiles $n | Where-Object { $_ })
-            # a whole series or season: Options > Downloads > only the newest N / only after a date
+            # a whole series or season: Options > Download rules > only the newest N / only after a date
             if ($n.Tag.Kind -in 'series', 'season', 'radioseries', 'radioseason') { $nf = Select-SeriesFiles $nf }
             foreach ($f in $nf) { [void]$res.Files.Add($f) }
         }
@@ -9264,7 +10296,7 @@ function Add-ToDownloadQueue {
             $already++
             continue
         }
-        # downloaded before (and moved or deleted since): listed as done, not fetched again (Options > Downloads)
+        # downloaded before (and moved or deleted since): listed as done, not fetched again (Options > Download rules)
         if ((Get-AppSettings).DlSkipHistory -and (Get-DlHistory).ContainsKey((Get-FileKey $f))) {
             $it = New-DownloadItem $f
             if ($it -and -not $inList.ContainsKey($it.Url)) { $it.Status = 'Done'; $it.Progress = 100; $it.Detail = 'downloaded before (right-click > Download again)'; $inList[$it.Url] = $true; [void]$new.Add($it) }
@@ -9386,7 +10418,7 @@ function Select-HlsVariant([string] $Url) {
                 $audio += [pscustomobject]@{ Group = (& $attr $l 'GROUP-ID'); Uri = [string](New-Object Uri($base, (& $attr $l 'URI'))); Default = ((& $attr $l 'DEFAULT') -eq 'YES'); Name = [string](& $attr $l 'NAME') }
             }
         }
-        # Options > Downloads > Quality: the best one up to the chosen height (or the smallest when none is that low)
+        # Options > Download rules > Quality: the best one up to the chosen height (or the smallest when none is that low)
         $maxH = 0; [void][int]::TryParse([string](Get-AppSettings).DlQuality, [ref]$maxH)
         $pool = if ($maxH -gt 0) { @($vars | Where-Object { $_.Height -gt 0 -and $_.Height -le $maxH }) } else { @($vars) }
         if (-not $pool.Count) { $pool = @($vars | Sort-Object Height, Bw | Select-Object -First 1) }
@@ -9416,6 +10448,13 @@ function Get-EpisodeNaming($File) {
     $cleanTitle = ($title -replace '^\d{1,3}\.\s*', '').Trim(); if (-not $cleanTitle) { $cleanTitle = $title }
     $seaDir = if ($sea -eq 'ekstramateriale') { 'Ekstramateriale' } elseif ($sea -match '^\d{1,2}$') { 'Season {0:D2}' -f [int]$sea } elseif ($sea) { "Season $sea" } else { 'Season 01' }
     $name = if ($sea -match '^\d{1,2}$' -and $epNo) { '{0} - s{1:D2}e{2:D2} - {3}' -f $series, [int]$sea, $epNo, $cleanTitle } else { '{0} - {1}' -f $series, $title }
+    # 2.9.0: your own file name (Options > Download rules), when everything it uses is known
+    $tpl = [string](Get-AppSettings).DlNameTv
+    if ($tpl) {
+        $vals = @{ series = $series; title = $cleanTitle; id = [string]$File.Id; season = $(if ($sea -match '^\d{1,2}$') { '{0:D2}' -f [int]$sea } else { '' }); episode = $(if ($epNo) { '{0:D2}' -f [int]$epNo } else { '' }) }
+        $own = Format-NameTemplate $tpl $vals
+        if ($own) { $name = $own }
+    }
     [pscustomobject]@{ Series = $series; Season = $sea; EpNo = $epNo; CleanTitle = $cleanTitle; SubDir = (Join-Path (Get-SafeFileName $series) $seaDir); Name = (Get-SafeFileName $name) }
 }
 
@@ -9440,9 +10479,8 @@ function Find-ExistingDownload($File, [string] $Dir) {
                 }
             }
             'audio' {
-                $date = ''; if ($File.Date -match '^(\d\d)\.(\d\d)\.(\d{4})$') { $date = '{0}-{1}-{2} - ' -f $Matches[3], $Matches[2], $Matches[1] }
                 $ser = Get-SafeFileName $(if ($File.SeriesTitle) { $File.SeriesTitle } else { 'NRK Radio' })
-                $name = Get-SafeFileName ($date + $File.Title)
+                $name = Get-RadioFileName $File
                 $rd = Get-CurrentDownloadDir -Radio
                 foreach ($folder in @($(if ($rd) { Join-Path $rd $ser }), (Join-Path (Join-Path $Dir 'Radio') $ser))) {   # (before 2.6.8: <download folder>\Radio)
                     if (-not $folder) { continue }
@@ -9560,9 +10598,7 @@ function Complete-TvDownload($Plan, $Item) {
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardError = $true
         $p = [System.Diagnostics.Process]::Start($psi); Add-ProcessToJob $p
         $err = $p.StandardError.ReadToEndAsync()
-        $ui = [bool]('System.Windows.Forms.Application' -as [type]); $sw = [Diagnostics.Stopwatch]::StartNew()
-        while (-not $p.HasExited -and $sw.Elapsed.TotalSeconds -lt 300) { if ($ui) { [System.Windows.Forms.Application]::DoEvents() }; Start-Sleep -Milliseconds 50 }
-        if (-not $p.HasExited) { try { $p.Kill() } catch { }; throw 'took more than 5 minutes' }
+        Wait-FinishProcess $p ([string]$Plan.Out)
         if ($p.ExitCode -ne 0) { throw ("ffmpeg exit {0}: {1}" -f $p.ExitCode, (($err.Result -split "`n" | Select-Object -First 3) -join ' ')) }
         if ((Get-Item -LiteralPath $Plan.Out).Length -lt 0.9 * (Get-Item -LiteralPath $Plan.Part).Length) { throw 'the finished file looks too small' }
         Remove-Item -LiteralPath $Plan.Part -Force
@@ -9758,12 +10794,13 @@ function Update-DownloadSummary {
     $run = $script:DlRun.Item
     if ($run) { $parts += 'now: #{0} {1}{2}' -f ($script:DlQueue.IndexOf($run) + 1), $run.Title, $(if ($run.Progress -ge 0) { " ($([int]$run.Progress)%)" } else { '' }) }
     $ui.Summary.Text = $parts -join '   ·   '
-    $busy = [bool]($script:DlRun.Proc -or $script:DlRun.Fetch)
+    $busy = [bool]($script:DlRun.Proc -or $script:DlRun.Fetch -or $script:DlRun.Finishing)
     # the folder can't change while files are being saved into it
     $ui.Cancel.Enabled = ($busy -or [bool]($c.Pending -or $c.Added -or $c.Paused))
     $ui.Clear.Enabled = [bool]($c.Done -or $c.Failed -or $c.Canceled)
     if ($ui.ClearNew) { $ui.ClearNew.Enabled = [bool](@($script:DlQueue | Where-Object { $_ -ne $script:DlRun.Item -and ($_.Status -eq 'Added' -or ($_.Status -in 'Canceled', 'Failed', 'Paused' -and $_.Progress -le 0)) }).Count) }
     $ui.SelAll.Enabled = [bool]$script:DlQueue.Count
+    if ($ui.Start) { $ui.Start.Enabled = [bool]($c.Added -or $c.Failed -or $c.Canceled -or $c.Paused) }   # (something that can be started)
     if ($c.Paused) { $parts += '{0} paused' -f $c.Paused }
     if ($ui.Pause) {
         $resume = [bool]($script:DlPaused -or ($c.Paused -and -not $busy))
@@ -9815,6 +10852,10 @@ function Remove-DownloadItems {
         [void][System.Windows.Forms.MessageBox]::Show($script:DlUi.Form, 'One of the selected files is downloading right now. Cancel it first.', 'Remove from list', 'OK', 'Information')
         return
     }
+    if ($script:DlRun.Finishing -and ($sel -contains $script:DlRun.Finishing)) {
+        [void][System.Windows.Forms.MessageBox]::Show($script:DlUi.Form, "One of the selected files is being finished (subtitles, chapters, cover). Wait a moment until it says Done.", 'Remove from list', 'OK', 'Information')
+        return
+    }
     foreach ($it in $sel) {
         $script:DlQueue.Remove($it); Write-Log INFO "Download queue: - $($it.Title)"
         if ($it.Status -ne 'Done') { Remove-Item -LiteralPath (Get-DownloadTmpDir $it) -Recurse -Force -ErrorAction SilentlyContinue }   # its saved pieces
@@ -9854,8 +10895,9 @@ function Test-DownloadTools {
     $ff = Find-FFmpeg
     if (-not $ff.Found) { $missing += 'FFmpeg' }
     if ($missing.Count -eq 0) { return $true }
-    $q = [System.Windows.Forms.MessageBox]::Show($script:DlUi.Form, ("Downloading needs: {0}.`n`nOpen Components to install it now?" -f ($missing -join ', ')), 'Missing components', 'YesNo', 'Warning')
-    if ($q -eq 'Yes') { [void](Show-DependencyDialog -Status (Get-DependencyStatus) -Owner $script:DlUi.Form -IncludeSkipped) }
+    $owner = if ($script:DlUi -and -not $script:DlUi.Form.IsDisposed -and $script:DlUi.Form.Visible) { $script:DlUi.Form } else { $form }   # (a followed series may start it with the window closed)
+    $q = [System.Windows.Forms.MessageBox]::Show($owner, ("Downloading needs: {0}.`n`nOpen Components to install it now?" -f ($missing -join ', ')), 'Missing components', 'YesNo', 'Warning')
+    if ($q -eq 'Yes') { [void](Show-DependencyDialog -Status (Get-DependencyStatus) -Owner $owner -IncludeSkipped) }
     return $false
 }
 
@@ -9889,7 +10931,7 @@ function Start-DownloadQueue {
 }
 
 function Step-DownloadQueue {
-    if ($script:DlRun.Proc -or $script:DlRun.Fetch -or $script:DlPaused) { return }
+    if ($script:DlRun.Proc -or $script:DlRun.Fetch -or $script:DlRun.Finishing -or $script:DlPaused) { return }   # (finishing: the next starts after it, from Complete-DownloadItem)
     $next = $script:DlQueue | Where-Object { $_.Status -eq 'Pending' } | Select-Object -First 1
     if (-not $next) {
         $done = @($script:DlQueue | Where-Object Status -eq 'Done').Count
@@ -9900,7 +10942,7 @@ function Step-DownloadQueue {
         Update-DownloadSummary
         return
     }
-    # Options > Downloads > "Only download between": wait for it
+    # Options > Download rules > "Only download between": wait for it
     if (-not (Test-DownloadWindow)) {
         $w = (Get-AppSettings).DlWindow
         Write-DownloadLog "Waiting for the download hours ($w): $(@($script:DlQueue | Where-Object Status -eq 'Pending').Count) waiting"
@@ -10060,7 +11102,7 @@ function Update-SegmentFetch {
             return
         }
     }
-    # start more pieces (Options > Downloads > speed limit: one at a time, and only while under the limit)
+    # start more pieces (Options > Download rules > speed limit: one at a time, and only while under the limit)
     $limit = [int](Get-AppSettings).DlSpeedKB
     $par = $f.Parallel
     if ($limit -gt 0) {
@@ -10149,7 +11191,7 @@ function Start-DownloadAutoResume {
         $script:DlResumeTimer.Add_Tick({
             $waiting = @($script:DlQueue | Where-Object { $_.Status -eq 'Paused' -and $_.AutoResume })
             if (-not $waiting.Count) { $script:DlResumeTimer.Stop(); return }
-            if ($script:DlRun.Proc -or $script:DlRun.Fetch -or $script:DlPaused) { return }
+            if ($script:DlRun.Proc -or $script:DlRun.Fetch -or $script:DlRun.Finishing -or $script:DlPaused) { return }
             if (-not [System.Net.NetworkInformation.NetworkInterface]::GetIsNetworkAvailable()) { return }
             Write-DownloadLog 'The connection seems to be back: continuing'
             foreach ($w in $waiting) { $w.Status = 'Pending'; $w.AutoResume = $false }
@@ -10259,10 +11301,8 @@ function Start-DownloadItem($Item) {
             $codec = if ($ext -eq $srcExt) { @('-c', 'copy') }
                      elseif ($ext -eq 'mp3') { @('-c:a', 'libmp3lame', '-b:a', '320k', '-id3v2_version', '3') }   # (converted: the highest MP3 bitrate)
                      else { @('-c:a', 'flac', '-compression_level', '8') }
-            $date = ''
-            if ($f.Date -match '^(\d\d)\.(\d\d)\.(\d{4})$') { $date = '{0}-{1}-{2} - ' -f $Matches[3], $Matches[2], $Matches[1] }
             $folder = Join-Path $dir (Get-SafeFileName $(if ($f.SeriesTitle) { $f.SeriesTitle } else { 'NRK Radio' }))
-            $out = Join-Path $folder ((Get-SafeFileName ($date + $f.Title)) + ".$ext")
+            $out = Join-Path $folder ((Get-RadioFileName $f) + ".$ext")   # (2.9.0: the name template, Options > Download rules)
             $had = if ($Item.Force) { $null } else { Find-ExistingDownload $f (Get-CurrentDownloadDir) }   # (in any of the formats; "Download again": fetch it anyway)
             if ($had) { $out = $had }
             if (-not $Item.Force -and (Test-Path -LiteralPath $out)) {
@@ -10410,10 +11450,12 @@ function Complete-DownloadItem {
     $finishNote = $null
     if ($code -eq 0 -and -not $run.Cancel -and $run.Plan -and (Test-Path -LiteralPath $run.Plan.Part)) {
         $it.Detail = if ($run.Plan.Kind -eq 'radio') { 'Finishing (format, tags, cover)' } else { 'Finishing (subtitles, chapters, cover)' }; Update-DownloadRow $it
+        $run.Finishing = $it; $run.FinishStop = $false; Update-DownloadSummary
         try {
             if ($run.Plan.Kind -eq 'radio') { $finishNote = Complete-RadioDownload $run.Plan $it }
-            else { $finishNote = Complete-TvDownload $run.Plan $it; if ((Get-AppSettings).DlNfo) { try { Write-DownloadNfo $run.Plan $it } catch { Write-LogException $_ 'NFO' } } }
+            else { $finishNote = Complete-TvDownload $run.Plan $it; if ((Get-AppSettings).DlNfo -and -not $run.FinishStop) { try { Write-DownloadNfo $run.Plan $it } catch { Write-LogException $_ 'NFO' } } }
         } catch { Write-LogException $_ 'Finishing the download' }
+        finally { $run.Finishing = $null }
     }
     Set-DownloadRunning $null
 
@@ -10550,6 +11592,10 @@ function Stop-CurrentDownload([string] $Mode = 'ask') {
 function Stop-DownloadItems {
     # Cancel for the selected queue items
     $sel = Get-SelectedDownloadItems
+    if ($script:DlRun.Finishing -and ($sel -contains $script:DlRun.Finishing)) {
+        Write-DownloadLog "$($script:DlRun.Finishing.Title) is being finished (the download itself is done): it can't be canceled now"
+        $sel = @($sel | Where-Object { $_ -ne $script:DlRun.Finishing })
+    }
     $n = 0
     foreach ($it in $sel) {
         if ($it.Status -in 'Added', 'Pending') { $it.Status = 'Canceled'; $it.Detail = ''; $n++ }
@@ -10699,7 +11745,16 @@ function Show-DownloadsWindow {
     $mi.Cancel.Add_Click({ Stop-DownloadItems })
     $mi.Remove.Add_Click({ Remove-DownloadItems })
     $mi.Delete.Add_Click({ Remove-DownloadedFiles @(Get-SelectedDownloadItems | Where-Object { $_.Status -eq 'Done' }) })
-    $bStart.Add_Click({ Start-DownloadQueue -Items (Get-SelectedDownloadItems) })
+    $bStart.Add_Click({
+        $sel = @(Get-SelectedDownloadItems | Where-Object { $_.Status -in 'Added', 'Failed', 'Canceled', 'Paused' })
+        if (-not $sel.Count) { [void][System.Windows.Forms.MessageBox]::Show($script:DlUi.Form, 'Select the downloads to start first (Shift/Ctrl+click, or Select all).', 'Download selected', 'OK', 'Information'); return }
+        Start-DownloadQueue -Items $sel
+    })
+    # the teal button looks switched off like the others when there is nothing to start
+    $bStart.Add_EnabledChanged({
+        if ($this.Enabled) { $this.BackColor = $T.Accent; $this.ForeColor = $T.OnAccent; $this.FlatAppearance.MouseOverBackColor = $T.AccentHover }
+        else { $this.BackColor = $T.Surface; $this.ForeColor = $T.Muted; $this.FlatAppearance.MouseOverBackColor = $T.Surface }
+    })
     $bSelAll.Add_Click({ $l = $script:DlUi.List; $l.BeginUpdate(); foreach ($r in $l.Items) { $r.Selected = $true }; $l.EndUpdate(); $l.Focus() })
     $bCancel.Add_Click({
         # the same as right-click > Cancel: the selected downloads (the running one too, when it is selected)
@@ -10807,38 +11862,73 @@ function Read-MergedLog([int] $MaxBytes = 3MB) {
 }
 
 function Update-LogsView {
+    # Only what is new is added (the text is not rebuilt every refresh); paused: nothing changes
+    # until Resume, while the app keeps logging.
     param([bool] $Force)
     $ui = $script:LogsUi
     if (-not $ui -or $ui.Form.IsDisposed) { return }
+    if ($ui.Paused -and -not $Force) { Update-LogsPauseButton; return }
     $sel = Get-LogsSelection
     if (-not $sel) { $ui.Box.Text = '(no log files found)'; return }
+    $append = { param([string] $Text) if ($Text) { $ui.Box.AppendText($(if ($ui.Box.TextLength) { "`r`n" } else { '' }) + $Text.TrimEnd("`r", "`n")) } }
     try {
+        if ($sel -ne $ui.ShownSel) { $Force = $true; $ui.ShownSel = $sel }
         if ($sel -eq 'session') {
             $mem = $script:LogMem
-            $sig = '{0}|{1}' -f $mem.Count, $(if ($mem.Count) { $mem[$mem.Count - 1] } else { '' })
-            if (-not $Force -and $sig -eq $ui.LastLength) { return }
-            $ui.LastLength = $sig
-            $ui.Box.Text = ($mem -join "`r`n")
+            $new = [int]$script:LogCount - [int]$ui.ShownCount
+            if (-not $Force -and $new -le 0) { return }
+            if ($Force -or $new -gt $mem.Count -or $ui.Box.Lines.Count -gt 7000) { $ui.Box.Text = ($mem -join "`r`n") }   # (all again: the first time, or when it got too long)
+            else { & $append (($mem.GetRange($mem.Count - $new, $new)) -join "`r`n") }
+            $ui.ShownCount = [int]$script:LogCount
             $ui.Form.Text = 'Logs - this session ({0} lines){1}' -f $mem.Count, $(if ($script:LogToDisk) { "  ·  saved in $($script:LogDir)" } else { '  ·  in memory only, not saved' })
         } elseif ($sel -eq 'merged') {
-            $files = Get-DayLogFiles
-            $sig = ($files | ForEach-Object { "$($_.Name):$($_.Length)" }) -join ';'
-            if (-not $Force -and $sig -eq $ui.LastLength) { return }
-            $ui.LastLength = $sig
-            $ui.Box.Text = Read-MergedLog
+            # Only the newest day grows (also when the indexer writes to it): its new part is added.
+            # An older day that changes (the indexer running past midnight) is shown again only when
+            # the set of days changes or on Refresh, so the window doesn't reload megabytes every 1.5 s.
+            $files = @(Get-DayLogFiles)
+            $last = if ($files.Count) { $files[-1] } else { $null }
+            $sig = ($files | ForEach-Object { $_.Name }) -join ';'
+            $grew = [bool]($last -and $ui.LastFile -eq $last.FullName -and $last.Length -gt $ui.LastFileLen)
+            if (-not $Force -and $sig -eq $ui.LastLength -and -not $grew) { return }
+            if (-not $Force -and $sig -eq $ui.LastLength -and $grew -and $ui.LastFileLen -gt 0) { & $append (Read-LogFrom $last.FullName $ui.LastFileLen) }
+            else { $ui.Box.Text = Read-MergedLog }
+            $ui.LastLength = $sig; if ($last) { $ui.LastFile = $last.FullName; $ui.LastFileLen = $last.Length }
             $total = ($files | Measure-Object Length -Sum).Sum
             $ui.Form.Text = 'Logs - all days ({0} file(s), {1:N0} KB)  ·  {2}' -f $files.Count, ($total / 1KB), $script:LogDir
         } else {
             $len = (Get-Item -LiteralPath $sel).Length
             if (-not $Force -and "$len" -eq "$($ui.LastLength)") { return }
+            $prev = 0L; [void][long]::TryParse([string]$ui.LastLength, [ref]$prev)
+            if (-not $Force -and $prev -gt 0 -and $len -gt $prev) { & $append (Read-LogFrom $sel $prev) }
+            else { $ui.Box.Text = Read-LogTail -Path $sel }
             $ui.LastLength = "$len"
-            $ui.Box.Text = Read-LogTail -Path $sel
             $ui.Form.Text = 'Logs - {0} ({1:N0} KB)' -f $sel, ($len / 1KB)
         }
         $ui.Box.SelectionStart = $ui.Box.TextLength
         $ui.Box.ScrollToCaret()
     } catch { $ui.Box.Text = "Could not read ${sel}: $($_.Exception.Message)" }
 }
+
+function Read-LogFrom([string] $Path, [long] $Offset) {
+    # the part of a log file written after $Offset bytes
+    $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+    try {
+        [void]$fs.Seek($Offset, 'Begin')
+        $sr = New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)
+        return $sr.ReadToEnd()
+    } finally { $fs.Dispose() }
+}
+
+function Update-LogsPauseButton {
+    $ui = $script:LogsUi
+    if (-not $ui -or -not $ui.Pause) { return }
+    if ($ui.Paused) {
+        $waiting = [int]$script:LogCount - [int]$ui.PausedAt
+        $ui.Pause.Text = "{0}  Resume{1}" -f [char]0x25B6, $(if ($waiting -gt 0) { "  ($waiting new)" } else { '' })
+        $ui.Pause.ForeColor = $T.Accent
+    } else { $ui.Pause.Text = "{0}  Pause" -f [char]0x2016; $ui.Pause.ForeColor = $T.Text }
+}
+
 
 function Update-LogsFileList {
     $ui = $script:LogsUi
@@ -10872,7 +11962,7 @@ function Clear-LogFile {
     if (-not $p) { return }
     if ($p -eq 'session') {
         if ([System.Windows.Forms.MessageBox]::Show($ui.Form, "Clear this session's log lines from memory?", 'Clear log', 'YesNo', 'Question') -ne 'Yes') { return }
-        $script:LogMem.Clear(); $script:LogPending.Clear(); $ui.Box.Text = ''; $ui.LastLength = '0|'
+        $script:LogMem.Clear(); $script:LogPending.Clear(); $ui.Box.Text = ''; $ui.ShownCount = [int]$script:LogCount; $ui.PausedAt = [int]$script:LogCount
         return
     }
     $all = ($p -eq 'merged')
@@ -10886,6 +11976,7 @@ function Clear-LogFile {
     $what = if ($all) { "all {0} log file(s)" -f $targets.Count } else { "this log file`n`n$p" }
     $q = [System.Windows.Forms.MessageBox]::Show($ui.Form, "Delete ${what}?`n`nThis cannot be undone.", 'Clear log', 'YesNo', 'Warning')
     if ($q -ne 'Yes') { return }
+    Close-LogWriter   # (what is collected goes in first, then the file goes)
     $gone = 0; $busy = @()
     foreach ($f in $targets) {
         try { [IO.File]::Delete($f); $gone++ }
@@ -10900,7 +11991,9 @@ function Clear-LogFile {
     try { Update-LogsFileList } finally { $ui.Suppress = $false }
     $ui.Box.Text = ''
     $files = Get-DayLogFiles
-    $ui.LastLength = if ((Get-LogsSelection) -eq 'merged') { ($files | ForEach-Object { "$($_.Name):$($_.Length)" }) -join ';' } else { '0' }
+    $ui.ShownSel = Get-LogsSelection; $ui.LastFile = $null; $ui.LastFileLen = 0
+    $ui.LastLength = if ($ui.ShownSel -eq 'merged') { ($files | ForEach-Object { $_.Name }) -join ';' } else { '0' }
+    if ($ui.ShownSel -eq 'merged' -and @($files).Count) { $ui.LastFile = @($files)[-1].FullName; $ui.LastFileLen = @($files)[-1].Length }
     $ui.Form.Text = 'Logs - cleared'
     if ($busy.Count) { [void][System.Windows.Forms.MessageBox]::Show($ui.Form, "Could not delete (in use):`n`n$($busy -join "`n")", 'Clear log', 'OK', 'Information') }
 }
@@ -10940,6 +12033,7 @@ function Show-LogsWindow {
         $sideItems.Add($gap)
         return $b
     }
+    $bPause = & $mk ("{0}  Pause" -f [char]0x2016)
     $bRefresh = & $mk ("{0}  Refresh" -f [char]0x27F3)
     $bCopy = & $mk ("{0}  Copy all" -f [char]0x29C9)
     $bEditor = & $mk ("{0}  Open in editor" -f [char]0x270E)
@@ -10948,8 +12042,6 @@ function Show-LogsWindow {
     $bClear = & $mk ("{0}  Clear log" -f [char]0x2715)
     $bClear.ForeColor = $T.Bad
     $sep2 = New-Object System.Windows.Forms.Panel; $sep2.Dock = 'Top'; $sep2.Height = 18; $sep2.BackColor = $T.Panel; $sideItems.Add($sep2)
-    $auto = New-Object System.Windows.Forms.CheckBox; $auto.Text = 'Auto-refresh'; $auto.Checked = $true
-    $auto.Dock = 'Top'; $auto.Height = 28; $auto.ForeColor = $T.Text; $sideItems.Add($auto)
     $disk = New-Object System.Windows.Forms.CheckBox; $disk.Text = 'Save logs to disk'; $disk.Checked = [bool]$script:LogToDisk
     $disk.Dock = 'Top'; $disk.Height = 28; $disk.ForeColor = $T.Text; $sideItems.Add($disk)
     $diskNote = New-Object System.Windows.Forms.Label; $diskNote.Dock = 'Top'; $diskNote.Height = 52; $diskNote.ForeColor = $T.Muted
@@ -10968,7 +12060,15 @@ function Show-LogsWindow {
 
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 1500
-    $script:LogsUi = @{ Form = $w; Combo = $combo; Box = $box; Auto = $auto; Timer = $timer; LastLength = -1; Paths = @{}; Disk = $disk }
+    $script:LogsUi = @{ Form = $w; Combo = $combo; Box = $box; Pause = $bPause; Paused = $false; PausedAt = 0; ShownCount = 0; ShownSel = $null; Timer = $timer; LastLength = -1; Paths = @{}; Disk = $disk }
+    $logTipsP = New-Object System.Windows.Forms.ToolTip
+    $logTipsP.SetToolTip($bPause, 'Stop the view from moving while you read. The app keeps logging; Resume shows what came meanwhile.')
+    $bPause.Add_Click({
+        $u = $script:LogsUi
+        $u.Paused = -not $u.Paused
+        if ($u.Paused) { $u.PausedAt = [int]$script:LogCount } else { Update-LogsView $false }
+        Update-LogsPauseButton
+    })
     $logTips = New-Object System.Windows.Forms.ToolTip
     $logTips.SetToolTip($disk, "Off: this session's log is only kept in memory (shown here as 'This session'). On: also written to day-files in the logs folder, kept for 3 days.")
     $disk.Add_CheckedChanged({
@@ -10977,7 +12077,7 @@ function Show-LogsWindow {
         Update-LogsFileList; Update-LogsView $true
     })
 
-    $timer.Add_Tick({ if ($script:LogsUi -and $script:LogsUi.Auto.Checked) { Update-LogsView $false } })
+    $timer.Add_Tick({ if ($script:LogsUi) { Update-LogsView $false } })
     $combo.Add_SelectedIndexChanged({ if (-not $script:LogsUi.Suppress) { Update-LogsView $true } })
     $bRefresh.Add_Click({ Update-LogsFileList; Update-LogsView $true })
     $bCopy.Add_Click({ if ($script:LogsUi.Box.Text) { [System.Windows.Forms.Clipboard]::SetText($script:LogsUi.Box.Text) } })
@@ -11643,8 +12743,9 @@ function Update-InstancePipe {
             switch -Regex ($cmd.Trim()) {
                 '^INFO$' { $c.Writer.WriteLine(("OK {0}|{1}|{2}" -f $script:AppVersion, $PID, $PSCommandPath)) }
                 '^SHOW$' { $c.Writer.WriteLine('OK'); Show-MainWindow }
+                '^PLAY (\S+)$' { $c.Writer.WriteLine('OK'); $what = $Matches[1]; try { Invoke-PlayCommand $what } catch { Write-LogException $_ "Play $what" } }
                 '^EXIT$' {
-                    if ($script:DlRun.Proc) { $c.Writer.WriteLine("BUSY downloading $($script:DlRun.Item.Title)") }
+                    if ($script:DlRun.Proc -or $script:DlRun.Finishing) { $c.Writer.WriteLine("BUSY downloading $(if ($script:DlRun.Item) { $script:DlRun.Item.Title } else { $script:DlRun.Finishing.Title })") }
                     else { $c.Writer.WriteLine('OK'); $exit = $true }
                 }
                 default { $c.Writer.WriteLine('ERR unknown command') }
@@ -11687,9 +12788,11 @@ function Initialize-Tray {
     $miSleep = New-ThemedMenuItem 'Sleep timer...'
     $miUpdate = New-ThemedMenuItem 'Check for updates'
     $miExit = New-ThemedMenuItem 'Exit'
-    [void]$menu.Items.AddRange(@($miOpen, (New-Object System.Windows.Forms.ToolStripSeparator), $miPause, $miMute, $miSleep, (New-Object System.Windows.Forms.ToolStripSeparator), $miUpdate, $miExit))
+    $miRadioMini = New-ThemedMenuItem 'Small radio window'; $miRadioMini.Add_Click({ Show-RadioMini })
+    $miRecs = New-ThemedMenuItem 'Recordings...'; $miRecs.Add_Click({ Show-RecordingsWindow })
+    [void]$menu.Items.AddRange(@($miOpen, (New-Object System.Windows.Forms.ToolStripSeparator), $miPause, $miMute, $miSleep, $miRadioMini, $miRecs, (New-Object System.Windows.Forms.ToolStripSeparator), $miUpdate, $miExit))
     $ni.ContextMenuStrip = $menu
-    $script:TrayUi = @{ Icon = $ni; Menu = $menu; Open = $miOpen; Pause = $miPause; Mute = $miMute; Exit = $miExit; Told = $false }
+    $script:TrayUi = @{ Icon = $ni; Menu = $menu; Open = $miOpen; Pause = $miPause; Mute = $miMute; Sleep = $miSleep; Exit = $miExit; Told = $false }
     $menu.Add_Opening({ Update-TrayMenu })
     $miOpen.Add_Click({ if ($form.Visible -and $form.WindowState -ne 'Minimized') { Hide-ToTray } else { Show-MainWindow } })
     $miPause.Add_Click({ Invoke-MediaCommand 'pause' })
@@ -11761,6 +12864,8 @@ function Update-TrayMenu {
     $u.Pause.Enabled = $any; $u.Mute.Enabled = $any
     $u.Pause.Text = if ($m.Playing) { 'Pause' } else { 'Play' }
     $u.Mute.Text = if ($m.Muted) { 'Unmute' } else { 'Mute' }
+    $zl = Get-SleepLabel
+    if ($u.Sleep) { $u.Sleep.Text = if ($zl) { "Sleep timer: $zl..." } else { 'Sleep timer...' } }
     $u.Open.Text = if ($form.Visible -and $form.WindowState -ne 'Minimized') { 'Hide NRK Browser' } else { 'Show NRK Browser' }
 }
 
@@ -11870,6 +12975,7 @@ function Update-ScriptFile([string] $Source, [string] $Target, [string] $Work, [
 
 function Install-Update {
     param([byte[]] $RemoteBytes, [version] $Version)
+    if ($script:DlRun.Finishing) { Set-Status "Update to $Version postponed: a download is being finished - try again in a moment"; return }
     if ($script:DlRun.Proc) {
         $q = [System.Windows.Forms.MessageBox]::Show($form, "A download is running:`n`n$($script:DlRun.Item.Title)`n`nUpdating restarts the app. Stop the download and update now? Its unfinished file is removed; finished downloads are kept.`n`nNo: update later (Options > Check for updates now).", 'Update', 'YesNo', 'Question')
         if ($q -ne 'Yes') { Set-Status "Update to $Version postponed: a download is running"; return }
@@ -11993,14 +13099,1092 @@ function Test-UpdateDue {
 }
 
 
+$script:WinHelpersCs = @'
+using System;
+using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Drawing;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+
+// 2.9.0: Windows integration for NRK Browser (C# 5, compiled by Windows PowerShell 5.1 and PowerShell 7).
+//   NrkHotkeys  - global hotkeys (RegisterHotKey on a hidden message window)
+//   NrkTaskbar  - buttons in the taskbar preview (ITaskbarList3) and the taskbar jump list (ICustomDestinationList)
+//   NrkRemote   - the phone remote: a tiny web server on the home network (commands are queued for the app)
+
+public class NrkHotkeys : NativeWindow, IDisposable {
+    [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
+    readonly Action<int> onKey;
+    readonly List<int> ids = new List<int>();
+    public NrkHotkeys(Action<int> onKey) {
+        this.onKey = onKey;
+        var cp = new CreateParams(); cp.Parent = new IntPtr(-3);   // HWND_MESSAGE: a window nobody sees
+        CreateHandle(cp);
+    }
+    // mods: 1 Alt, 2 Ctrl, 4 Shift, 8 Win (0x4000 = no repeat is added). false = taken by another app
+    public bool Add(int id, uint mods, uint vk) {
+        bool ok = RegisterHotKey(Handle, id, mods | 0x4000, vk);
+        if (ok) ids.Add(id);
+        return ok;
+    }
+    public void Clear() { foreach (int id in ids) UnregisterHotKey(Handle, id); ids.Clear(); }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == 0x0312) { try { onKey(m.WParam.ToInt32()); } catch { } return; }
+        base.WndProc(ref m);
+    }
+    public void Dispose() { Clear(); DestroyHandle(); }
+}
+
+[ComImport, Guid("ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface ITaskbarList3 {
+    void HrInit(); void AddTab(IntPtr h); void DeleteTab(IntPtr h); void ActivateTab(IntPtr h); void SetActiveAlt(IntPtr h);
+    void MarkFullscreenWindow(IntPtr h, [MarshalAs(UnmanagedType.Bool)] bool full);
+    void SetProgressValue(IntPtr h, ulong done, ulong total); void SetProgressState(IntPtr h, int flags);
+    void RegisterTab(IntPtr tab, IntPtr main); void UnregisterTab(IntPtr tab); void SetTabOrder(IntPtr tab, IntPtr before);
+    void SetTabActive(IntPtr tab, IntPtr main, uint res);
+    [PreserveSig] int ThumbBarAddButtons(IntPtr h, uint count, [MarshalAs(UnmanagedType.LPArray)] ThumbButton[] buttons);
+    [PreserveSig] int ThumbBarUpdateButtons(IntPtr h, uint count, [MarshalAs(UnmanagedType.LPArray)] ThumbButton[] buttons);
+    void ThumbBarSetImageList(IntPtr h, IntPtr list);
+    void SetOverlayIcon(IntPtr h, IntPtr icon, [MarshalAs(UnmanagedType.LPWStr)] string text);
+    void SetThumbnailTooltip(IntPtr h, [MarshalAs(UnmanagedType.LPWStr)] string tip);
+    void SetThumbnailClip(IntPtr h, IntPtr rect);
+}
+[ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090"), ClassInterface(ClassInterfaceType.None)] class CTaskbarList { }
+
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+struct ThumbButton {
+    public uint Mask; public uint Id; public uint Bitmap; public IntPtr Icon;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string Tip;
+    public uint Flags;
+}
+
+[ComImport, Guid("6332DEBF-87B5-4670-90C0-5E57B408A49E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface ICustomDestinationList {
+    void SetAppID([MarshalAs(UnmanagedType.LPWStr)] string id);
+    void BeginList(out uint minSlots, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object removed);
+    void AppendCategory([MarshalAs(UnmanagedType.LPWStr)] string name, [MarshalAs(UnmanagedType.Interface)] IObjectArray items);
+    void AppendKnownCategory(int category);
+    void AddUserTasks([MarshalAs(UnmanagedType.Interface)] IObjectArray tasks);
+    void CommitList();
+    void GetRemovedDestinations(ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object removed);
+    void DeleteList([MarshalAs(UnmanagedType.LPWStr)] string id);
+    void AbortList();
+}
+[ComImport, Guid("77f10cf0-3db5-4966-b520-b7c54fd35ed6"), ClassInterface(ClassInterfaceType.None)] class CDestinationList { }
+[ComImport, Guid("92CA9DCD-5622-4bba-A805-5E9F541BD8C9"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IObjectArray { void GetCount(out uint n); void GetAt(uint i, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object o); }
+[ComImport, Guid("5632b1a4-e38a-400a-928a-d4cd63230295"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IObjectCollection {
+    void GetCount(out uint n); void GetAt(uint i, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object o);
+    void AddObject([MarshalAs(UnmanagedType.Interface)] object o); void AddFromArray([MarshalAs(UnmanagedType.Interface)] IObjectArray a);
+    void RemoveObjectAt(uint i); void Clear();
+}
+[ComImport, Guid("2d3468c1-36a7-43b6-ac24-d3f02fd9607a"), ClassInterface(ClassInterfaceType.None)] class CEnumerableObjectCollection { }
+[ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IShellLinkW {
+    void GetPath(IntPtr a, int b, IntPtr c, int d); void GetIDList(out IntPtr p); void SetIDList(IntPtr p);
+    void GetDescription(IntPtr a, int b); void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string s);
+    void GetWorkingDirectory(IntPtr a, int b); void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string s);
+    void GetArguments(IntPtr a, int b); void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string s);
+    void GetHotkey(out short k); void SetHotkey(short k); void GetShowCmd(out int c); void SetShowCmd(int c);
+    void GetIconLocation(IntPtr a, int b, out int c); void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string s, int i);
+    void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string s, int r); void Resolve(IntPtr h, int f);
+    void SetPath([MarshalAs(UnmanagedType.LPWStr)] string s);
+}
+[ComImport, Guid("00021401-0000-0000-C000-000000000046"), ClassInterface(ClassInterfaceType.None)] class CShellLink { }
+[StructLayout(LayoutKind.Sequential, Pack = 4)] struct PropKey { public Guid Fmt; public uint Pid; }
+[StructLayout(LayoutKind.Explicit)] struct PropVariant { [FieldOffset(0)] public ushort Vt; [FieldOffset(8)] public IntPtr Ptr; }
+[ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IPropertyStore {
+    void GetCount(out uint n); void GetAt(uint i, out PropKey k); void GetValue(ref PropKey k, out PropVariant v);
+    void SetValue(ref PropKey k, ref PropVariant v); void Commit();
+}
+
+public class NrkTaskbar : NativeWindow {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint RegisterWindowMessage(string s);
+    [DllImport("ole32.dll")] static extern int PropVariantClear(ref PropVariant v);
+    readonly Action<int> onButton;
+    readonly uint createdMsg;
+    ITaskbarList3 bar;
+    bool added;
+    ThumbButton[] buttons;
+    public NrkTaskbar(IntPtr form, Action<int> onButton) {
+        this.onButton = onButton;
+        createdMsg = RegisterWindowMessage("TaskbarButtonCreated");
+        AssignHandle(form);
+    }
+    // the buttons: Previous (1), Play/Pause (2), Next (3); icons drawn by the app
+    public void SetButtons(Icon prev, Icon play, Icon next, string tipPrev, string tipPlay, string tipNext) {
+        buttons = new ThumbButton[] { Btn(1, prev, tipPrev), Btn(2, play, tipPlay), Btn(3, next, tipNext) };
+        Push();   // (the taskbar button usually exists already; if not, TaskbarButtonCreated adds them)
+    }
+    static ThumbButton Btn(uint id, Icon ic, string tip) {
+        ThumbButton b = new ThumbButton(); b.Id = id; b.Icon = ic == null ? IntPtr.Zero : ic.Handle; b.Tip = tip ?? ""; b.Mask = 0x2 | 0x4 | 0x8; b.Flags = 0;   // icon | tooltip | flags
+        return b;
+    }
+    public void Update(int id, Icon ic, string tip, bool enabled) {
+        if (buttons == null) return;
+        for (int i = 0; i < buttons.Length; i++) if (buttons[i].Id == id) { if (ic != null) buttons[i].Icon = ic.Handle; buttons[i].Tip = tip ?? buttons[i].Tip; buttons[i].Flags = enabled ? 0u : 1u; }
+        if (bar != null && added) { try { bar.ThumbBarUpdateButtons(Handle, (uint)buttons.Length, buttons); } catch { } }
+    }
+    void Push() {
+        try {
+            if (bar == null) { bar = (ITaskbarList3)new CTaskbarList(); bar.HrInit(); }
+            if (!added) { if (bar.ThumbBarAddButtons(Handle, (uint)buttons.Length, buttons) == 0) added = true; }
+            else bar.ThumbBarUpdateButtons(Handle, (uint)buttons.Length, buttons);
+        } catch { }
+    }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == (int)createdMsg && buttons != null) { added = false; bar = null; Push(); }
+        else if (m.Msg == 0x0111 && ((m.WParam.ToInt64() >> 16) & 0xFFFF) == 0x1800) { try { onButton((int)(m.WParam.ToInt64() & 0xFFFF)); } catch { } }
+        base.WndProc(ref m);
+    }
+    // the jump list: right-click the taskbar button -> these channels start straight away
+    public static string SetJumpList(string appId, string category, string exe, string[] titles, string[] args, string icon, int iconIndex) {
+        try {
+            ICustomDestinationList list = (ICustomDestinationList)new CDestinationList();
+            list.SetAppID(appId);
+            uint slots; object removed; Guid g = typeof(IObjectArray).GUID;
+            list.BeginList(out slots, ref g, out removed);
+            IObjectCollection items = (IObjectCollection)new CEnumerableObjectCollection();
+            Guid title = new Guid("F29F85E0-4FF9-1068-AB91-08002B27B3D9");
+            for (int i = 0; i < titles.Length; i++) {
+                IShellLinkW link = (IShellLinkW)new CShellLink();
+                link.SetPath(exe); link.SetArguments(args[i]); link.SetDescription(titles[i]);
+                if (!string.IsNullOrEmpty(icon)) link.SetIconLocation(icon, iconIndex);
+                link.SetShowCmd(7);   // minimized: the console never shows
+                IPropertyStore ps = (IPropertyStore)link;
+                PropKey k = new PropKey(); k.Fmt = title; k.Pid = 2;
+                PropVariant v = new PropVariant(); v.Vt = 31; v.Ptr = Marshal.StringToCoTaskMemUni(titles[i]);   // VT_LPWSTR
+                ps.SetValue(ref k, ref v); ps.Commit(); PropVariantClear(ref v);
+                items.AddObject(link);
+            }
+            if (titles.Length > 0) list.AppendCategory(category, (IObjectArray)items);
+            list.CommitList();
+            return "";
+        } catch (Exception e) { return e.Message; }
+    }
+}
+
+public class NrkRemote {
+    TcpListener listener; Thread loop; volatile bool running;
+    public string Key = ""; public string Page = ""; public volatile string State = "{}";
+    public int Port;
+    public readonly ConcurrentQueue<string> Commands = new ConcurrentQueue<string>();
+    public readonly ConcurrentQueue<string> Log = new ConcurrentQueue<string>();
+    public int Start(int first) {
+        for (int p = first; p < first + 10; p++) {
+            try { listener = new TcpListener(IPAddress.Any, p); listener.Start(); Port = p; break; } catch { listener = null; }
+        }
+        if (listener == null) return 0;
+        running = true;
+        loop = new Thread(Run); loop.IsBackground = true; loop.Start();
+        return Port;
+    }
+    public void Stop() { running = false; try { listener.Stop(); } catch { } }
+    static bool Local(IPAddress a) {
+        if (IPAddress.IsLoopback(a)) return true;
+        if (a.IsIPv4MappedToIPv6) a = a.MapToIPv4();
+        if (a.AddressFamily == AddressFamily.InterNetworkV6) return a.IsIPv6LinkLocal || a.IsIPv6SiteLocal || (a.GetAddressBytes()[0] & 0xFE) == 0xFC;
+        byte[] b = a.GetAddressBytes();
+        return b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254);
+    }
+    void Run() {
+        while (running) {
+            TcpClient c = null;
+            try { c = listener.AcceptTcpClient(); } catch { if (!running) return; continue; }
+            ThreadPool.QueueUserWorkItem(o => Serve((TcpClient)o), c);
+        }
+    }
+    void Serve(TcpClient c) {
+        try {
+            using (c) {
+                c.ReceiveTimeout = 5000; c.SendTimeout = 5000;
+                NetworkStream s = c.GetStream();
+                StreamReader r = new StreamReader(s, Encoding.ASCII);
+                string line = r.ReadLine(); if (line == null) return;
+                string h; while (!string.IsNullOrEmpty(h = r.ReadLine())) { }
+                string[] parts = line.Split(' ');
+                string path = parts.Length > 1 ? parts[1] : "/";
+                IPAddress from = ((IPEndPoint)c.Client.RemoteEndPoint).Address;
+                if (!Local(from)) { Send(s, 403, "text/plain", "home network only"); return; }
+                string q = path.Contains("?") ? path.Substring(path.IndexOf('?') + 1) : "";
+                string p = path.Contains("?") ? path.Substring(0, path.IndexOf('?')) : path;
+                Dictionary<string, string> args = new Dictionary<string, string>();
+                foreach (string kv in q.Split('&')) { int i = kv.IndexOf('='); if (i > 0) args[kv.Substring(0, i)] = Uri.UnescapeDataString(kv.Substring(i + 1).Replace('+', ' ')); }
+                string k; args.TryGetValue("k", out k);
+                if (string.IsNullOrEmpty(Key) || k != Key) { Send(s, 403, "text/plain", "wrong or missing key: open the address shown in NRK Browser (Options > Phone remote)"); return; }
+                if (p == "/" || p == "/remote") { Send(s, 200, "text/html; charset=utf-8", Page); return; }
+                if (p == "/state") { Send(s, 200, "application/json; charset=utf-8", State); return; }
+                if (p == "/cmd") { string cmd; if (args.TryGetValue("c", out cmd) && cmd.Length < 200) { Commands.Enqueue(cmd); Log.Enqueue(from + " " + cmd); } Send(s, 200, "application/json", "{\"ok\":true}"); return; }
+                Send(s, 404, "text/plain", "not found");
+            }
+        } catch { }
+    }
+    static void Send(Stream s, int code, string type, string body) {
+        byte[] b = Encoding.UTF8.GetBytes(body ?? "");
+        string head = "HTTP/1.1 " + code + (code == 200 ? " OK" : code == 403 ? " Forbidden" : " Not Found") + "\r\nContent-Type: " + type + "\r\nContent-Length: " + b.Length +
+                      "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+        byte[] hb = Encoding.ASCII.GetBytes(head);
+        s.Write(hb, 0, hb.Length); s.Write(b, 0, b.Length); s.Flush();
+    }
+}
+'@
+
+#region ---------- 2.9.0 features (see CHANGES-2.9.0.md) -------------------------------------
+# Everything new in 2.9.0 that is not inside an existing function lives here, so it is easy to
+# find (and to take out again). Settings: $script:SettingDefaults, the "2.9.0" block.
+
+# ---- per series: speed, skip the intro / the outro (seriesprefs.json) --------------------------
+$script:SeriesPrefsFile = Join-Path $script:AppDataDir 'seriesprefs.json'
+$script:SeriesPrefs = $null
+
+function Get-SeriesPrefKey($File) {
+    # radio series / podcasts: "radio|<series id>"; TV series: "series|<id>"; otherwise none
+    if (-not $File) { return $null }
+    if ($File.Type -eq 'audio' -and $File.SeriesId) { return "radio|$($File.SeriesId)" }
+    if ($File.SeriesItem -and $File.SeriesItem.Id) { return "series|$($File.SeriesItem.Id)" }
+    return $null
+}
+
+function Get-SeriesPrefs {
+    if ($null -ne $script:SeriesPrefs) { return $script:SeriesPrefs }
+    $m = @{}
+    $j = Read-JsonFile $script:SeriesPrefsFile
+    if ($j) { foreach ($p in $j.PSObject.Properties) { $m[$p.Name] = @{ Title = [string]$p.Value.Title; Rate = [double]$p.Value.Rate; Intro = [int]$p.Value.Intro; Outro = [int]$p.Value.Outro } } }
+    $script:SeriesPrefs = $m
+    return $m
+}
+
+function Get-SeriesPref([string] $Key) {
+    if (-not $Key) { return @{ Rate = 0.0; Intro = 0; Outro = 0 } }
+    $m = Get-SeriesPrefs
+    if ($m.ContainsKey($Key)) { return $m[$Key] }
+    return @{ Rate = 0.0; Intro = 0; Outro = 0 }
+}
+
+function Set-SeriesPref([string] $Key, [string] $Title, [hashtable] $Values) {
+    if (-not $Key) { return }
+    $m = Get-SeriesPrefs
+    $r = if ($m.ContainsKey($Key)) { $m[$Key] } else { @{ Title = $Title; Rate = 0.0; Intro = 0; Outro = 0 } }
+    foreach ($k in $Values.Keys) { $r[$k] = $Values[$k] }
+    if ($Title) { $r.Title = $Title }
+    if ([double]$r.Rate -le 0 -and [int]$r.Intro -le 0 -and [int]$r.Outro -le 0) { $m.Remove($Key) } else { $m[$Key] = $r }   # (all default: forget it)
+    $o = [ordered]@{}; foreach ($k in ($m.Keys | Sort-Object)) { $o[$k] = $m[$k] }
+    Write-JsonFile $script:SeriesPrefsFile $o
+}
+
+function Send-AudioFx {
+    # skip silences / voice boost (Options > Listening, or the bars button in the radio bar)
+    $st = Get-AppSettings
+    Invoke-AudioScript ("nrkb.setFx({{""silence"":{0},""boost"":{1}}})" -f ([bool]$st.SkipSilence).ToString().ToLower(), ([bool]$st.VoiceBoost).ToString().ToLower())
+}
+
+function Show-AudioFxMenu {
+    if (-not $script:FxMenu) { $script:FxMenu = New-ThemedMenu }
+    $m = $script:FxMenu; $m.Items.Clear()
+    $st = Get-AppSettings
+    $a = New-ThemedMenuItem 'Skip silences (quiet parts play faster)'; $a.Checked = [bool]$st.SkipSilence
+    $a.Add_Click({ $s = Get-AppSettings; $s.SkipSilence = -not [bool]$s.SkipSilence; Save-AppSettings $s; Send-AudioFx; Write-Log INFO "Option SkipSilence = $($s.SkipSilence)" })
+    $b = New-ThemedMenuItem 'Voice boost (clearer, more even speech)'; $b.Checked = [bool]$st.VoiceBoost
+    $b.Add_Click({ $s = Get-AppSettings; $s.VoiceBoost = -not [bool]$s.VoiceBoost; Save-AppSettings $s; Send-AudioFx; Write-Log INFO "Option VoiceBoost = $($s.VoiceBoost)" })
+    [void]$m.Items.AddRange(@($a, $b))
+    $cur = $script:AudioUi.Current
+    $key = Get-SeriesPrefKey $cur
+    if ($key) {
+        [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+        $title = if ($cur.SeriesTitle) { [string]$cur.SeriesTitle } else { [string]$cur.Title }
+        $c = New-ThemedMenuItem ("Settings for {0}..." -f $title); $c.Tag = @{ Key = $key; Title = $title }
+        $c.Add_Click({ Show-SeriesPrefsDialog $this.Tag.Key $this.Tag.Title })
+        [void]$m.Items.Add($c)
+    }
+    $m.Show([System.Windows.Forms.Cursor]::Position)
+}
+
+function Show-SeriesPrefsDialog([string] $Key, [string] $Title) {
+    # speed, skip the first / the last seconds - for one series or podcast
+    $p = Get-SeriesPref $Key
+    $d = New-Object System.Windows.Forms.Form
+    Set-AppIcon $d
+    $d.Text = "Listening settings - $Title"; $d.ClientSize = New-Object System.Drawing.Size(440, 236); $d.StartPosition = 'CenterParent'
+    $d.FormBorderStyle = 'FixedDialog'; $d.MaximizeBox = $false; $d.MinimizeBox = $false
+    $d.Font = $script:FontUi; $d.BackColor = $T.Bg; $d.ForeColor = $T.Text
+    $mk = { param($t, $x, $y) $l = New-Object System.Windows.Forms.Label; $l.Text = $t; $l.AutoSize = $true; $l.Location = New-Object System.Drawing.Point($x, $y); $d.Controls.Add($l); $l }
+    [void](& $mk $Title 18 14); $d.Controls[0].Font = $script:FontBold
+    [void](& $mk 'Speed' 20 56)
+    $rates = @(0, 0.75, 1, 1.25, 1.5, 1.75, 2)
+    $cb = New-Object System.Windows.Forms.ComboBox; $cb.DropDownStyle = 'DropDownList'; $cb.FlatStyle = 'Flat'; $cb.Width = 200; $cb.Location = New-Object System.Drawing.Point(200, 52)
+    [void]$cb.Items.AddRange(@('The general speed', '0.75x', '1x', '1.25x', '1.5x', '1.75x', '2x'))
+    $cb.SelectedIndex = [Math]::Max(0, [array]::IndexOf($rates, [double]$p.Rate)); $d.Controls.Add($cb)
+    [void](& $mk 'Skip the first (seconds)' 20 96)
+    $n1 = New-Object System.Windows.Forms.NumericUpDown; $n1.Minimum = 0; $n1.Maximum = 900; $n1.Value = [Math]::Min(900, [int]$p.Intro); $n1.Width = 80; $n1.Location = New-Object System.Drawing.Point(200, 92); $d.Controls.Add($n1)
+    [void](& $mk 'Skip the last (seconds)' 20 134)
+    $n2 = New-Object System.Windows.Forms.NumericUpDown; $n2.Minimum = 0; $n2.Maximum = 900; $n2.Value = [Math]::Min(900, [int]$p.Outro); $n2.Width = 80; $n2.Location = New-Object System.Drawing.Point(200, 130); $d.Controls.Add($n2)
+    $note = & $mk 'Skipping the first part: only when it starts from the beginning.' 20 166; $note.ForeColor = $T.Muted
+    $ok = New-FlatButton 'Save' 90 -Primary; $ok.Location = New-Object System.Drawing.Point(236, 194); $ok.DialogResult = 'OK'; $d.Controls.Add($ok)
+    $no = New-FlatButton 'Cancel' 90; $no.Location = New-Object System.Drawing.Point(334, 194); $no.DialogResult = 'Cancel'; $d.Controls.Add($no)
+    $d.AcceptButton = $ok; $d.CancelButton = $no
+    Set-DarkTheme $d; Enable-DarkTitleBar $d
+    if ($d.ShowDialog($form) -ne 'OK') { return }
+    Set-SeriesPref $Key $Title @{ Rate = [double]$rates[$cb.SelectedIndex]; Intro = [int]$n1.Value; Outro = [int]$n2.Value }
+    Write-Log INFO ("Series settings {0}: speed {1}, skip first {2} s, last {3} s" -f $Key, $rates[$cb.SelectedIndex], $n1.Value, $n2.Value)
+    # playing now: at once
+    if ((Get-SeriesPrefKey $script:AudioUi.Current) -eq $Key) {
+        if ($rates[$cb.SelectedIndex] -gt 0) { Invoke-AudioScript ("nrkb.setRate({0})" -f ([double]$rates[$cb.SelectedIndex]).ToString([Globalization.CultureInfo]::InvariantCulture)) }
+        Invoke-AudioScript ("nrkb.setSkip({{""intro"":{0},""outro"":{1}}})" -f [int]$n1.Value, [int]$n2.Value)
+    }
+}
+
+# ---- live radio: the song playing now (NRK: /channels/<id>/liveelements/now) ------------------
+function Start-NowPlaying {
+    if (-not $script:NowTimer) {
+        $script:NowTimer = New-Object System.Windows.Forms.Timer
+        $script:NowTimer.Interval = 30000
+        $script:NowTimer.Add_Tick({ Update-NowPlaying })
+    }
+    $script:NowLast = ''
+    $script:NowTimer.Start()
+    Update-NowPlaying
+}
+
+function Update-NowPlaying {
+    $u = $script:AudioUi
+    if (-not $u.Current -or $u.Current.Type -ne 'radiolive' -or -not (Get-AppSettings).NowPlaying) { if ($script:NowTimer) { $script:NowTimer.Stop() }; return }
+    if ($script:NowJob) { return }
+    $id = [string]$u.Current.Id
+    $script:NowJob = Start-ApiJob "Now playing on $id" { param($cid) Invoke-NrkApi ('/channels/{0}/liveelements/now' -f [uri]::EscapeDataString($cid)) } {
+        param($j, $cid)
+        $script:NowJob = $null
+        if (-not $script:AudioUi.Current -or [string]$script:AudioUi.Current.Id -ne $cid) { return }
+        $els = @(if ($j -is [array]) { $j } else { foreach ($n in 'liveElements', 'elements', 'items') { $v = Get-Prop $j $n; if ($v) { $v; break } } }) | Where-Object { $_ }
+        $songs = New-Object System.Collections.Generic.List[string]
+        $nowSong = $null
+        foreach ($e in @($els)) {
+            if ([string](Get-Prop $e 'type') -ne 'Music') { continue }
+            $when = [string](Get-Prop $e 'relativeTimeType')
+            if ($when -notin 'Past', 'Present') { continue }
+            $t = [string](Get-Prop $e 'title'); $a = [string](Get-Prop $e 'description')
+            $txt = if ($a) { "$a - $t" } else { $t }
+            if ($when -eq 'Present') { $nowSong = $txt } else { $songs.Insert(0, "(earlier) $txt") }
+        }
+        if ($nowSong) { $songs.Insert(0, $nowSong) }
+        $list = @($songs | Select-Object -First 6)
+        Invoke-AudioScript ("nrkb.song({0})" -f (ConvertTo-Json -InputObject @($list) -Compress))
+        if ($nowSong -and $nowSong -ne $script:NowLast) {
+            $script:NowLast = $nowSong
+            Write-Log INFO "Now playing on $($cid): $nowSong"
+            Set-TrayText ("{0}  {1} {2}" -f $script:AudioUi.Current.Title, [char]0x266A, $nowSong)
+        }
+    } { param($err, $cid) $script:NowJob = $null; Write-Log DEBUG "Now playing on $($cid): $($err.Exception.Message)" } $id
+}
+
+# ---- a small radio window that stays on top ----------------------------------------------------
+function Show-RadioMini {
+    if ($script:RadioMini -and -not $script:RadioMini.Form.IsDisposed) { $script:RadioMini.Form.Close(); return }
+    $w = New-Object System.Windows.Forms.Form
+    Set-AppIcon $w
+    $w.Text = 'NRK Radio'; $w.FormBorderStyle = 'FixedToolWindow'; $w.TopMost = $true; $w.ShowInTaskbar = $false
+    $w.ClientSize = New-Object System.Drawing.Size(380, 92); $w.StartPosition = 'Manual'
+    $wa = [System.Windows.Forms.Screen]::FromControl($form).WorkingArea
+    $w.Location = New-Object System.Drawing.Point(($wa.Right - 400), ($wa.Bottom - 140))
+    $w.Font = $script:FontUi; $w.BackColor = $T.Panel; $w.ForeColor = $T.Text
+    $t1 = New-Object System.Windows.Forms.Label; $t1.Location = New-Object System.Drawing.Point(12, 8); $t1.Size = New-Object System.Drawing.Size(356, 20); $t1.Font = $script:FontBold; $t1.AutoEllipsis = $true; $t1.UseMnemonic = $false
+    $t2 = New-Object System.Windows.Forms.Label; $t2.Location = New-Object System.Drawing.Point(12, 28); $t2.Size = New-Object System.Drawing.Size(356, 18); $t2.ForeColor = $T.Muted; $t2.AutoEllipsis = $true; $t2.UseMnemonic = $false
+    $w.Controls.AddRange(@($t1, $t2))
+    $x = 12
+    $btns = @{}
+    foreach ($b in @(@('prev', [string][char]0x23EE, 'Previous'), @('back', '-15', 'Back 15 seconds'), @('play', [string][char]0x23EF, 'Play / pause'), @('fwd', '+15', 'Forward 15 seconds'), @('next', [string][char]0x23ED, 'Next'), @('show', 'Open', 'Show NRK Browser'))) {
+        $bt = New-FlatButton $b[1] $(if ($b[0] -eq 'show') { 70 } else { 50 }); $bt.Location = New-Object System.Drawing.Point($x, 52); $bt.Height = 32; $bt.Tag = $b[0]
+        $bt.Add_Click({ switch ($this.Tag) { 'prev' { Start-NextAudio -1 } 'next' { Start-NextAudio 1 } 'back' { Invoke-AudioScript 'nrkb.skip(-15)' } 'fwd' { Invoke-AudioScript 'nrkb.skip(15)' } 'play' { Invoke-AudioScript 'nrkb.toggle()' } 'show' { Show-MainWindow } } })
+        $w.Controls.Add($bt); $btns[$b[0]] = $bt; $x += $bt.Width + 6
+    }
+    $timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 1000
+    $script:RadioMini = @{ Form = $w; T1 = $t1; T2 = $t2; Btn = $btns; Timer = $timer; Task = $null }
+    $timer.Add_Tick({
+        $r = $script:RadioMini
+        if (-not $r -or $r.Form.IsDisposed) { return }
+        $u = $script:AudioUi
+        if ($r.Task -and $r.Task.IsCompleted) {
+            try { $s = ([string]$r.Task.Result | ConvertFrom-Json) | ConvertFrom-Json; $r.T1.Text = [string]$s.title; $r.T2.Text = [string]$s.sub; $r.Btn.play.Text = $(if ($s.paused) { [string][char]0x25B6 } else { [string][char]0x2016 }) } catch { }
+            $r.Task = $null
+        }
+        if (-not $u.Current) { $r.T1.Text = 'Nothing playing'; $r.T2.Text = ''; return }
+        if (-not $r.Task -and $u.Ready -and $u.WebView -and $u.WebView.CoreWebView2) { try { $r.Task = $u.WebView.CoreWebView2.ExecuteScriptAsync('window.nrkb ? nrkb.state() : "{}"') } catch { } }
+    })
+    $w.Add_FormClosed({ $script:RadioMini.Timer.Stop(); $script:RadioMini.Timer.Dispose(); $script:RadioMini = $null })
+    Set-DarkTheme $w; Enable-DarkTitleBar $w
+    $w.BackColor = $T.Panel
+    $timer.Start()
+    $w.Show()
+    Write-Log INFO 'Radio: small window'
+}
+
+# ---- sleep timer: fade out --------------------------------------------------------------------
+function Invoke-PlayerFade([double] $Seconds) {
+    # $Seconds > 0: the video goes quiet over that time; 0: the volume back (built-in player or NRK's page)
+    $pw = $script:PlayerWin
+    if (-not $pw -or -not $pw.WebView -or -not $pw.WebView.CoreWebView2) { return }
+    $s = $Seconds.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $js = "(function(s){ if (window.nrkb && nrkb.fade) { if (s > 0) nrkb.fade(s); else nrkb.unfade(); return; } document.querySelectorAll('video').forEach(function(v){ if (s > 0) { if (v.__nf == null) v.__nf = v.volume; var st = Math.max(1, Math.round(s * 4)), n = 0; clearInterval(v.__nt); v.__nt = setInterval(function(){ n++; v.volume = Math.max(0, v.__nf * (1 - n / st)); if (n >= st) clearInterval(v.__nt); }, 250); } else { clearInterval(v.__nt); if (v.__nf != null) { v.volume = v.__nf; v.__nf = null; } } }); })($s)"
+    try { [void]$pw.WebView.CoreWebView2.ExecuteScriptAsync($js) } catch { }
+}
+
+function Start-SleepFade([double] $Seconds) {
+    $z = $script:Sleep
+    if ($z.Fading) { return }
+    $z.Fading = $true
+    Write-Log INFO ("Sleep timer: fading out over {0:N0} s" -f $Seconds)
+    $s = $Seconds.ToString([Globalization.CultureInfo]::InvariantCulture)
+    Invoke-AudioScript "nrkb.fade($s)"
+    Invoke-PlayerFade $Seconds
+}
+
+function Stop-SleepFade {
+    $z = $script:Sleep
+    if (-not $z.Fading) { return }
+    $z.Fading = $false
+    Invoke-AudioScript 'nrkb.unfade()'
+    Invoke-PlayerFade 0
+}
+
+# ---- wake to radio ----------------------------------------------------------------------------
+function Start-AlarmTimer {
+    if ($script:AlarmTimer) { return }
+    $script:AlarmTimer = New-Object System.Windows.Forms.Timer
+    $script:AlarmTimer.Interval = 20000
+    $script:AlarmTimer.Add_Tick({ try { Test-Alarm } catch { Write-LogException $_ 'Wake to radio' } })
+    $script:AlarmTimer.Start()
+}
+
+function Get-NextAlarm {
+    # the next time the alarm goes off, or $null (off / no days)
+    $st = Get-AppSettings
+    if (-not $st.AlarmOn -or [string]$st.AlarmTime -notmatch '^(\d{1,2}):(\d\d)$') { return $null }
+    $h = [int]$Matches[1]; $mi = [int]$Matches[2]
+    $days = @([string]$st.AlarmDays -split ',' | Where-Object { $_ -match '^[1-7]$' } | ForEach-Object { [int]$_ })
+    if (-not $days.Count) { return $null }
+    for ($i = 0; $i -le 7; $i++) {
+        $d = (Get-Date).Date.AddDays($i).AddHours($h).AddMinutes($mi)
+        $dow = [int]$d.DayOfWeek; if ($dow -eq 0) { $dow = 7 }
+        if ($days -contains $dow -and $d -gt (Get-Date).AddMinutes(-2) -and $st.AlarmLast -ne $d.ToString('yyyy-MM-dd')) { return $d }
+    }
+    return $null
+}
+
+function Test-Alarm {
+    $next = Get-NextAlarm
+    if (-not $next -or (Get-Date) -lt $next -or ((Get-Date) - $next).TotalMinutes -gt 2) { return }
+    $s = Get-AppSettings; $s.AlarmLast = $next.ToString('yyyy-MM-dd'); Save-AppSettings $s
+    Write-Log INFO "Wake to radio: $($s.AlarmChannelTitle) ($($s.AlarmChannel))"
+    Invoke-PlayCommand ("radio:{0}" -f $s.AlarmChannel) -Alarm
+    Show-AppNotification 'Good morning' ("{0} is on (wake to radio)" -f $s.AlarmChannelTitle)
+}
+
+# ---- start a channel from outside (jump list, phone remote, alarm): "radio:p1", "tv:nrk1" ------
+function Invoke-PlayCommand([string] $What, [switch] $Alarm) {
+    if ($What -notmatch '^(radio|tv):([\w\-]+)$') { Write-Log WARN "Play: not understood: $What"; return }
+    $medium = $Matches[1]; $id = $Matches[2]
+    $chs = @()
+    try { $chs = @(Get-Cached "$($medium):live" { Get-NrkLiveChannels -Medium $medium }) } catch { Write-LogException $_ "Play $What"; return }
+    $ch = @($chs | Where-Object { [string]$_.Id -eq $id }) | Select-Object -First 1
+    if (-not $ch) { Write-Log WARN "Play: no channel '$id' in $medium"; Set-Status "Channel $id not found"; return }
+    Write-Log INFO "Play from outside: $($ch.Title)"
+    if ($medium -eq 'radio') {
+        Start-AudioPlayer $ch
+        if ($Alarm) { Invoke-AudioScript 'nrkb.fadeIn && nrkb.fadeIn(45)' }   # (gently louder over 45 s)
+        try { Add-RecentChannel $ch } catch { }
+    } else {
+        Show-MainWindow
+        Start-Player -Target (New-VideoTarget $ch)
+        try { Add-RecentChannel $ch } catch { }
+    }
+}
+
+# ---- recording live TV and radio (recordings.json; FFmpeg copies the live stream as it is) -------
+$script:RecFile = Join-Path $script:AppDataDir 'recordings.json'
+$script:Recs = $null
+
+function Get-Recordings {
+    if ($null -ne $script:Recs) { return $script:Recs }
+    $l = [System.Collections.Generic.List[object]]::new()
+    $j = Read-JsonFile $script:RecFile
+    if ($j) {
+        foreach ($r in @($j.Items | Where-Object { $_ })) {
+            $h = @{}; foreach ($p in $r.PSObject.Properties) { $h[$p.Name] = $p.Value }
+            if ($h.Status -eq 'Recording') { $h.Status = 'Stopped'; $h.Note = 'the app was closed while recording' }
+            $l.Add($h)
+        }
+    }
+    $script:Recs = $l
+    return $l
+}
+
+function Save-Recordings {
+    $items = @(foreach ($r in (Get-Recordings)) { $o = [ordered]@{}; foreach ($k in 'Id', 'Title', 'Medium', 'ChannelId', 'ChannelTitle', 'Manifest', 'Start', 'End', 'Status', 'File', 'Note') { $o[$k] = $r[$k] }; $o })
+    Write-JsonFile $script:RecFile ([ordered]@{ Items = @($items) })
+}
+
+function Get-RecordDir([string] $Medium) {
+    $d = [string](Get-AppSettings).RecordDir
+    if ($d) { return $d }
+    return (Join-Path (Get-DownloadDir -Radio:($Medium -eq 'radio')) 'Recordings')
+}
+
+function Add-Recording($Channel, [datetime] $Start, [datetime] $End, [string] $Title = '') {
+    # $Channel: a live TV or radio channel file; Start/End: local time
+    $medium = if ($Channel.Type -eq 'radiolive') { 'radio' } else { 'tv' }
+    $r = @{ Id = [guid]::NewGuid().ToString('N').Substring(0, 10); Title = $(if ($Title) { $Title } else { [string]$Channel.Title }); Medium = $medium
+            ChannelId = [string]$Channel.Id; ChannelTitle = [string]$Channel.Title; Manifest = [string]$Channel.ManifestPath
+            Start = $Start.ToString('o'); End = $End.ToString('o'); Status = 'Scheduled'; File = ''; Note = '' }
+    (Get-Recordings).Add($r)
+    Save-Recordings
+    Write-Log INFO ("Recording planned: {0} on {1}, {2:dd.MM HH:mm}-{3:HH:mm}" -f $r.Title, $r.ChannelTitle, $Start, $End)
+    Start-RecordTimer
+    Update-RecordingsList
+    Set-Status ("Recording planned: {0}, {1:HH:mm}-{2:HH:mm}" -f $r.Title, $Start, $End)
+}
+
+function Start-RecordTimer {
+    if (-not $script:RecTimer) {
+        $script:RecTimer = New-Object System.Windows.Forms.Timer
+        $script:RecTimer.Interval = 5000
+        $script:RecTimer.Add_Tick({ try { Update-Recordings } catch { Write-LogException $_ 'Recordings' } })
+    }
+    $script:RecTimer.Start()
+}
+
+function Update-Recordings {
+    $now = Get-Date; $busy = $false; $changed = $false
+    foreach ($r in @(Get-Recordings)) {
+        $start = [datetime]$r.Start; $end = [datetime]$r.End
+        switch ($r.Status) {
+            'Scheduled' {
+                $busy = $true
+                if ($now -ge $end) { $r.Status = 'Missed'; $r.Note = 'the app was not running at the time'; $changed = $true }
+                elseif ($now -ge $start -and -not $r.Resolving) { Start-RecordingNow $r; $changed = $true }
+            }
+            'Recording' {
+                $busy = $true
+                $p = $r.Proc
+                if (-not $p -or $p.HasExited) {
+                    $len = try { (Get-Item -LiteralPath $r.File).Length } catch { 0 }
+                    $r.Status = if ($len -gt 100KB -and ($now -ge $end.AddSeconds(-30) -or $r.StopAsked)) { 'Done' } elseif ($len -gt 100KB) { 'Stopped' } else { 'Failed' }
+                    if ($r.Status -eq 'Failed' -and $r.Err -and $r.Err.IsCompleted) { $r.Note = (([string]$r.Err.Result) -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' ' }
+                    elseif ($r.Status -ne 'Failed') { $r.Note = '{0:N0} MB' -f ($len / 1MB) }
+                    Write-Log INFO "Recording $($r.Status.ToLower()): $($r.Title) -> $($r.File) $($r.Note)"
+                    if ($r.Status -eq 'Done') { Show-AppNotification 'Recording done' $r.Title }
+                    $r.Proc = $null; $changed = $true
+                } elseif ($now -ge $end -and -not $r.StopAsked) { Stop-RecordingNow $r }
+                elseif ($r.StopAsked -and $r.StopAt -and ($now - $r.StopAt).TotalSeconds -gt 10) { try { $p.Kill() } catch { } }
+            }
+        }
+    }
+    if ($changed) { Save-Recordings; Update-RecordingsList }
+    if (-not $busy -and $script:RecTimer) { $script:RecTimer.Stop() }
+}
+
+function Start-RecordingNow($r) {
+    # the stream address is looked up in the background, then FFmpeg starts
+    $ff = Find-FFmpeg
+    if (-not $ff.Found) { $r.Status = 'Failed'; $r.Note = 'FFmpeg is not installed (Options > Updates > Components)'; return }
+    $r.Resolving = $true
+    [void](Start-ApiJob "Recording $($r.Title)" {
+        param($rec)
+        if ($rec.Medium -eq 'radio') { $s = Get-NrkAudioStream -ManifestPath $rec.Manifest; return @{ Url = $s.Url; Ok = $s.Playable; Why = $s.Reason } }
+        $s = Get-NrkVideoStream -Id $rec.ChannelId -Kind channel
+        return @{ Url = $s.Url; Ok = $s.Playable; Why = $s.Reason }
+    } {
+        param($res, $rec)
+        $rec.Resolving = $false
+        if ($rec.Status -ne 'Scheduled') { return }
+        if (-not $res.Ok -or -not $res.Url) { $rec.Status = 'Failed'; $rec.Note = $(if ($res.Why) { [string]$res.Why } else { 'no stream' }); Save-Recordings; Update-RecordingsList; return }
+        $end = [datetime]$rec.End
+        $secs = [Math]::Max(30, [int]($end - (Get-Date)).TotalSeconds)
+        $dir = Get-RecordDir $rec.Medium
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $ext = if ($rec.Medium -eq 'radio') { 'm4a' } else { 'mp4' }
+        $name = Get-SafeFileName ('{0} {1:yyyy-MM-dd HH.mm} {2}' -f $rec.ChannelTitle, (Get-Date), $(if ($rec.Title -ne $rec.ChannelTitle) { $rec.Title } else { '' })).Trim()
+        $out = Join-Path $dir "$name.$ext"
+        # fragmented MP4: what is recorded stays playable even if the recording is cut off
+        $argv = @('-hide_banner', '-loglevel', 'error', '-y', '-user_agent', $script:UserAgent, '-i', $res.Url, '-t', "$secs")
+        if ($rec.Medium -eq 'radio') { $argv += @('-vn', '-c:a', 'copy') } else { $argv += @('-c', 'copy') }
+        $argv += @('-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', $out)
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = (Find-FFmpeg).Path; $psi.Arguments = ConvertTo-ArgString $argv
+            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true
+            $p = [System.Diagnostics.Process]::Start($psi); Add-ProcessToJob $p
+            $rec.Proc = $p; $rec.Err = $p.StandardError.ReadToEndAsync(); $rec.File = $out; $rec.Status = 'Recording'; $rec.Note = ''
+            Write-Log INFO ("Recording started: {0} ({1} s) -> {2}" -f $rec.Title, $secs, $out)
+        } catch { $rec.Status = 'Failed'; $rec.Note = $_.Exception.Message }
+        Save-Recordings; Update-RecordingsList
+    } { param($err, $rec) $rec.Resolving = $false; $rec.Status = 'Failed'; $rec.Note = $err.Exception.Message; Save-Recordings; Update-RecordingsList } $r)
+}
+
+function Stop-RecordingNow($r) {
+    # FFmpeg finishes the file when it gets "q"
+    if ($r.Status -eq 'Scheduled') { $r.Status = 'Canceled'; Save-Recordings; Update-RecordingsList; return }
+    if ($r.Status -ne 'Recording' -or -not $r.Proc) { return }
+    $r.StopAsked = $true; $r.StopAt = Get-Date
+    try { $r.Proc.StandardInput.Write('q'); $r.Proc.StandardInput.Flush() } catch { try { $r.Proc.Kill() } catch { } }
+    Write-Log INFO "Recording: stopping $($r.Title)"
+}
+
+function Stop-AllRecordings {
+    # exit: what is being recorded is finished properly (at most 3 s)
+    foreach ($r in @(Get-Recordings | Where-Object { $_.Status -eq 'Recording' -and $_.Proc })) {
+        Stop-RecordingNow $r
+        try { [void]$r.Proc.WaitForExit(3000) } catch { }
+        $r.Status = 'Stopped'; $r.Note = 'stopped when the app closed'; $r.Proc = $null
+    }
+    if ($null -ne $script:Recs) { Save-Recordings }
+}
+
+function Show-RecordDialog($Channel) {
+    # live channel > Record...: now for N minutes, or from a time of day
+    $d = New-Object System.Windows.Forms.Form
+    Set-AppIcon $d
+    $d.Text = "Record - $($Channel.Title)"; $d.ClientSize = New-Object System.Drawing.Size(440, 230); $d.StartPosition = 'CenterParent'
+    $d.FormBorderStyle = 'FixedDialog'; $d.MaximizeBox = $false; $d.MinimizeBox = $false
+    $d.Font = $script:FontUi; $d.BackColor = $T.Bg; $d.ForeColor = $T.Text
+    $rNow = New-Object System.Windows.Forms.RadioButton; $rNow.Text = 'Start now'; $rNow.Checked = $true; $rNow.AutoSize = $true; $rNow.Location = New-Object System.Drawing.Point(20, 18)
+    $rAt = New-Object System.Windows.Forms.RadioButton; $rAt.Text = 'Start at (hh:mm)'; $rAt.AutoSize = $true; $rAt.Location = New-Object System.Drawing.Point(20, 52)
+    $tAt = New-Object System.Windows.Forms.TextBox; $tAt.Width = 70; $tAt.Location = New-Object System.Drawing.Point(200, 50); $tAt.Text = (Get-Date).AddMinutes(30).ToString('HH:mm'); $tAt.BorderStyle = 'FixedSingle'
+    $lLen = New-Object System.Windows.Forms.Label; $lLen.Text = 'For (minutes)'; $lLen.AutoSize = $true; $lLen.Location = New-Object System.Drawing.Point(20, 92)
+    $nLen = New-Object System.Windows.Forms.NumericUpDown; $nLen.Minimum = 1; $nLen.Maximum = 720; $nLen.Value = 60; $nLen.Width = 70; $nLen.Location = New-Object System.Drawing.Point(200, 88)
+    $note = New-Object System.Windows.Forms.Label; $note.AutoSize = $false; $note.Size = New-Object System.Drawing.Size(400, 54); $note.Location = New-Object System.Drawing.Point(20, 124); $note.ForeColor = $T.Muted
+    $note.Text = "Saved in $(Get-RecordDir $(if ($Channel.Type -eq 'radiolive') { 'radio' } else { 'tv' })). The app must be running (it may be in the tray). TV programmes: right-click one in the schedule > Record this programme."
+    $ok = New-FlatButton 'Record' 90 -Primary; $ok.Location = New-Object System.Drawing.Point(140, 186); $ok.DialogResult = 'OK'
+    $lst = New-FlatButton 'Recordings...' 110; $lst.Location = New-Object System.Drawing.Point(236, 186); $lst.Add_Click({ Show-RecordingsWindow })
+    $no = New-FlatButton 'Cancel' 80; $no.Location = New-Object System.Drawing.Point(352, 186); $no.DialogResult = 'Cancel'
+    $d.Controls.AddRange(@($rNow, $rAt, $tAt, $lLen, $nLen, $note, $ok, $lst, $no))
+    $d.AcceptButton = $ok; $d.CancelButton = $no
+    Set-DarkTheme $d; Enable-DarkTitleBar $d
+    if ($d.ShowDialog($form) -ne 'OK') { return }
+    $start = Get-Date
+    if ($rAt.Checked) {
+        if ($tAt.Text.Trim() -notmatch '^(\d{1,2}):(\d\d)$') { [void][System.Windows.Forms.MessageBox]::Show($form, 'Write the time as hh:mm, for example 20:15.', 'Record', 'OK', 'Information'); return }
+        $start = (Get-Date).Date.AddHours([int]$Matches[1]).AddMinutes([int]$Matches[2])
+        if ($start -lt (Get-Date).AddMinutes(-1)) { $start = $start.AddDays(1) }
+    }
+    Add-Recording $Channel $start ($start.AddMinutes([int]$nLen.Value))
+}
+
+function Show-RecordingsWindow {
+    if ($script:RecUi -and -not $script:RecUi.Form.IsDisposed) { $script:RecUi.Form.Activate(); Update-RecordingsList; return }
+    $w = New-Object System.Windows.Forms.Form
+    Set-AppIcon $w
+    $w.Text = 'Recordings - NRK Browser'; $w.ClientSize = New-Object System.Drawing.Size(860, 380); $w.StartPosition = 'CenterParent'
+    $w.Font = $script:FontUi; $w.BackColor = $T.Bg; $w.ForeColor = $T.Text
+    $lv = New-Object System.Windows.Forms.ListView; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.BorderStyle = 'None'; $lv.Dock = 'Fill'; $lv.HideSelection = $false
+    foreach ($c in @(@('Title', 250), @('Channel', 130), @('When', 170), @('Status', 90), @('', 200))) { [void]$lv.Columns.Add($c[0], $c[1]) }
+    $side = New-Object System.Windows.Forms.FlowLayoutPanel; $side.Dock = 'Bottom'; $side.Height = 52; $side.Padding = New-Object System.Windows.Forms.Padding(10, 10, 10, 0); $side.BackColor = $T.Panel
+    $bStop = New-FlatButton 'Stop / cancel' 120; $bRemove = New-FlatButton 'Remove from list' 140; $bPlay = New-FlatButton 'Open file' 100; $bDir = New-FlatButton 'Open folder' 110
+    $side.Controls.AddRange(@($bStop, $bRemove, $bPlay, $bDir))
+    $w.Controls.Add($lv); $w.Controls.Add($side)
+    $script:RecUi = @{ Form = $w; List = $lv }
+    $sel = { @($script:RecUi.List.SelectedItems | ForEach-Object { $_.Tag }) }
+    $bStop.Add_Click({ foreach ($r in (& $sel)) { Stop-RecordingNow $r }; Update-RecordingsList })
+    $bRemove.Add_Click({ foreach ($r in (& $sel)) { if ($r.Status -ne 'Recording') { [void](Get-Recordings).Remove($r) } }; Save-Recordings; Update-RecordingsList })
+    $bPlay.Add_Click({ $r = @(& $sel) | Select-Object -First 1; if ($r -and $r.File -and (Test-Path -LiteralPath $r.File)) { Start-Process -FilePath 'explorer.exe' -ArgumentList "/select,`"$($r.File)`"" } })
+    $bDir.Add_Click({ $d = Get-RecordDir 'tv'; New-Item -ItemType Directory -Path $d -Force | Out-Null; Start-Process $d })
+    $w.Add_FormClosed({ $script:RecUi = $null })
+    Set-DarkTheme $w; Enable-DarkTitleBar $w
+    $lv.BackColor = $T.Surface; $lv.ForeColor = $T.Text
+    Update-RecordingsList
+    $w.Show($form)
+}
+
+function Update-RecordingsList {
+    $u = $script:RecUi
+    if (-not $u -or $u.Form.IsDisposed) { return }
+    $u.List.BeginUpdate(); $u.List.Items.Clear()
+    foreach ($r in @(Get-Recordings) | Sort-Object { [datetime]$_.Start } -Descending) {
+        $it = New-Object System.Windows.Forms.ListViewItem([string]$r.Title)
+        [void]$it.SubItems.Add([string]$r.ChannelTitle)
+        [void]$it.SubItems.Add(('{0:ddd dd.MM HH:mm}-{1:HH:mm}' -f [datetime]$r.Start, [datetime]$r.End))
+        [void]$it.SubItems.Add([string]$r.Status)
+        [void]$it.SubItems.Add($(if ($r.Note) { [string]$r.Note } else { [string]$r.File }))
+        $it.Tag = $r
+        if ($r.Status -eq 'Recording') { $it.ForeColor = $T.Live }
+        [void]$u.List.Items.Add($it)
+    }
+    $u.List.EndUpdate()
+}
+
+# ---- file-name templates (Options > Download rules) -------------------------------------------
+function Format-NameTemplate([string] $Template, [hashtable] $Values) {
+    # {series} {season} {episode} {title} {date} {id}; returns $null when a used value is missing
+    $missing = $false
+    $out = [regex]::Replace($Template, '\{(\w+)\}', {
+        param($m)
+        $k = $m.Groups[1].Value.ToLower()
+        if ($Values.ContainsKey($k) -and "$($Values[$k])" -ne '') { return [string]$Values[$k] }
+        $script:NameTplMissing = $true; return ''
+    })
+    if ($script:NameTplMissing) { $script:NameTplMissing = $false; return $null }
+    $out = ($out -replace '\s{2,}', ' ' -replace '^[\s\-_.]+|[\s\-_.]+$', '').Trim()
+    if (-not $out) { return $null }
+    return (Get-SafeFileName $out)
+}
+
+function Get-RadioFileName($File) {
+    # radio episode file name (without extension): the template, or "2026-10-20 - Title"
+    $date = ''; if ($File.Date -match '^(\d\d)\.(\d\d)\.(\d{4})$') { $date = '{0}-{1}-{2}' -f $Matches[3], $Matches[2], $Matches[1] }
+    $tpl = [string](Get-AppSettings).DlNameRadio
+    if ($tpl) {
+        $n = Format-NameTemplate $tpl @{ series = [string]$File.SeriesTitle; title = [string]$File.Title; date = $date; id = [string]$File.Id }
+        if ($n) { return $n }
+    }
+    return (Get-SafeFileName ($(if ($date) { "$date - " } else { '' }) + $File.Title))
+}
+
+# ---- Windows: global hotkeys, shortcuts, taskbar buttons, jump list ------------------------------
+$script:AppActions = [ordered]@{
+    playpause = 'Play / pause'; next = 'Next'; prev = 'Previous'; back = 'Back 15 seconds'; fwd = 'Forward 15 seconds'
+    volup = 'Volume up'; voldown = 'Volume down'; mute = 'Mute'; stop = 'Stop'; show = 'Show NRK Browser'
+}
+$script:HotkeyDefaults = [ordered]@{ playpause = 'Ctrl+Alt+P'; next = 'Ctrl+Alt+Right'; prev = 'Ctrl+Alt+Left'; back = ''; fwd = ''; volup = 'Ctrl+Alt+Up'; voldown = 'Ctrl+Alt+Down'; mute = 'Ctrl+Alt+M'; stop = ''; show = 'Ctrl+Alt+N' }
+$script:KeyActions = [ordered]@{ options = 'Options'; logs = 'Logs'; downloads = 'Downloads'; indexer = 'Indexer'; filter = 'Search / filter box'; grid = 'Thumbnails / list'; later = 'Watch later (selected)'; recordings = 'Recordings' }
+$script:KeyDefaults = [ordered]@{ options = 'Ctrl+Oemcomma'; logs = 'Ctrl+L'; downloads = 'Ctrl+D'; indexer = 'Ctrl+I'; filter = 'Ctrl+F'; grid = 'Ctrl+G'; later = 'Ctrl+W'; recordings = 'Ctrl+R' }
+
+function Get-KeyMapSetting([string] $Name, $Defaults) {
+    # the saved map (JSON in settings) over the defaults
+    $m = [ordered]@{}; foreach ($k in $Defaults.Keys) { $m[$k] = $Defaults[$k] }
+    $raw = [string](Get-AppSettings).$Name
+    if ($raw) { try { $j = $raw | ConvertFrom-Json; foreach ($p in $j.PSObject.Properties) { if ($m.Contains($p.Name)) { $m[$p.Name] = [string]$p.Value } } } catch { } }
+    return $m
+}
+
+function ConvertTo-KeyText([System.Windows.Forms.Keys] $KeyData) {
+    # Keys (with Ctrl/Alt/Shift) -> "Ctrl+Alt+P"
+    $k = $KeyData -band [System.Windows.Forms.Keys]::KeyCode
+    if ($k -in [System.Windows.Forms.Keys]::ControlKey, [System.Windows.Forms.Keys]::Menu, [System.Windows.Forms.Keys]::ShiftKey, [System.Windows.Forms.Keys]::LWin, [System.Windows.Forms.Keys]::RWin) { return '' }
+    $p = @()
+    if ($KeyData -band [System.Windows.Forms.Keys]::Control) { $p += 'Ctrl' }
+    if ($KeyData -band [System.Windows.Forms.Keys]::Alt) { $p += 'Alt' }
+    if ($KeyData -band [System.Windows.Forms.Keys]::Shift) { $p += 'Shift' }
+    $p += [string]$k
+    return ($p -join '+')
+}
+
+function ConvertFrom-KeyText([string] $Text) {
+    # "Ctrl+Alt+P" -> @{ Mods = 3; Vk = 80; Keys = <Keys> } or $null
+    if (-not $Text) { return $null }
+    $mods = 0; $keys = [System.Windows.Forms.Keys]::None; $vk = 0
+    foreach ($part in ($Text -split '\+')) {
+        switch ($part.Trim()) {
+            'Ctrl' { $mods = $mods -bor 2; $keys = $keys -bor [System.Windows.Forms.Keys]::Control }
+            'Alt' { $mods = $mods -bor 1; $keys = $keys -bor [System.Windows.Forms.Keys]::Alt }
+            'Shift' { $mods = $mods -bor 4; $keys = $keys -bor [System.Windows.Forms.Keys]::Shift }
+            'Win' { $mods = $mods -bor 8 }
+            default { try { $kc = [System.Windows.Forms.Keys]$part.Trim(); $vk = [int]$kc; $keys = $keys -bor $kc } catch { return $null } }
+        }
+    }
+    if (-not $vk) { return $null }
+    return @{ Mods = $mods; Vk = $vk; Keys = $keys }
+}
+
+function Invoke-AppAction([string] $Action) {
+    # one action for hotkeys, taskbar buttons and the phone remote: on what plays (radio, video, cast)
+    $u = $script:AudioUi; $pw = $script:PlayerWin
+    $audio = [bool]($u.Current -and $audioBar.Visible)
+    $video = [bool]($pw -and -not $pw.Form.IsDisposed -and $pw.Url -and $pw.Form.Visible)
+    $vjs = { param($js) try { [void]$pw.WebView.CoreWebView2.ExecuteScriptAsync("(function(){ var v = document.querySelector('video'); if (!v) return; $js })()") } catch { } }
+    switch ($Action) {
+        'playpause' { Invoke-MediaCommand 'pause' }
+        'mute' { Invoke-MediaCommand 'mute' }
+        'next' { if ($audio) { Start-NextAudio 1 } elseif ($video) { Start-PlayerStep 1 } }
+        'prev' { if ($audio) { Start-NextAudio -1 } elseif ($video) { Start-PlayerStep -1 } }
+        'back' { if ($script:Cast.Session) { Invoke-CastCommand 'rel' -15 } elseif ($audio) { Invoke-AudioScript 'nrkb.skip(-15)' } elseif ($video) { & $vjs 'v.currentTime = Math.max(0, v.currentTime - 15);' } }
+        'fwd' { if ($script:Cast.Session) { Invoke-CastCommand 'rel' 15 } elseif ($audio) { Invoke-AudioScript 'nrkb.skip(15)' } elseif ($video) { & $vjs 'v.currentTime = v.currentTime + 15;' } }
+        'volup' { if ($audio) { Invoke-AudioScript 'nrkb.vol(0.1)' } elseif ($video) { & $vjs 'v.muted = false; v.volume = Math.min(1, v.volume + 0.1);' } }
+        'voldown' { if ($audio) { Invoke-AudioScript 'nrkb.vol(-0.1)' } elseif ($video) { & $vjs 'v.volume = Math.max(0, v.volume - 0.1);' } }
+        'stop' { if ($audio) { Stop-AudioPlayer } elseif ($video) { Stop-Player } }
+        'show' { Show-MainWindow }
+        default { if ($Action -match '^(radio|tv):') { Invoke-PlayCommand $Action } }
+    }
+}
+
+function Initialize-WinHelpers {
+    # compiles the C# helpers once (hotkeys, taskbar, phone remote); $false when not possible
+    if ('NrkHotkeys' -as [type]) { return $true }
+    if ($script:WinHelpersFailed) { return $false }
+    try {
+        $refs = if ($PSVersionTable.PSEdition -eq 'Desktop') { @('System', 'System.Drawing', 'System.Windows.Forms') }
+                else { [AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { -not $_.IsDynamic -and $_.Location -and $_.GetName().Name -match '^System\.(Windows\.Forms(\.Primitives)?|Drawing(\.Common|\.Primitives)?|ComponentModel\.Primitives)$' } | ForEach-Object Location }   # (the rest: PowerShell's own default references, as for the dark menus)
+        Add-Type -ReferencedAssemblies $refs -ErrorAction Stop -TypeDefinition $script:WinHelpersCs
+        return $true
+    } catch { $script:WinHelpersFailed = $true; Write-Log WARN "Hotkeys / taskbar buttons / phone remote not available: $($_.Exception.Message)"; return $false }
+}
+
+function Register-AppHotkeys {
+    # Options > Shortcuts > global hotkeys (work while the app is in the background)
+    if (-not (Initialize-WinHelpers)) { return }
+    if (-not $script:Hotkeys) { $script:Hotkeys = New-Object NrkHotkeys([Action[int]]{ param($id) try { $a = $script:HotkeyIds[$id]; if ($a) { Write-Log DEBUG "Hotkey: $a"; Invoke-AppAction $a } } catch { Write-LogException $_ 'Hotkey' } }) }
+    $script:Hotkeys.Clear(); $script:HotkeyIds = @{}; $script:HotkeyFailed = @()
+    if (-not (Get-AppSettings).Hotkeys) { return }
+    $map = Get-KeyMapSetting 'HotkeyMap' $script:HotkeyDefaults
+    $id = 100
+    foreach ($a in $map.Keys) {
+        $k = ConvertFrom-KeyText $map[$a]
+        if (-not $k) { continue }
+        $id++
+        if ($script:Hotkeys.Add($id, [uint32]$k.Mods, [uint32]$k.Vk)) { $script:HotkeyIds[$id] = $a }
+        else { $script:HotkeyFailed += "$($map[$a]) ($($script:AppActions[$a]))" }
+    }
+    Write-Log INFO ("Global hotkeys: {0} on{1}" -f $script:HotkeyIds.Count, $(if ($script:HotkeyFailed.Count) { "; taken by another app: $($script:HotkeyFailed -join ', ')" } else { '' }))
+}
+
+function Invoke-AppShortcut($E) {
+    # the main window's own shortcuts (Options > Shortcuts); $true when one matched
+    $txt = ConvertTo-KeyText $E.KeyData
+    if (-not $txt) { return $false }
+    if (-not $script:KeyMapCache -or $script:KeyMapCacheAt -ne (Get-AppSettings).KeyMap) { $script:KeyMapCache = Get-KeyMapSetting 'KeyMap' $script:KeyDefaults; $script:KeyMapCacheAt = (Get-AppSettings).KeyMap }
+    foreach ($a in $script:KeyMapCache.Keys) {
+        if ($script:KeyMapCache[$a] -ne $txt) { continue }
+        switch ($a) {
+            'options' { Show-OptionsWindow }
+            'logs' { Show-LogsWindow }
+            'downloads' { Show-DownloadsWindow }
+            'indexer' { Open-IndexerWindow }
+            'filter' { $search.Focus() }
+            'grid' { Set-FilesView $(if (Test-GridView) { 'list' } else { 'grid' }) }
+            'later' { $sel = @(Get-SelectedFiles | Where-Object { Test-PosFile $_ }); if ($sel.Count) { Set-WatchLater $sel (-not (@($sel | Where-Object { -not (Test-WatchLater $_) }).Count -eq 0)) } }
+            'recordings' { Show-RecordingsWindow }
+        }
+        return $true
+    }
+    return $false
+}
+
+function New-TaskbarIcon([string] $Kind) {
+    # small white symbols for the taskbar preview buttons
+    $b = New-Object System.Drawing.Bitmap(16, 16)
+    $g = [System.Drawing.Graphics]::FromImage($b); $g.SmoothingMode = 'AntiAlias'
+    $br = [System.Drawing.Brushes]::White
+    $P = { param([float[]] $xy) $pts = for ($i = 0; $i -lt $xy.Count; $i += 2) { New-Object System.Drawing.PointF($xy[$i], $xy[$i + 1]) }; $g.FillPolygon($br, [System.Drawing.PointF[]]$pts) }
+    switch ($Kind) {
+        'prev' { $g.FillRectangle($br, 2, 3, 2, 10); & $P @(13, 3, 13, 13, 5, 8) }
+        'next' { $g.FillRectangle($br, 12, 3, 2, 10); & $P @(3, 3, 3, 13, 11, 8) }
+        'play' { & $P @(4, 2, 4, 14, 14, 8) }
+        'pause' { $g.FillRectangle($br, 3, 2, 4, 12); $g.FillRectangle($br, 9, 2, 4, 12) }
+    }
+    $g.Dispose()
+    $ic = [System.Drawing.Icon]::FromHandle($b.GetHicon())
+    return $ic
+}
+
+function Initialize-Taskbar {
+    # Previous / Play-Pause / Next under the taskbar preview of the main window, and the jump list
+    if (-not (Initialize-WinHelpers)) { return }
+    try {
+        $script:TbIcons = @{ prev = (New-TaskbarIcon 'prev'); next = (New-TaskbarIcon 'next'); play = (New-TaskbarIcon 'play'); pause = (New-TaskbarIcon 'pause') }
+        $script:Taskbar = New-Object NrkTaskbar($form.Handle, [Action[int]]{ param($id) try { switch ($id) { 1 { Invoke-AppAction 'prev' } 2 { Invoke-AppAction 'playpause' } 3 { Invoke-AppAction 'next' } } } catch { Write-LogException $_ 'Taskbar button' } })
+        $script:Taskbar.SetButtons($script:TbIcons.prev, $script:TbIcons.play, $script:TbIcons.next, 'Previous', 'Play / pause', 'Next')
+        $script:TbTimer = New-Object System.Windows.Forms.Timer; $script:TbTimer.Interval = 1000
+        $script:TbTimer.Add_Tick({ Update-TaskbarButtons })
+        $script:TbTimer.Start()
+    } catch { Write-Log WARN "Taskbar buttons: $($_.Exception.Message)" }
+    Update-JumpList
+}
+
+function Update-TaskbarButtons {
+    if (-not $script:Taskbar) { return }
+    $m = Get-MediaState
+    $any = [bool]($m.Audio -or $m.Video)
+    $state = "$any|$($m.Playing)"
+    if ($state -eq $script:TbState) { return }
+    $script:TbState = $state
+    try {
+        $script:Taskbar.Update(1, $null, 'Previous', $any)
+        $script:Taskbar.Update(2, $(if ($m.Playing) { $script:TbIcons.pause } else { $script:TbIcons.play }), $(if ($m.Playing) { 'Pause' } else { 'Play' }), $any)
+        $script:Taskbar.Update(3, $null, 'Next', $any)
+    } catch { }
+}
+
+$script:RecentChFile = Join-Path $script:AppDataDir 'recentchannels.json'
+$script:JumpScript = $PSCommandPath   # (the jump list starts this script with -Play <channel>)
+function Add-RecentChannel($Channel) {
+    # live channels you played, newest first (for the jump list and the phone remote)
+    $medium = if ($Channel.Type -eq 'radiolive') { 'radio' } else { 'tv' }
+    $key = "$($medium):$($Channel.Id)"
+    $list = [System.Collections.Generic.List[object]]::new()
+    $j = Read-JsonFile $script:RecentChFile
+    if ($j) { foreach ($x in @($j.Items)) { if ($x -and $x.Key -ne $key) { $list.Add($x) } } }
+    $list.Insert(0, [pscustomobject]@{ Key = $key; Title = [string]$Channel.Title })
+    while ($list.Count -gt 8) { $list.RemoveAt($list.Count - 1) }
+    Write-JsonFile $script:RecentChFile ([ordered]@{ Items = @($list) })
+    Update-JumpList
+}
+
+function Get-RecentChannels {
+    $j = Read-JsonFile $script:RecentChFile
+    $l = @(if ($j) { @($j.Items | Where-Object { $_ -and $_.Key }) })
+    if (-not $l.Count) { $l = @([pscustomobject]@{ Key = 'radio:p1'; Title = 'NRK P1' }, [pscustomobject]@{ Key = 'radio:p3'; Title = 'NRK P3' }, [pscustomobject]@{ Key = 'radio:mp3'; Title = 'NRK mP3' }, [pscustomobject]@{ Key = 'tv:nrk1'; Title = 'NRK1' }) }
+    return $l
+}
+
+function Update-JumpList {
+    # right-click the taskbar button: the channels you played lately start straight away
+    if (-not ('NrkTaskbar' -as [type]) -or -not $script:JumpScript) { return }
+    try {
+        $ch = @(Get-RecentChannels)
+        $exe = (Get-Process -Id $PID).Path
+        $argsFor = { param($k) '-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Play {1}' -f $script:JumpScript, $k }
+        $icon = ''; $iconIx = 0
+        if ($script:AppIconLocation -match '^(.*),(-?\d+)$') { $icon = $Matches[1]; $iconIx = [int]$Matches[2] }
+        $err = [NrkTaskbar]::SetJumpList('NRK.Browser', 'Channels', $exe, [string[]]@($ch | ForEach-Object { [string]$_.Title }), [string[]]@($ch | ForEach-Object { & $argsFor $_.Key }), $icon, $iconIx)
+        if ($err) { Write-Log DEBUG "Jump list: $err" }
+    } catch { Write-Log DEBUG "Jump list: $($_.Exception.Message)" }
+}
+
+# ---- the phone remote ---------------------------------------------------------------------------
+$script:RemotePage = @'
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NRK Browser remote</title>
+<style>
+:root{--bg:#10171c;--s:#1c252b;--t:#e2e8ec;--m:#86939c;--a:#48c9d2}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:16px system-ui,sans-serif;padding:16px;max-width:520px;margin:auto}
+h1{font-size:15px;color:var(--m);font-weight:500;margin:4px 0 14px}
+#t1{font-size:20px;font-weight:600;min-height:26px}#t2{color:var(--m);min-height:22px;margin:4px 0 18px}
+.row{display:flex;gap:10px;margin-bottom:10px}.row button{flex:1}
+button{background:var(--s);color:var(--t);border:0;border-radius:12px;padding:16px 0;font:600 18px system-ui;cursor:pointer}
+button:active{filter:brightness(1.3)}#pp{background:var(--a);color:#0a1e22;font-size:22px}
+h2{font-size:14px;color:var(--m);margin:22px 0 8px;font-weight:500}
+.ch{display:grid;grid-template-columns:1fr 1fr;gap:8px}.ch button{font-size:15px;padding:12px 6px}
+</style></head><body>
+<h1>NRK Browser</h1>
+<div id="t1">...</div><div id="t2"></div>
+<div class="row"><button data-c="prev">&#x23EE;</button><button data-c="back">-15</button><button id="pp" data-c="playpause">&#x23EF;</button><button data-c="fwd">+15</button><button data-c="next">&#x23ED;</button></div>
+<div class="row"><button data-c="voldown">Vol &minus;</button><button data-c="mute">Mute</button><button data-c="volup">Vol +</button></div>
+<div class="row"><button data-c="stop">Stop</button></div>
+<h2>Channels</h2><div class="ch" id="ch"></div>
+<script>
+const k = new URLSearchParams(location.search).get('k') || '';
+const send = c => fetch('cmd?k=' + encodeURIComponent(k) + '&c=' + encodeURIComponent(c)).then(() => setTimeout(poll, 400));
+document.querySelectorAll('button[data-c]').forEach(b => b.onclick = () => send(b.dataset.c));
+let chs = '';
+function poll() {
+  fetch('state?k=' + encodeURIComponent(k)).then(r => r.json()).then(s => {
+    document.getElementById('t1').textContent = s.title || 'Nothing playing';
+    document.getElementById('t2').textContent = s.sub || '';
+    document.getElementById('pp').innerHTML = s.playing ? '&#x2016;' : '&#x25B6;';
+    const j = JSON.stringify(s.channels || []);
+    if (j !== chs) { chs = j; const el = document.getElementById('ch'); el.innerHTML = '';
+      (s.channels || []).forEach(c => { const b = document.createElement('button'); b.textContent = c.title; b.onclick = () => send(c.key); el.appendChild(b); }); }
+  }).catch(() => { document.getElementById('t2').textContent = 'Not connected (is NRK Browser running?)'; });
+}
+poll(); setInterval(poll, 3000);
+</script></body></html>
+'@
+
+function Get-RemoteUrls {
+    # the addresses the phone can use (this PC's addresses on the home network)
+    if (-not $script:Remote) { return @() }
+    $ips = @()
+    try {
+        foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            if ($ni.OperationalStatus -ne 'Up' -or $ni.NetworkInterfaceType -eq 'Loopback') { continue }
+            foreach ($ua in $ni.GetIPProperties().UnicastAddresses) { if ($ua.Address.AddressFamily -eq 'InterNetwork') { $ips += $ua.Address.ToString() } }
+        }
+    } catch { }
+    return @($ips | Select-Object -Unique | ForEach-Object { 'http://{0}:{1}/?k={2}' -f $_, $script:Remote.Port, $script:Remote.Key })
+}
+
+function Start-PhoneRemote {
+    if ($script:Remote) { return $true }
+    if (-not (Initialize-WinHelpers)) { return $false }
+    $st = Get-AppSettings
+    if (-not $st.RemoteKey) { $st.RemoteKey = -join ((1..16) | ForEach-Object { 'abcdefghijkmnpqrstuvwxyz23456789'[(Get-Random -Maximum 32)] }); Save-AppSettings $st }
+    $r = New-Object NrkRemote
+    $r.Key = [string]$st.RemoteKey; $r.Page = $script:RemotePage
+    $port = $r.Start(51792)
+    if (-not $port) { Write-Log WARN 'Phone remote: no free port (51792-51801)'; return $false }
+    $script:Remote = $r
+    $script:RemoteTimer = New-Object System.Windows.Forms.Timer; $script:RemoteTimer.Interval = 300
+    $script:RemoteTimer.Add_Tick({ Update-PhoneRemote })
+    $script:RemoteTimer.Start()
+    Write-Log INFO "Phone remote on port $port (home network only)"
+    return $true
+}
+
+function Stop-PhoneRemote {
+    if (-not $script:Remote) { return }
+    try { $script:RemoteTimer.Stop(); $script:RemoteTimer.Dispose() } catch { }
+    try { $script:Remote.Stop() } catch { }
+    $script:Remote = $null
+    Write-Log INFO 'Phone remote off'
+}
+
+function Update-PhoneRemote {
+    $r = $script:Remote
+    if (-not $r) { return }
+    $c = $null
+    while ($r.Commands.TryDequeue([ref]$c)) { try { Invoke-AppAction $c } catch { Write-LogException $_ "Remote $c" } }
+    $l = $null; while ($r.Log.TryDequeue([ref]$l)) { Write-Log INFO "Phone remote: $l" }
+    $script:RemoteTick = 1 + [int]$script:RemoteTick
+    if ($script:RemoteTick % 3) { return }   # (the state about once a second)
+    $u = $script:AudioUi; $pw = $script:PlayerWin; $m = Get-MediaState
+    $title = ''; $sub = ''
+    if ($m.Audio) { $title = [string]$u.Current.Title; $sub = if ($u.Current.Type -eq 'radiolive' -and $script:NowLast) { [string][char]0x266A + ' ' + $script:NowLast } else { [string]$u.Current.SeriesTitle } }
+    elseif ($m.Video -and $pw.Target) { $title = [string]$pw.Target.Title }
+    $chs = @(Get-RecentChannels | ForEach-Object { [ordered]@{ key = [string]$_.Key; title = [string]$_.Title } })
+    $r.State = [ordered]@{ title = $title; sub = $sub; playing = [bool]$m.Playing; channels = $chs } | ConvertTo-Json -Compress -Depth 4
+}
+
+#endregion
+
+
 #---- Options window ---------------------------------------------------------------
+
+function Get-OptionTexts($Control) {
+    # every label, check box and button under $Control (not what is typed in boxes)
+    foreach ($c in $Control.Controls) {
+        if ($c -is [System.Windows.Forms.Label] -or $c -is [System.Windows.Forms.CheckBox] -or $c -is [System.Windows.Forms.RadioButton] -or $c -is [System.Windows.Forms.Button]) { if ($c.Text) { $c } }
+        if ($c.Controls.Count) { Get-OptionTexts $c }
+    }
+}
+
+function Update-OptionsFind([switch] $Next) {
+    $u = $script:OptUi
+    if (-not $u -or -not $u.Find) { return }
+    $term = $u.Find.Text.Trim()
+    # undo the last highlight
+    foreach ($c in @($u.FindColors.Keys)) { try { $c.ForeColor = $u.FindColors[$c] } catch { } }
+    $u.FindColors = @{}
+    $hitPages = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $u.Pages.Keys) {
+        $b = $u.NavButtons[$name]
+        $hits = if ($term.Length -ge 2) { @(Get-OptionTexts $u.Pages[$name] | Where-Object { $_.Text -like "*$term*" }) } else { @() }
+        foreach ($c in $hits) { $u.FindColors[$c] = $c.ForeColor; $c.ForeColor = $T.Accent }
+        $b.Text = '   ' + $name + $(if ($hits.Count) { "  ($($hits.Count))" } else { '' })
+        if ($term.Length -ge 2 -and -not $hits.Count) { $b.ForeColor = $T.Muted } elseif ($u.Current -ne $name) { $b.ForeColor = $T.Text }
+        if ($hits.Count) { $hitPages.Add($name) }
+        $u.Pages[$name].Tag = if ($hits.Count) { $hits[0] } else { $null }
+    }
+    if (-not $hitPages.Count) { return }
+    $go = $hitPages[0]
+    if ($Next -and $hitPages.Contains($u.Current)) { $go = $hitPages[($hitPages.IndexOf($u.Current) + 1) % $hitPages.Count] }
+    elseif ($hitPages.Contains($u.Current) -and -not $Next) { $go = $u.Current }
+    & $script:OptShowPage $go
+    $first = $u.Pages[$go].Tag
+    if ($first) { try { $u.Pages[$go].ScrollControlIntoView($first) } catch { } }
+    foreach ($name in $u.Pages.Keys) { if ($term.Length -ge 2 -and -not $hitPages.Contains($name)) { $u.NavButtons[$name].ForeColor = $T.Muted } }
+}
 
 function Show-OptionsWindow {
     Write-Log INFO 'UI: opened Options window'
     $w = New-Object System.Windows.Forms.Form
     Set-AppIcon $w   # window, title bar and taskbar icon
     $w.Text = 'Options - NRK Browser'
-    $w.ClientSize = New-Object System.Drawing.Size(860, 560)
+    $w.ClientSize = New-Object System.Drawing.Size(860, 620)   # (2.9.0: taller for the new pages)
     $w.StartPosition = 'CenterParent'
     $w.FormBorderStyle = 'FixedDialog'; $w.MaximizeBox = $false; $w.MinimizeBox = $false
     $w.Font = $script:FontUi; $w.BackColor = $T.Bg; $w.ForeColor = $T.Text
@@ -12016,6 +14200,16 @@ function Show-OptionsWindow {
     $pageHost.Dock = 'Fill'; $pageHost.BackColor = $T.Bg
     $w.Controls.Add($pageHost); $w.Controls.Add($nav)
     $ui.Pages = [ordered]@{}; $ui.NavButtons = @{}
+    # Find setting: the pages with a match show how many, the first one opens, the words light up
+    $findPanel = New-Object System.Windows.Forms.Panel; $findPanel.Dock = 'Top'; $findPanel.Height = 44; $findPanel.BackColor = $T.Panel
+    $findPanel.Padding = New-Object System.Windows.Forms.Padding(10, 0, 10, 12)
+    $find = New-Object System.Windows.Forms.TextBox; $find.Dock = 'Fill'; $find.BorderStyle = 'FixedSingle'
+    $find.BackColor = $T.Surface; $find.ForeColor = $T.Text
+    $findPanel.Controls.Add($find); $nav.Controls.Add($findPanel)
+    $ui.Find = $find; $ui.FindColors = @{}
+    $find.Add_HandleCreated({ try { [NrkNative]::Placeholder($this.Handle, 'Find setting') } catch { } })
+    $find.Add_TextChanged({ Update-OptionsFind })
+    $find.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Enter') { Update-OptionsFind -Next; $e.SuppressKeyPress = $true } elseif ($e.KeyCode -eq 'Escape' -and $this.Text) { $this.Text = ''; $e.SuppressKeyPress = $true } })
     $newPage = {
         param([string] $Name)
         $pg = New-Object System.Windows.Forms.Panel
@@ -12023,7 +14217,7 @@ function Show-OptionsWindow {
         [void]$pageHost.Controls.Add($pg)
         $ui.Pages[$Name] = $pg
         $b = New-Object System.Windows.Forms.Button
-        $b.Text = '   ' + $Name; $b.TextAlign = 'MiddleLeft'; $b.Dock = 'Top'; $b.Height = 42
+        $b.Text = '   ' + $Name; $b.TextAlign = 'MiddleLeft'; $b.Dock = 'Top'; $b.Height = 40
         $b.FlatStyle = 'Flat'; $b.FlatAppearance.BorderSize = 0; $b.UseVisualStyleBackColor = $false
         $b.BackColor = $T.Panel; $b.ForeColor = $T.Text; $b.Font = $script:FontUi; $b.Cursor = [System.Windows.Forms.Cursors]::Hand
         $b.FlatAppearance.MouseOverBackColor = $T.Hover; $b.Tag = $Name
@@ -12267,38 +14461,59 @@ function Show-OptionsWindow {
         [void](& $add $c 220 $Y)
         $c
     }
-    & $header 'Quality and format' 590
-    [void](& $combo 'TV quality' 630 @('Best NRK has', 'Up to 1080p', 'Up to 720p', 'Up to 480p (small files)', 'Up to 360p (smallest)') @('best', '1080', '720', '480', '360') 'DlQuality')
-    [void](& $combo 'TV file type' 668 @('MP4 (plays everywhere)', 'MKV (Matroska)') @('mp4', 'mkv') 'DlContainer')
-    $ui.DlNfo = & $check 'Save .nfo files and pictures for Kodi, Jellyfin and Plex' ([bool]$st.DlNfo) 26 708
+    [void](& $muted ("Quality, file type, whole series, speed limit, download hours and history: see the Download rules page.") 26 576 600 20)
+    # ---- Download rules (what and when; the Downloads page has folders and connection)
+    $page = & $newPage 'Download rules'
+    & $header 'Quality and format' 18
+    [void](& $combo 'TV quality' 58 @('Best NRK has', 'Up to 1080p', 'Up to 720p', 'Up to 480p (small files)', 'Up to 360p (smallest)') @('best', '1080', '720', '480', '360') 'DlQuality')
+    [void](& $combo 'TV file type' 96 @('MP4 (plays everywhere)', 'MKV (Matroska)') @('mp4', 'mkv') 'DlContainer')
+    $ui.DlNfo = & $check 'Save .nfo files and pictures for Kodi, Jellyfin and Plex' ([bool]$st.DlNfo) 26 136
     $ui.DlNfo.Add_CheckedChanged({ & $script:OptSaveFlag 'DlNfo' $this.Checked })
-    & $header 'Whole series' 756
-    [void](& $combo 'Download' 796 @('Every episode', 'Only the newest 1', 'Only the newest 3', 'Only the newest 5', 'Only the newest 10', 'Only the newest 25') @('0', '1', '3', '5', '10', '25') 'DlSeriesNewest')
+    & $header 'Whole series' 184
+    [void](& $combo 'Download' 224 @('Every episode', 'Only the newest 1', 'Only the newest 3', 'Only the newest 5', 'Only the newest 10', 'Only the newest 25') @('0', '1', '3', '5', '10', '25') 'DlSeriesNewest')
     $lblAfter = New-Object System.Windows.Forms.Label; $lblAfter.Text = 'Only published after'; $lblAfter.AutoSize = $true
-    [void](& $add $lblAfter 26 838)
+    [void](& $add $lblAfter 26 266)
     $ui.DlAfter = New-Object System.Windows.Forms.TextBox; $ui.DlAfter.Width = 120; $ui.DlAfter.BackColor = $T.Surface; $ui.DlAfter.ForeColor = $T.Text; $ui.DlAfter.BorderStyle = 'FixedSingle'
     $ui.DlAfter.Text = [string]$st.DlSeriesAfter
-    [void](& $add $ui.DlAfter 220 834)
-    [void](& $muted 'yyyy-mm-dd, empty = any date' 350 838 280)
+    [void](& $add $ui.DlAfter 220 262)
+    [void](& $muted 'yyyy-mm-dd, empty = any date' 350 266 280)
     $ui.DlAfter.Add_Leave({ $v = $this.Text.Trim(); if ($v -and $v -notmatch '^\d{4}-\d\d-\d\d$') { $this.Text = [string](Get-AppSettings).DlSeriesAfter; return }; $s = Get-AppSettings; if ($s.DlSeriesAfter -ne $v) { $s.DlSeriesAfter = $v; Save-AppSettings $s } })
-    & $header 'When and how fast' 882
-    [void](& $combo 'Speed limit' 922 @('No limit', '500 KB/s', '1 MB/s', '2 MB/s', '5 MB/s') @('0', '500', '1000', '2000', '5000') 'DlSpeedKB')
+    & $header 'When and how fast' 310
+    [void](& $combo 'Speed limit' 350 @('No limit', '500 KB/s', '1 MB/s', '2 MB/s', '5 MB/s') @('0', '500', '1000', '2000', '5000') 'DlSpeedKB')
     $lblWin = New-Object System.Windows.Forms.Label; $lblWin.Text = 'Only download between'; $lblWin.AutoSize = $true
-    [void](& $add $lblWin 26 964)
+    [void](& $add $lblWin 26 392)
     $ui.DlWin = New-Object System.Windows.Forms.TextBox; $ui.DlWin.Width = 120; $ui.DlWin.BackColor = $T.Surface; $ui.DlWin.ForeColor = $T.Text; $ui.DlWin.BorderStyle = 'FixedSingle'
     $ui.DlWin.Text = [string]$st.DlWindow
-    [void](& $add $ui.DlWin 220 960)
-    [void](& $muted 'for example 01:00-07:00, empty = any time' 350 964 280)
+    [void](& $add $ui.DlWin 220 388)
+    [void](& $muted 'for example 01:00-07:00, empty = any time' 350 392 280)
     $ui.DlWin.Add_Leave({ $v = $this.Text.Trim(); if ($v -and $v -notmatch '^\d{1,2}:\d\d\s*-\s*\d{1,2}:\d\d$') { $this.Text = [string](Get-AppSettings).DlWindow; return }; $s = Get-AppSettings; if ($s.DlWindow -ne $v) { $s.DlWindow = $v; Save-AppSettings $s } })
-    $ui.DlNotify = & $check 'Tell me (Windows notification) when downloads finish or new episodes arrive' ([bool]$st.DlNotify) 26 1004
+    $ui.DlNotify = & $check 'Tell me (Windows notification) when downloads finish or new episodes arrive' ([bool]$st.DlNotify) 26 432
     $ui.DlNotify.Add_CheckedChanged({ & $script:OptSaveFlag 'DlNotify' $this.Checked })
-    & $header 'History' 1052
-    $ui.DlHist = & $check "Don't download again what was downloaded before (also after it was moved or deleted)" ([bool]$st.DlSkipHistory) 26 1092
+    & $header 'History' 480
+    $ui.DlHist = & $check "Don't download again what was downloaded before (also after it was moved or deleted)" ([bool]$st.DlSkipHistory) 26 520
     $ui.DlHist.Add_CheckedChanged({ & $script:OptSaveFlag 'DlSkipHistory' $this.Checked })
     $bHist = New-FlatButton ('Clear download history ({0})' -f (Get-DlHistory).Count) 260
-    [void](& $add $bHist 24 1126)
+    [void](& $add $bHist 24 554)
     $bHist.Add_Click({ if ([System.Windows.Forms.MessageBox]::Show($script:OptUi.Form, 'Forget what was downloaded before?', 'Download history', 'YesNo', 'Question') -eq 'Yes') { Clear-DlHistory; $this.Text = 'Clear download history (0)' } })
-    [void](& $muted '' 26 1170 10 10)   # (room at the bottom when scrolled)
+    # 2.9.0: file names
+    & $header 'File names' 616
+    $lblNt = New-Object System.Windows.Forms.Label; $lblNt.Text = 'TV episodes'; $lblNt.AutoSize = $true
+    [void](& $add $lblNt 26 660)
+    $ui.NameTv = New-Object System.Windows.Forms.TextBox; $ui.NameTv.Width = 380; $ui.NameTv.BackColor = $T.Surface; $ui.NameTv.ForeColor = $T.Text; $ui.NameTv.BorderStyle = 'FixedSingle'
+    $ui.NameTv.Text = [string]$st.DlNameTv; [void](& $add $ui.NameTv 220 656)
+    $lblNr = New-Object System.Windows.Forms.Label; $lblNr.Text = 'Radio and podcasts'; $lblNr.AutoSize = $true
+    [void](& $add $lblNr 26 700)
+    $ui.NameRadio = New-Object System.Windows.Forms.TextBox; $ui.NameRadio.Width = 380; $ui.NameRadio.BackColor = $T.Surface; $ui.NameRadio.ForeColor = $T.Text; $ui.NameRadio.BorderStyle = 'FixedSingle'
+    $ui.NameRadio.Text = [string]$st.DlNameRadio; [void](& $add $ui.NameRadio 220 696)
+    [void](& $muted 'Empty = as before ("Series - s01e02 - Title", "2026-10-20 - Title"). You can use {series} {season} {episode} {title} {date} {id}, for example {series} - S{season}E{episode} - {title}. The folders stay the same. If something the name uses is not known (no episode number), the built-in name is used.' 26 734 600 74)
+    foreach ($tb in @($ui.NameTv, $ui.NameRadio)) {
+        $tb.Add_HandleCreated({ try { [NrkNative]::Placeholder($this.Handle, 'built-in name') } catch { } })
+        $tb.Add_Leave({
+            $s = Get-AppSettings; $k = if ($this -eq $script:OptUi.NameTv) { 'DlNameTv' } else { 'DlNameRadio' }
+            $v = $this.Text.Trim(); if ([string]$s.$k -ne $v) { $s.$k = $v; Save-AppSettings $s; Write-Log INFO "Option $k = $v" }
+        })
+    }
+    [void](& $muted '' 26 820 10 10)   # (room at the bottom when scrolled)
     $script:OptSaveDlDir = {
         # both download folders (a download that is running keeps the folder it started in)
         foreach ($r in @($false, $true)) {
@@ -12395,6 +14610,144 @@ function Show-OptionsWindow {
         if ($script:LogsUi -and $script:LogsUi.Disk) { $script:LogsUi.Disk.Checked = $this.Checked }
     })
 
+    # ---- 2.9.0: Listening
+    $page = & $newPage 'Listening'
+    & $header 'Radio bar' 18
+    $ui.Silence = & $check 'Skip silences: the quiet parts of programmes and podcasts play faster' ([bool]$st.SkipSilence) 26 60
+    $ui.Silence.Add_CheckedChanged({ & $script:OptSaveFlag 'SkipSilence' $this.Checked; Send-AudioFx })
+    $ui.Boost = & $check 'Voice boost: clearer, more even speech (quiet voices louder)' ([bool]$st.VoiceBoost) 26 92
+    $ui.Boost.Add_CheckedChanged({ & $script:OptSaveFlag 'VoiceBoost' $this.Checked; Send-AudioFx })
+    $ui.NowPl = & $check 'Live radio: show the song that is playing (when NRK says)' ([bool]$st.NowPlaying) 26 124
+    $ui.NowPl.Add_CheckedChanged({ & $script:OptSaveFlag 'NowPlaying' $this.Checked })
+    [void](& $muted 'Also the bars button in the radio bar. Speed and skipping the start / end for one series: that button > Settings for <series>. A podcast file from another site may not allow the sound effects; it then plays without them.' 26 154 600 52)
+    & $header 'Sleep timer and next episode' 218
+    $ui.Fade = & $check 'Sleep timer: lower the volume over the last minute' ([bool]$st.SleepFade) 26 260
+    $ui.Fade.Add_CheckedChanged({ & $script:OptSaveFlag 'SleepFade' $this.Checked })
+    $ui.UpCard = & $check 'Built-in player: a card with a countdown before the next episode (Play now / Cancel)' ([bool]$st.UpNextCard) 26 292
+    $ui.UpCard.Add_CheckedChanged({ & $script:OptSaveFlag 'UpNextCard' $this.Checked })
+    [void](& $combo 'Countdown' 326 @('5 seconds', '10 seconds', '15 seconds', '20 seconds', '30 seconds') @('5', '10', '15', '20', '30') 'UpNextSeconds' 160)
+    & $header 'Statistics' 380
+    $ui.Stats = & $check 'Count what I watch and listen to (only on this PC)' ([bool]$st.StatsOn) 26 422
+    $ui.Stats.Add_CheckedChanged({ & $script:OptSaveFlag 'StatsOn' $this.Checked })
+    $bStats = New-FlatButton 'Show statistics...' 170; [void](& $add $bStats 24 454)
+    $bStats.Add_Click({ Show-StatsWindow })
+    & $header 'Recordings (live TV and radio)' 512
+    $lblRd = New-Object System.Windows.Forms.Label; $lblRd.Text = 'Folder'; $lblRd.AutoSize = $true
+    [void](& $add $lblRd 26 556)
+    $ui.RecDir = New-Object System.Windows.Forms.TextBox; $ui.RecDir.Width = 360; $ui.RecDir.BackColor = $T.Surface; $ui.RecDir.ForeColor = $T.Text; $ui.RecDir.BorderStyle = 'FixedSingle'
+    $ui.RecDir.Text = [string]$st.RecordDir; [void](& $add $ui.RecDir 120 552)
+    $ui.RecDir.Add_HandleCreated({ try { [NrkNative]::Placeholder($this.Handle, 'the download folders \ Recordings') } catch { } })
+    $ui.RecDir.Add_Leave({ $s = Get-AppSettings; $v = $this.Text.Trim(); if ([string]$s.RecordDir -ne $v) { $s.RecordDir = $v; Save-AppSettings $s; Write-Log INFO "Option RecordDir = $v" } })
+    $bRecs = New-FlatButton 'Recordings...' 130; [void](& $add $bRecs 490 549)
+    $bRecs.Add_Click({ Show-RecordingsWindow })
+    [void](& $muted 'Right-click a live channel > Record..., or a programme in the TV schedule > Record this programme. Needs FFmpeg; the app must be running (the tray is fine).' 26 588 600 40)
+    [void](& $muted '' 26 640 10 10)
+
+    # ---- 2.9.0: Wake to radio
+    $page = & $newPage 'Wake to radio'
+    & $header 'Wake to radio' 18
+    $ui.Alarm = & $check 'Start a radio channel at this time' ([bool]$st.AlarmOn) 26 60
+    $ui.Alarm.Add_CheckedChanged({ & $script:OptSaveFlag 'AlarmOn' $this.Checked; & $script:OptAlarmNext })
+    $lblAt = New-Object System.Windows.Forms.Label; $lblAt.Text = 'Time (hh:mm)'; $lblAt.AutoSize = $true
+    [void](& $add $lblAt 26 104)
+    $ui.AlarmTime = New-Object System.Windows.Forms.TextBox; $ui.AlarmTime.Width = 80; $ui.AlarmTime.BackColor = $T.Surface; $ui.AlarmTime.ForeColor = $T.Text; $ui.AlarmTime.BorderStyle = 'FixedSingle'
+    $ui.AlarmTime.Text = [string]$st.AlarmTime; [void](& $add $ui.AlarmTime 220 100)
+    $ui.AlarmTime.Add_Leave({ $v = $this.Text.Trim(); if ($v -notmatch '^([01]?\d|2[0-3]):[0-5]\d$') { $this.Text = [string](Get-AppSettings).AlarmTime; return }; $s = Get-AppSettings; if ($s.AlarmTime -ne $v) { $s.AlarmTime = $v; $s.AlarmLast = ''; Save-AppSettings $s; Write-Log INFO "Option AlarmTime = $v" }; & $script:OptAlarmNext })
+    $lblDays = New-Object System.Windows.Forms.Label; $lblDays.Text = 'Days'; $lblDays.AutoSize = $true
+    [void](& $add $lblDays 26 144)
+    $ui.AlarmDays = @()
+    $dx = 220
+    foreach ($d in @(@(1, 'Mon'), @(2, 'Tue'), @(3, 'Wed'), @(4, 'Thu'), @(5, 'Fri'), @(6, 'Sat'), @(7, 'Sun'))) {
+        $c = New-Object System.Windows.Forms.CheckBox; $c.Text = $d[1]; $c.AutoSize = $true; $c.ForeColor = $T.Text; $c.Tag = $d[0]
+        $c.Checked = (@([string]$st.AlarmDays -split ',') -contains [string]$d[0])
+        [void](& $add $c $dx 142); $dx += 56; $ui.AlarmDays += $c
+        $c.Add_CheckedChanged({ $s = Get-AppSettings; $s.AlarmDays = (@($script:OptUi.AlarmDays | Where-Object { $_.Checked } | ForEach-Object { [string]$_.Tag }) -join ','); Save-AppSettings $s; & $script:OptAlarmNext })
+    }
+    $lblCh = New-Object System.Windows.Forms.Label; $lblCh.Text = 'Channel'; $lblCh.AutoSize = $true
+    [void](& $add $lblCh 26 188)
+    $ui.AlarmCh = New-Object System.Windows.Forms.ComboBox; $ui.AlarmCh.DropDownStyle = 'DropDownList'; $ui.AlarmCh.FlatStyle = 'Flat'; $ui.AlarmCh.Width = 260; $ui.AlarmCh.BackColor = $T.Surface; $ui.AlarmCh.ForeColor = $T.Text
+    [void](& $add $ui.AlarmCh 220 184)
+    $ui.AlarmChIds = @()
+    $chs = @(); try { $chs = @(Get-Cached 'radio:live' { Get-NrkLiveChannels -Medium radio }) } catch { }
+    if (-not $chs.Count) { $chs = @([pscustomobject]@{ Id = [string]$st.AlarmChannel; Title = [string]$st.AlarmChannelTitle }) }
+    foreach ($c in $chs) { [void]$ui.AlarmCh.Items.Add([string]$c.Title); $ui.AlarmChIds += [string]$c.Id }
+    $ui.AlarmCh.SelectedIndex = [Math]::Max(0, [array]::IndexOf($ui.AlarmChIds, [string]$st.AlarmChannel))
+    $ui.AlarmCh.Add_SelectedIndexChanged({ $s = Get-AppSettings; $s.AlarmChannel = $script:OptUi.AlarmChIds[$this.SelectedIndex]; $s.AlarmChannelTitle = [string]$this.SelectedItem; Save-AppSettings $s; Write-Log INFO "Option AlarmChannel = $($s.AlarmChannel)" })
+    $ui.AlarmNext = & $muted '' 26 228 600 20
+    [void](& $muted 'The PC must be on and NRK Browser running (in the tray is fine). The volume rises gently over 45 seconds. Sleep mode: Windows does not wake the PC for this.' 26 258 600 40)
+    $bTry = New-FlatButton 'Try it now' 120; [void](& $add $bTry 24 306)
+    $bTry.Add_Click({ $s = Get-AppSettings; Invoke-PlayCommand ("radio:{0}" -f $s.AlarmChannel) -Alarm })
+    $script:OptAlarmNext = {
+        $n = Get-NextAlarm
+        $script:OptUi.AlarmNext.Text = if ($n) { 'Next time: {0:dddd dd.MM HH:mm}' -f $n } else { 'Off' }
+    }
+    & $script:OptAlarmNext
+
+    # ---- 2.9.0: Shortcuts
+    $page = & $newPage 'Shortcuts'
+    & $header 'Hotkeys (work also when NRK Browser is in the background)' 18
+    $ui.HkOn = & $check 'Use these hotkeys' ([bool]$st.Hotkeys) 26 56
+    $ui.HkOn.Add_CheckedChanged({ & $script:OptSaveFlag 'Hotkeys' $this.Checked; Register-AppHotkeys; & $script:OptHkNote })
+    $mkKeyRow = {
+        param([string] $Setting, $Defaults, [string] $Action, [string] $Label, [int] $Y)
+        $l = New-Object System.Windows.Forms.Label; $l.Text = $Label; $l.AutoSize = $true
+        [void](& $add $l 26 ($Y + 4))
+        $tb = New-Object System.Windows.Forms.TextBox; $tb.Width = 200; $tb.ReadOnly = $true; $tb.BackColor = $T.Surface; $tb.ForeColor = $T.Text; $tb.BorderStyle = 'FixedSingle'
+        $tb.Text = (Get-KeyMapSetting $Setting $Defaults)[$Action]; $tb.Tag = @{ Setting = $Setting; Defaults = $Defaults; Action = $Action }
+        [void](& $add $tb 240 $Y)
+        $tb.Add_KeyDown({
+            param($s, $e)
+            $e.SuppressKeyPress = $true; $e.Handled = $true
+            $txt = if ($e.KeyCode -in 'Back', 'Delete' -and -not ($e.Control -or $e.Alt -or $e.Shift)) { '' } else { ConvertTo-KeyText $e.KeyData }
+            if ($txt -eq '' -and $e.KeyCode -notin 'Back', 'Delete') { return }   # (Ctrl / Alt / Shift alone: wait for the key)
+            if ($txt -and $txt -notmatch '\+' -and $this.Tag.Setting -eq 'HotkeyMap' -and $txt -notmatch '^(F\d+|Media\w+|Volume\w+)$') { return }   # (a hotkey needs Ctrl / Alt / Shift)
+            $this.Text = $txt
+            $m = Get-KeyMapSetting $this.Tag.Setting $this.Tag.Defaults; $m[$this.Tag.Action] = $txt
+            $s2 = Get-AppSettings; $s2.($this.Tag.Setting) = ($m | ConvertTo-Json -Compress); Save-AppSettings $s2
+            if ($this.Tag.Setting -eq 'HotkeyMap') { Register-AppHotkeys; & $script:OptHkNote }
+        })
+        $tb
+    }
+    $y = 90
+    foreach ($a in $script:AppActions.Keys) { [void](& $mkKeyRow 'HotkeyMap' $script:HotkeyDefaults $a $script:AppActions[$a] $y); $y += 32 }
+    $ui.HkNote = & $muted '' 26 ($y + 2) 600 36
+    $script:OptHkNote = { $script:OptUi.HkNote.Text = if (@($script:HotkeyFailed).Count) { 'Taken by another app: ' + ($script:HotkeyFailed -join ', ') } else { 'Click a box and press the keys; Backspace = none. Media keys on the keyboard work as before.' } }
+    & $script:OptHkNote
+    $y += 48
+    & $header 'In the main window' $y
+    $y += 42
+    foreach ($a in $script:KeyActions.Keys) { [void](& $mkKeyRow 'KeyMap' $script:KeyDefaults $a $script:KeyActions[$a] $y); $y += 32 }
+    $bKeyReset = New-FlatButton 'Back to the defaults' 180; [void](& $add $bKeyReset 24 ($y + 8))
+    $bKeyReset.Add_Click({ $s = Get-AppSettings; $s.HotkeyMap = ''; $s.KeyMap = ''; Save-AppSettings $s; Register-AppHotkeys; [void][System.Windows.Forms.MessageBox]::Show($script:OptUi.Form, 'The default shortcuts are back (open Options again to see them).', 'Shortcuts', 'OK', 'Information') })
+    $y += 64
+    & $header 'Taskbar' $y
+    $ui.Tb = & $check 'Previous / Play / Next under the taskbar preview, and recent channels when you right-click the taskbar button (after a restart)' ([bool]$st.TaskbarButtons) 26 ($y + 42)
+    $ui.Tb.Add_CheckedChanged({ & $script:OptSaveFlag 'TaskbarButtons' $this.Checked })
+    [void](& $muted '' 26 ($y + 100) 10 10)
+
+    # ---- 2.9.0: Phone remote
+    $page = & $newPage 'Phone remote'
+    & $header 'Phone remote' 18
+    $ui.RemOn = & $check 'Control NRK Browser from a phone on the same network' ([bool]$st.RemoteOn) 26 60
+    $ui.RemUrls = New-Object System.Windows.Forms.TextBox; $ui.RemUrls.Multiline = $true; $ui.RemUrls.ReadOnly = $true; $ui.RemUrls.Width = 600; $ui.RemUrls.Height = 70
+    $ui.RemUrls.BackColor = $T.Surface; $ui.RemUrls.ForeColor = $T.Text; $ui.RemUrls.BorderStyle = 'FixedSingle'
+    [void](& $add $ui.RemUrls 26 100)
+    $bRemCopy = New-FlatButton 'Copy the address' 160; [void](& $add $bRemCopy 24 182)
+    $bRemKey = New-FlatButton 'New key' 110; [void](& $add $bRemKey 194 182)
+    [void](& $muted 'Open the address in the phone''s browser (the key in it is the password: only share it with people in your home). Only devices on your home network get in. The first time, Windows may ask whether PowerShell may use the network: allow it on private networks.' 26 228 600 74)
+    $script:OptRemShow = {
+        $u = $script:OptUi
+        $u.RemUrls.Text = if ($script:Remote) { (Get-RemoteUrls) -join "`r`n" } else { '(off)' }
+    }
+    $ui.RemOn.Add_CheckedChanged({
+        & $script:OptSaveFlag 'RemoteOn' $this.Checked
+        if ($this.Checked) { if (-not (Start-PhoneRemote)) { [void][System.Windows.Forms.MessageBox]::Show($script:OptUi.Form, 'The phone remote could not start (see Logs).', 'Phone remote', 'OK', 'Warning') } } else { Stop-PhoneRemote }
+        & $script:OptRemShow
+    })
+    $bRemCopy.Add_Click({ $u = @(Get-RemoteUrls); if ($u.Count) { [System.Windows.Forms.Clipboard]::SetText($u[0]); Set-Status 'Phone remote address copied' } })
+    $bRemKey.Add_Click({ $s = Get-AppSettings; $s.RemoteKey = ''; Save-AppSettings $s; $on = [bool]$script:Remote; Stop-PhoneRemote; if ($on) { [void](Start-PhoneRemote) } else { $s = Get-AppSettings; $s.RemoteKey = -join ((1..16) | ForEach-Object { 'abcdefghijkmnpqrstuvwxyz23456789'[(Get-Random -Maximum 32)] }); Save-AppSettings $s }; & $script:OptRemShow })
+    & $script:OptRemShow
+
     # ---- About
     $page = & $newPage 'About'
     $lblName = New-Object System.Windows.Forms.Label; $lblName.Text = 'NRK Browser'; $lblName.Font = New-Object System.Drawing.Font($script:FontUi.FontFamily, 18, [System.Drawing.FontStyle]::Bold); $lblName.AutoSize = $true
@@ -12416,6 +14769,8 @@ function Show-OptionsWindow {
     [void](& $muted 'Unofficial. Not made, endorsed or supported by NRK (Norsk rikskringkasting AS). All programmes, images and trademarks belong to NRK. Downloads are for personal use; some content is only available in Norway.' 26 356 600 56)
     & $header 'Built with' 426
     [void](& $muted 'NRK''s public programme data (psapi.nrk.no)  ·  Microsoft Edge WebView2  ·  hls.js (Apache-2.0)  ·  FFmpeg' 26 466 600 36)
+    $bStatsA = New-FlatButton 'Statistics...' 130; [void](& $add $bStatsA 24 510)
+    $bStatsA.Add_Click({ Show-StatsWindow })
 
     # Close, under the pages
     $foot = New-Object System.Windows.Forms.Panel
@@ -12558,7 +14913,20 @@ $itemsList.Add_MouseUp({
     param($s, $e)
     if ($e.Button -ne 'Right') { return }
     $hit = $itemsList.GetItemAt($e.X, $e.Y)
-    if (-not $hit) { return }
+    if (-not $hit) {
+        # empty space: just the view switch
+        if (-not $script:ViewMenu) {
+            $script:ViewMenu = New-ThemedMenu
+            $vi = New-ThemedMenuItem 'Show as a list    (Ctrl+G)'
+            $vi.Add_Click({ Set-FilesView $(if (Test-GridView) { 'list' } else { 'grid' }) })
+            [void]$script:ViewMenu.Items.Add($vi)
+        }
+        $script:ViewMenu.Items[0].Text = if (Test-GridView) { 'Show as a list    (Ctrl+G)' } else { 'Show as thumbnails    (Ctrl+G)' }
+        if ($script:DarkRenderer) { $script:ViewMenu.Renderer = $script:DarkRenderer }
+        $script:ViewMenu.BackColor = $T.Surface; $script:ViewMenu.Items[0].ForeColor = $T.Text
+        $script:ViewMenu.Show($itemsList, $e.Location)
+        return
+    }
     if (-not $hit.Selected) { $itemsList.SelectedItems.Clear(); $hit.Selected = $true; $hit.Focused = $true }
     $sel = Get-SelectedFiles
     $dl = @($sel | Where-Object { $_.Downloadable })
@@ -12581,6 +14949,10 @@ $itemsList.Add_MouseUp({
     $miFView.Text = if (Test-GridView) { 'Show as a list    (Ctrl+G)' } else { 'Show as thumbnails    (Ctrl+G)' }
     $posable = @($sel | Where-Object { Test-PosFile $_ })
     $miFWatched.Visible = [bool]@($posable | Where-Object { -not (Test-Watched $_) }).Count
+    $laterAll = ($posable.Count -and @($posable | Where-Object { -not (Test-WatchLater $_) }).Count -eq 0)
+    $miFLater.Visible = [bool]$posable.Count
+    $miFLater.Text = if ($laterAll) { 'Remove from Watch later' } else { 'Watch later' }
+    $miFRecord.Visible = ($sel.Count -eq 1 -and $sel[0].Type -in 'live', 'radiolive')
     $miFUnwatched.Visible = [bool]@($posable | Where-Object { Get-PlayRecord $_ }).Count
     $miFFav.Text = if ($fref -and (Test-Favourite $fref.Key)) { 'Remove the series from favourites' } else { 'Add the series to favourites' }
     $miFHide.Text = if ($hideable.Count -gt 1) { "Hide {0} files (don't show or index)" -f $hideable.Count } else { "Hide (don't show or index)" }
@@ -12591,6 +14963,8 @@ $miFDownload.Add_Click({ Add-ToDownloadQueue -Files @(Get-SelectedFiles | Where-
 $miFWeb.Add_Click({ $f = @(Get-SelectedFiles)[0]; if ($f.WebUrl) { Start-Process $f.WebUrl } })
 $miFHide.Add_Click({ Add-Excluded -Files @(Get-SelectedFiles) })
 $miFWatched.Add_Click({ Set-Watched @(Get-SelectedFiles) $true })
+$miFLater.Add_Click({ $sel = @(Get-SelectedFiles | Where-Object { Test-PosFile $_ }); Set-WatchLater $sel (-not ($sel.Count -and @($sel | Where-Object { -not (Test-WatchLater $_) }).Count -eq 0)) })
+$miFRecord.Add_Click({ $sel = @(Get-SelectedFiles); if ($sel.Count -eq 1) { Show-RecordDialog $sel[0] } })
 $miFView.Add_Click({ Set-FilesView $(if (Test-GridView) { 'list' } else { 'grid' }) })
 $miFPlayNext.Add_Click({ Add-AudioQueue @(Get-SelectedFiles) -Next })
 $miFQueue.Add_Click({ Add-AudioQueue @(Get-SelectedFiles) })
@@ -12661,12 +15035,15 @@ $folderTree.Add_NodeMouseClick({
         $miTFav.Visible = [bool]$ref
         $isFav = [bool]($ref -and (Test-Favourite $ref.Key))
         $miTFav.Text = if ($isFav) { 'Remove from favourites' } else { 'Add to favourites' }
-        $miTFollow.Visible = $isFav
+        $miTFollow.Visible = $isFav; $miTFollowNotify.Visible = $isFav
+        $miTOpml.Visible = ($nodes.Count -eq 1 -and $nodes[0].Tag.Kind -eq 'favourites')
         $miTCheckFollow.Visible = ($nodes.Count -eq 1 -and $nodes[0].Tag.Kind -eq 'favourites' -and [bool]@((Get-FavMap).Values | Where-Object { $_.Follow }).Count)
         $feedItem = if ($nodes.Count -eq 1 -and $nodes[0].Tag.Kind -eq 'radioseries') { $nodes[0].Tag.Item } else { $null }
         $script:TreeMenuFeed = Get-PodcastFeedUrl $feedItem
         $miTFeed.Visible = [bool]$script:TreeMenuFeed
-        $miTFollow.Checked = [bool]($isFav -and (Get-FavMap)[$ref.Key].Follow)
+        $frec = if ($isFav) { (Get-FavMap)[$ref.Key] } else { $null }
+        $miTFollow.Checked = [bool]($frec -and $frec.Follow -and [string]$frec.FollowMode -ne 'notify')
+        $miTFollowNotify.Checked = [bool]($frec -and $frec.Follow -and [string]$frec.FollowMode -eq 'notify')
         $miTClearRecent.Visible = ($nodes.Count -eq 1 -and $nodes[0].Tag.Kind -eq 'recent')
         $miTCloseSearch.Visible = ($nodes.Count -eq 1 -and $nodes[0].Tag.Kind -eq 'search')
         $hideNodes = @($nodes | Where-Object { $_.Tag.Kind -in 'category', 'letter', 'radiocategory', 'radioletter', 'series', 'season', 'radioseries', 'radioseason' })
@@ -12677,7 +15054,9 @@ $folderTree.Add_NodeMouseClick({
 })
 $miTOpen.Add_Click({ $n = @($script:TreeMenuNodes)[0]; if ($n) { $folderTree.SelectedNode = $n } })
 $miTFav.Add_Click({ $r = $script:TreeMenuRef; if (-not $r) { return }; if (Test-Favourite $r.Key) { Remove-Favourite $r.Key } else { Add-Favourite $r } })
-$miTFollow.Add_Click({ $r = $script:TreeMenuRef; if ($r) { Set-FollowSeries $r.Key (-not (Get-FavMap)[$r.Key].Follow) } })
+$miTFollow.Add_Click({ $r = $script:TreeMenuRef; if ($r) { $x = (Get-FavMap)[$r.Key]; $on = -not ($x.Follow -and [string]$x.FollowMode -ne 'notify'); Set-FollowSeries $r.Key $on -Mode 'download' } })
+$miTFollowNotify.Add_Click({ $r = $script:TreeMenuRef; if ($r) { $x = (Get-FavMap)[$r.Key]; $on = -not ($x.Follow -and [string]$x.FollowMode -eq 'notify'); Set-FollowSeries $r.Key $on -Mode 'notify' } })
+$miTOpml.Add_Click({ Export-PodcastOpml })
 $miTCheckFollow.Add_Click({ Invoke-Ui 'Checking followed series' { Invoke-FollowCheck }; Set-Status 'Followed series checked' })
 $miTFeed.Add_Click({ if ($script:TreeMenuFeed) { [System.Windows.Forms.Clipboard]::SetText($script:TreeMenuFeed); Set-Status "Copied $($script:TreeMenuFeed)  ·  paste it into a podcast app" } })
 $miTDownload.Add_Click({ Add-ToDownloadQueue -Nodes @($script:TreeMenuNodes) })
@@ -12723,7 +15102,9 @@ $scheduleList.Add_DoubleClick({
             Start-Player -Target ([pscustomobject]@{ Url = $rec.WebUrl; Title = $e.Title; Audio = $rec })
             return
         }
-        Start-Player -Target ([pscustomobject]@{ Url = Get-NrkPlayUrl $e.ProgramId; Title = $e.Title })
+        # a finished TV programme: as a programme, so it plays in the built-in player (continues where you stopped)
+        $prog = New-NrkItem -Type 'program' -Id $e.ProgramId -Title $e.Title -Description $e.Description -ImageUrl $e.ImageUrl -Section $script:SelectedFile.Title
+        Start-Player -Target (New-VideoTarget $prog)
     } else { Start-Player }   # on now / upcoming: watch the channel live
 })
 
@@ -12785,12 +15166,8 @@ $btnCopyUrl.Add_Click({
 
 $form.Add_KeyDown({
     param($s, $e)
-    if ($e.Control -and $e.KeyCode -eq 'Oemcomma') { Show-OptionsWindow; $e.Handled = $true }
-    elseif ($e.Control -and $e.KeyCode -eq 'L') { Show-LogsWindow; $e.Handled = $true }
-    elseif ($e.Control -and $e.KeyCode -eq 'D') { Show-DownloadsWindow; $e.Handled = $true }
-    elseif ($e.Control -and $e.KeyCode -eq 'I') { Open-IndexerWindow; $e.Handled = $true }
-    elseif ($e.Control -and $e.KeyCode -eq 'F') { $search.Focus(); $e.Handled = $true }
-    elseif ($e.Control -and $e.KeyCode -eq 'G') { Set-FilesView $(if (Test-GridView) { 'list' } else { 'grid' }); $e.Handled = $true }
+    # the shortcuts can be changed (Options > Shortcuts)
+    if (Invoke-AppShortcut $e) { $e.Handled = $true; $e.SuppressKeyPress = $true }
     elseif ($e.KeyCode -eq 'Back' -and -not $search.Focused) { Invoke-Back; $e.Handled = $true }
 })
 
@@ -12800,9 +15177,40 @@ $pDesc.Add_TextChanged({ Update-ContentLayout })
 $form.Add_LocationChanged({ if ($form.WindowState -eq 'Normal') { Update-MaxBounds $form } })
 
 # Follow Windows' light/dark setting while the app runs (only when the theme setting is System)
+# Windows says when the setting changes (no polling); if that can't be set up, look every 3 s.
 $themeTimer = New-Object System.Windows.Forms.Timer
 $themeTimer.Interval = 3000
 $themeTimer.Add_Tick({ if ($script:ThemeMode -eq 'System') { Set-AppTheme 'System' } })
+function Start-ThemeWatch {
+    try {
+        if (-not ('NrkThemeWatch' -as [type])) {
+            $refs = if ($PSVersionTable.PSEdition -eq 'Desktop') { @('System', 'System.Windows.Forms') }
+                    else { [AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { -not $_.IsDynamic -and $_.Location -and $_.GetName().Name -match '^(System\.(Windows\.Forms(\.Primitives)?|Runtime|ComponentModel\.Primitives|ComponentModel\.TypeConverter|Private\.CoreLib)|Microsoft\.Win32\.SystemEvents)$' } | ForEach-Object Location }
+            Add-Type -ReferencedAssemblies $refs -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Windows.Forms;
+using Microsoft.Win32;
+// Windows' "light/dark" change arrives on its own thread: hand it to the window's thread.
+public static class NrkThemeWatch {
+    static Control target; static MethodInvoker action;
+    public static void Start(Control c, MethodInvoker a) {
+        target = c; action = a;
+        SystemEvents.UserPreferenceChanged += OnChange;
+    }
+    public static void Stop() { SystemEvents.UserPreferenceChanged -= OnChange; target = null; }
+    static void OnChange(object s, UserPreferenceChangedEventArgs e) {
+        if (e.Category != UserPreferenceCategory.General && e.Category != UserPreferenceCategory.Color && e.Category != UserPreferenceCategory.VisualStyle) return;
+        var t = target;
+        try { if (t != null && t.IsHandleCreated && !t.IsDisposed) t.BeginInvoke(action); } catch { }
+    }
+}
+'@
+        }
+        [NrkThemeWatch]::Start($form, [System.Windows.Forms.MethodInvoker]{ if ($script:ThemeMode -eq 'System') { try { Set-AppTheme 'System' } catch { } } })
+        Write-Log DEBUG 'Theme: following Windows by its change notice'
+        return $true
+    } catch { Write-Log DEBUG "Theme change notice not available, checking every 3 s: $($_.Exception.Message)"; return $false }
+}
 $form.Add_Resize({
     if ($form.WindowState -eq 'Minimized') {
         if (-not $script:InTray -and (Get-AppSettings).MinimizeToTray) { Hide-ToTray }
@@ -12817,13 +15225,23 @@ $showTimer.Add_Tick({
 })
 $form.Add_Shown({
     Enable-DarkTitleBar $form
+    try { Start-LogFlushTimer } catch { }
+    try { Start-AssetDownload } catch { Write-LogException $_ 'Assets' }
     try { Set-TopBarIcons } catch { Write-LogException $_ 'Top bar icons' }
     try { Update-SearchFilterButton } catch { }
     if (Test-ChildMode) { $form.Text = "NRK Browser $($script:AppVersion)  ·  Child mode" }
     try { Start-FollowTimer } catch { Write-LogException $_ 'Follow timer' }
+    # 2.9.0
+    try { Start-StatsTimer } catch { Write-LogException $_ 'Statistics' }
+    try { Start-AlarmTimer } catch { Write-LogException $_ 'Wake to radio' }
+    try { if (@(Get-Recordings | Where-Object { $_.Status -eq 'Scheduled' }).Count) { Start-RecordTimer } } catch { Write-LogException $_ 'Recordings' }
+    try { Register-AppHotkeys } catch { Write-LogException $_ 'Hotkeys' }
+    try { if ((Get-AppSettings).TaskbarButtons) { Initialize-Taskbar } } catch { Write-LogException $_ 'Taskbar' }
+    try { if ((Get-AppSettings).RemoteOn) { [void](Start-PhoneRemote) } } catch { Write-LogException $_ 'Phone remote' }
+    if ($Play) { $script:PlayAtStart = $Play }
     Update-MaxBounds $form
     Set-PaneLayout (Get-AppSettings).Layout
-    $themeTimer.Start()
+    if (-not (Start-ThemeWatch)) { $themeTimer.Start() }
     Update-Actions
     Initialize-Tree
     Show-FolderPreview
@@ -12876,6 +15294,35 @@ $form.Add_Shown({
         })
         $script:ResumeTimer.Start()
     }
+    if ($script:PlayAtStart) {
+        # 2.9.0: started from the jump list (-Play radio:p1)
+        $script:PlayStartTimer = New-Object System.Windows.Forms.Timer; $script:PlayStartTimer.Interval = 1200
+        $script:PlayStartTimer.Add_Tick({ $script:PlayStartTimer.Stop(); $script:PlayStartTimer.Dispose(); try { Invoke-PlayCommand $script:PlayAtStart } catch { Write-LogException $_ 'Play at start' } })
+        $script:PlayStartTimer.Start()
+    }
+})
+# 2.9.0: right-click a programme in the schedule > Record this programme
+$script:SchedMenu = New-ThemedMenu
+$miSRecord = New-ThemedMenuItem 'Record this programme'
+$miSRecList = New-ThemedMenuItem 'Recordings...'
+[void]$script:SchedMenu.Items.AddRange(@($miSRecord, $miSRecList))
+$miSRecord.Add_Click({
+    $e = if ($scheduleList.SelectedItems.Count) { $scheduleList.SelectedItems[0].Tag } else { $null }
+    if (-not $e -or -not $script:SelectedFile) { return }
+    # a minute early and three late (NRK is rarely exactly on time)
+    $start = $e.Start.AddMinutes(-1); if ($start -lt (Get-Date)) { $start = Get-Date }
+    Add-Recording $script:SelectedFile $start $e.End.AddMinutes(3) ([string]$e.Title)
+})
+$miSRecList.Add_Click({ Show-RecordingsWindow })
+$scheduleList.Add_MouseUp({
+    param($s, $e)
+    if ($e.Button -ne 'Right' -or -not $script:SelectedFile -or $script:SelectedFile.Type -ne 'live') { return }
+    $hit = $scheduleList.GetItemAt($e.X, $e.Y)
+    if (-not $hit) { return }
+    $scheduleList.SelectedItems.Clear(); $hit.Selected = $true
+    $miSRecord.Enabled = ($hit.Tag.End -gt (Get-Date))
+    if ($script:DarkRenderer) { $script:SchedMenu.Renderer = $script:DarkRenderer }
+    $script:SchedMenu.Show($scheduleList, $e.Location)
 })
 $form.Add_FormClosing({
     param($s, $e)
@@ -12890,6 +15337,18 @@ $form.Add_FormClosing({
     param($s, $e)
     if ($e.Cancel) { $script:ReallyExit = $false; return }
     if ($script:DlRun.Fetch) { Stop-CurrentDownload 'exit'; return }   # in pieces: just paused, it continues next time
+    if ($script:DlRun.Finishing -and $script:DlRun.FinishProc) {
+        # the download is done, only the finishing pass runs: stopping it keeps the plain file
+        $quiet = $script:ForceExit -or $e.CloseReason -in [System.Windows.Forms.CloseReason]::WindowsShutDown, [System.Windows.Forms.CloseReason]::TaskManagerClosing
+        if (-not $quiet) {
+            $q = [System.Windows.Forms.MessageBox]::Show($form, "A download is being finished (subtitles, chapters, cover):`n`n$($script:DlRun.Finishing.Title)`n`nExit anyway? The file is kept, but without those.", 'Download being finished', 'YesNo', 'Warning')
+            if ($q -ne 'Yes') { $e.Cancel = $true; $script:ReallyExit = $false; return }
+        }
+        Write-Log INFO 'Exit: stopping the finishing pass (the plain file is kept)'
+        $script:DlRun.FinishStop = $true
+        try { $script:DlRun.FinishProc.Kill() } catch { }
+        return
+    }
     if (-not $script:DlRun.Proc) { return }
     # Windows shutting down / restarting for updates, Task Manager, or an update that was already
     # confirmed: no question (it would hold up Windows), just stop and remove the unfinished file
@@ -12902,7 +15361,7 @@ $form.Add_FormClosing({
     Stop-CurrentDownload 'exit'
 })
 $form.Add_FormClosed({
-    $themeTimer.Stop(); $showTimer.Stop()
+    $themeTimer.Stop(); $showTimer.Stop(); try { if ('NrkThemeWatch' -as [type]) { [NrkThemeWatch]::Stop() } } catch { }
     # any exit (also an update, or a newer copy asking this one to close): the download list as it is now
     # (settings are saved the moment they change; the window layout in FormClosing)
     try { if ($script:QueueSaveTimer) { $script:QueueSaveTimer.Stop() }; Save-DownloadQueue } catch { }
@@ -12958,6 +15417,11 @@ try {
     try { Stop-InstancePipe } catch { }
     try { if ($script:TrayUi) { $script:TrayUi.Icon.Visible = $false; $script:TrayUi.Icon.Dispose() } } catch { }
     try { if ($script:InstanceMutex) { $script:InstanceMutex.ReleaseMutex() } } catch { }
+    try { Stop-AllRecordings } catch { }
+    try { Stop-PhoneRemote } catch { }
+    try { if ($script:Hotkeys) { $script:Hotkeys.Dispose() } } catch { }
+    try { Save-Stats } catch { }
+    try { if ($script:LogFlushTimer) { $script:LogFlushTimer.Stop() }; Close-LogWriter } catch { }
 }
 
 #endregion
