@@ -13,3 +13,21 @@ all without a browser tab.
 > some content is only available in Norway.
 
 <img src="https://raw.githubusercontent.com/aleaag/nrk-browser/refs/heads/main/main.png" alt="main" width="800" height="auto">
+
+## Features
+ 
+### Browse everything as folders
+- **LIVE**: every NRK TV channel (including the regional NRK1 channels) and every NRK Radio
+  channel (P1, P2, P3, mP3, Klassisk, Jazz, Nyheter, regional P1 and more), with today's
+  programme guide.
+- **TV Archive**: all tv.nrk.no categories plus the complete **A–Å** index.
+- **Radio Archive**: all radio.nrk.no categories plus the radio **A–Å** index: series, podcasts and
+  single programmes.
+
+  ### Watch TV in NRK's own player
+
+  ### Listen to radio and podcasts in the audio bar
+
+  ### Download queue
+
+  ### More to come
