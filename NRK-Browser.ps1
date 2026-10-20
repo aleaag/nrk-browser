@@ -93,7 +93,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.10.3'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.10.5'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -13262,6 +13262,29 @@ function Get-IndexScriptPath {
     return $PSCommandPath
 }
 
+function Get-IndexProgress($S) {
+    # @{ Percent; Eta } of the whole run. 2.10 indexers say so themselves (Percent, 2 steps); an
+    # indexer from before 2.10 that is still running (6 steps, no Percent, a time for the current
+    # step only) is worked out from its counts: steps 1-4 (folders) are the first 5 %, then TV
+    # series and radio series together the rest, with the time per series seen so far.
+    $done = [double]$S.PhaseDone; $tot = [double]$S.PhaseTotal; $no = [int]$S.PhaseNo
+    if ($null -ne $S.Percent -and [int]$S.PhaseCount -eq 2) {
+        $eta = if ($no -ge 2 -and $done -ge 10 -and $null -ne $S.EtaSeconds) { [double]$S.EtaSeconds } else { $null }
+        return @{ Percent = [Math]::Max(0, [Math]::Min(100, [int]$S.Percent)); Eta = $eta }
+    }
+    if ($no -le 4) { return @{ Percent = [int][Math]::Floor(5.0 * [Math]::Max(0, $no - 1) / 4.0); Eta = $null } }
+    $tv = [double]$S.TvSeries; $radio = [double]$S.RadioSeries
+    $all = [Math]::Max(1.0, $tv + $radio)
+    $did = if ($no -eq 5) { $done } else { $tv + $done }
+    $pct = [int][Math]::Floor(5.0 + 94.0 * [Math]::Min(1.0, $did / $all))
+    $eta = $null
+    if ($null -ne $S.EtaSeconds -and $done -ge 10 -and $tot -gt $done) {
+        $per = [double]$S.EtaSeconds / ($tot - $done)   # seconds per series, as it goes now
+        $eta = $per * [Math]::Max(0.0, $all - $did)
+    }
+    return @{ Percent = $pct; Eta = $eta }
+}
+
 function Update-IndexProgress {
     # 2.10.3: while the indexer runs, the main window shows how far it is: "Indexing 42%, about
     # 1 h 10 min left" in the title (and the taskbar), a thin bar under the Indexer button and its
@@ -13275,8 +13298,9 @@ function Update-IndexProgress {
         $part = ''; $pct = -1; $tip = 'Indexer  (saves every folder in the background, Ctrl+I)'
         if ($st.Running -and $st.Status) {
             $s = $st.Status
-            $pct = [Math]::Max(0, [Math]::Min(100, [int]$s.Percent))
-            $left = if ($s.State -eq 'running' -and $null -ne $s.EtaSeconds -and [int]$s.PhaseNo -ge 2 -and [int]$s.PhaseDone -ge 10) { ', about {0} left' -f (Format-Span ([double]$s.EtaSeconds)) } else { '' }
+            $g = Get-IndexProgress $s
+            $pct = $g.Percent
+            $left = if ($s.State -eq 'running' -and $null -ne $g.Eta) { ', about {0} left' -f (Format-Span ([double]$g.Eta)) } else { '' }
             $part = switch ($s.State) { 'paused' { "  ·  Indexing paused at $pct%" } 'stopping' { '  ·  Indexer stopping' } default { "  ·  Indexing $pct%$left" } }
             $tip = 'Indexer: {0}%{1}{2}  ·  {3}  (Ctrl+I)' -f $pct, $left, $(if ($s.Mode -eq 'full') { ', full check' } elseif ($s.Mode -eq 'quick') { ', quick check' } else { '' }), $s.Phase
         }
