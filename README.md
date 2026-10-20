@@ -1,1 +1,1 @@
-# nrk-player
+# powershell NRK browser
