@@ -74,7 +74,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.9.7'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.9.9'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -2801,6 +2801,12 @@ function New-FlatButton {
     if ($Primary) {
         $b.BackColor = $T.Accent; $b.ForeColor = $T.OnAccent; $b.Font = $script:FontBold
         $b.FlatAppearance.MouseOverBackColor = $T.AccentHover
+        # (2.9.8) switched off: grey like the other buttons, not teal (Play in an empty folder, Download selected...)
+        $b.Add_EnabledChanged({
+            if ($this.Enabled) { $this.BackColor = $T.Accent; $this.ForeColor = $T.OnAccent; $this.FlatAppearance.MouseOverBackColor = $T.AccentHover }
+            else { $this.BackColor = $T.Surface; $this.ForeColor = $T.Muted; $this.FlatAppearance.MouseOverBackColor = $T.Surface }
+            try { Update-IconButton $this } catch { }
+        })
     } else {
         $b.BackColor = $T.Surface; $b.ForeColor = $T.Text; $b.Font = $(if ($Icon) { $script:FontIcon } else { $script:FontUi })
         $b.FlatAppearance.MouseOverBackColor = $T.Hover
@@ -3331,7 +3337,7 @@ function Set-IconText($Button, [string] $Kind, [string] $Text, [string] $Glyph =
     foreach ($m in $script:IconButtons) { if ([object]::ReferenceEquals($m.Button, $Button)) { $meta = $m; break } }
     if (-not $meta) { $meta = @{ Button = $Button }; [void]$script:IconButtons.Add($meta); $Button.Add_Disposed({ $me = $this; foreach ($m in @($script:IconButtons)) { if ([object]::ReferenceEquals($m.Button, $me)) { $script:IconButtons.Remove($m) } } }) }
     $meta.Kind = $Kind; $meta.Text = $Text; $meta.Glyph = $Glyph; $meta.Primary = [bool]$Primary; $meta.IconOnly = [bool]$IconOnly; $meta.Plain = $Plain
-    $img = Get-ButtonIcon $Kind ([bool]$Primary) $(if ($IconOnly) { 20 } else { 18 })
+    $img = Get-ButtonIcon $Kind ([bool]$Primary -and $Button.Enabled) $(if ($IconOnly) { 20 } else { 18 })   # (switched off: the ordinary icon, it isn't teal then)
     if ($img) {
         if (-not [object]::ReferenceEquals($Button.Image, $img)) { $Button.Image = $img }
         $Button.TextImageRelation = 'ImageBeforeText'
@@ -3343,6 +3349,10 @@ function Set-IconText($Button, [string] $Kind, [string] $Text, [string] $Glyph =
         $t = if ($Plain) { $Plain } elseif ($IconOnly) { $Glyph } elseif ($Glyph) { '{0}  {1}' -f $Glyph, $Text } else { $Text }
     }
     if ($Button.Text -ne $t) { $Button.Text = $t }
+}
+
+function Update-IconButton($Button) {
+    foreach ($m in @($script:IconButtons)) { if ([object]::ReferenceEquals($m.Button, $Button)) { Set-IconText $m.Button $m.Kind $m.Text $m.Glyph -Primary:$m.Primary -IconOnly:$m.IconOnly -Plain ([string]$m.Plain); return } }
 }
 
 function Update-IconButtons {
@@ -3514,7 +3524,8 @@ $script:SettingDefaults = [ordered]@{
     RemoteOn = $false; RemoteKey = ''   # phone remote (a page on your network)
     StatsOn = $true   # count what you watch and listen to (Statistics)
     SkipSilence = $false; VoiceBoost = $false   # radio bar: quiet parts faster; clearer speech
-    TaskbarButtons = $true   # Previous / Play-Pause / Next under the taskbar preview, and the jump list
+    TaskbarButtons = $true   # Previous / Play-Pause / Next under the taskbar preview
+    JumpList = $false   # recent channels when you right-click the taskbar button (needs a Windows setting; off by default)
 }
 # Settings are read from disk only when settings.json changed (another copy, the indexer or
 # an edit by hand): otherwise the last read is reused. Each caller gets its own copy.
@@ -11940,11 +11951,7 @@ function Show-DownloadsWindow {
         if (-not $sel.Count) { [void][System.Windows.Forms.MessageBox]::Show($script:DlUi.Form, 'Select the downloads to start first (Shift/Ctrl+click, or Select all).', 'Download selected', 'OK', 'Information'); return }
         Start-DownloadQueue -Items $sel
     })
-    # the teal button looks switched off like the others when there is nothing to start
-    $bStart.Add_EnabledChanged({
-        if ($this.Enabled) { $this.BackColor = $T.Accent; $this.ForeColor = $T.OnAccent; $this.FlatAppearance.MouseOverBackColor = $T.AccentHover }
-        else { $this.BackColor = $T.Surface; $this.ForeColor = $T.Muted; $this.FlatAppearance.MouseOverBackColor = $T.Surface }
-    })
+
     $bSelAll.Add_Click({ $l = $script:DlUi.List; $l.BeginUpdate(); foreach ($r in $l.Items) { $r.Selected = $true }; $l.EndUpdate(); $l.Focus() })
     $bCancel.Add_Click({
         # the same as right-click > Cancel: the selected downloads (the running one too, when it is selected)
@@ -14217,7 +14224,6 @@ function Initialize-Taskbar {
         $script:TbTimer.Add_Tick({ Update-TaskbarButtons })
         $script:TbTimer.Start()
     } catch { Write-Log WARN "Taskbar buttons: $($_.Exception.Message)" }
-    Update-JumpList
 }
 
 function Update-TaskbarButtons {
@@ -14256,17 +14262,21 @@ function Get-RecentChannels {
     return $l
 }
 
-function Update-JumpList {
+function Update-JumpList([switch] $Clear) {
     # right-click the taskbar button: the channels you played lately start straight away
-    if (-not ('NrkTaskbar' -as [type]) -or -not $script:JumpScript) { return }
+    # (Options > Shortcuts > Taskbar, off by default; -Clear: empty it again)
+    if (-not $Clear -and -not (Get-AppSettings).JumpList) { return }
+    if (-not $script:JumpScript -or -not (Initialize-WinHelpers)) { return }
     try {
-        $ch = @(Get-RecentChannels)
+        $ch = if ($Clear) { @() } else { @(Get-RecentChannels) }
         $exe = (Get-Process -Id $PID).Path
         $argsFor = { param($k) '-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Play {1}' -f $script:JumpScript, $k }
         $icon = ''; $iconIx = 0
         if ($script:AppIconLocation -match '^(.*),(-?\d+)$') { $icon = $Matches[1]; $iconIx = [int]$Matches[2] }
         $err = [NrkTaskbar]::SetJumpList('NRK.Browser', 'Channels', $exe, [string[]]@($ch | ForEach-Object { [string]$_.Title }), [string[]]@($ch | ForEach-Object { & $argsFor $_.Key }), $icon, $iconIx)
-        if ($err) { Write-Log DEBUG "Jump list: $err" }
+        if ($err) {
+            if (-not $script:JumpListWarned) { $script:JumpListWarned = $true; Write-Log WARN "Jump list not possible: $err. Windows: Settings > Personalization > Start > show items in Jump Lists must be on." }
+        } elseif ($Clear) { Write-Log INFO 'Jump list emptied' }
     } catch { Write-Log DEBUG "Jump list: $($_.Exception.Message)" }
 }
 
@@ -14947,9 +14957,19 @@ function Show-OptionsWindow {
     $bKeyReset.Add_Click({ $s = Get-AppSettings; $s.HotkeyMap = ''; $s.KeyMap = ''; Save-AppSettings $s; Register-AppHotkeys; [void][System.Windows.Forms.MessageBox]::Show($script:OptUi.Form, 'The default shortcuts are back (open Options again to see them).', 'Shortcuts', 'OK', 'Information') })
     $y += 64
     & $header 'Taskbar' $y
-    $ui.Tb = & $check 'Previous / Play / Next under the taskbar preview, and recent channels when you right-click the taskbar button (after a restart)' ([bool]$st.TaskbarButtons) 26 ($y + 42)
+    $ui.Tb = & $check 'Previous / Play / Next under the taskbar preview (after a restart)' ([bool]$st.TaskbarButtons) 26 ($y + 42)
     $ui.Tb.Add_CheckedChanged({ & $script:OptSaveFlag 'TaskbarButtons' $this.Checked })
-    [void](& $muted '' 26 ($y + 100) 10 10)
+    $optTips.SetToolTip($ui.Tb, 'Hover over NRK Browser on the taskbar: three buttons under the small preview control what plays.')
+    $ui.Jump = & $check 'Recent channels when you right-click the taskbar button (jump list)' ([bool]$st.JumpList) 26 ($y + 74)
+    $ui.Jump.Add_CheckedChanged({
+        & $script:OptSaveFlag 'JumpList' $this.Checked
+        if ($this.Checked) { $script:JumpListWarned = $false; Update-JumpList } else { Update-JumpList -Clear }
+    })
+    $optTips.SetToolTip($ui.Jump, ("Right-click the app on the taskbar: a ""Channels"" list with the live channels you played lately; click one to start it.`n" +
+        "Needs the Windows setting Settings > Personalization > Start > ""Show ... items in Jump Lists"".`n" +
+        "Windows shows the menu under the name ""Windows PowerShell"", since the app runs in PowerShell."))
+    [void](& $muted 'Hover over the options for what they do.' 26 ($y + 106) 600 20)
+    [void](& $muted '' 26 ($y + 140) 10 10)
 
     # ---- 2.9.0: Phone remote
     $page = & $newPage 'Phone remote'
@@ -15463,6 +15483,7 @@ $form.Add_Shown({
     try { if (@(Get-Recordings | Where-Object { $_.Status -eq 'Scheduled' }).Count) { Start-RecordTimer } } catch { Write-LogException $_ 'Recordings' }
     try { Register-AppHotkeys } catch { Write-LogException $_ 'Hotkeys' }
     try { if ((Get-AppSettings).TaskbarButtons) { Initialize-Taskbar } } catch { Write-LogException $_ 'Taskbar' }
+    try { Update-JumpList } catch { }   # (only when switched on in Options > Shortcuts)
     try { if ((Get-AppSettings).RemoteOn) { [void](Start-PhoneRemote) } } catch { Write-LogException $_ 'Phone remote' }
     if ($Play) { $script:PlayAtStart = $Play }
     Update-MaxBounds $form
