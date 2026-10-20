@@ -73,7 +73,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion   = '2.7.4'   # the updater compares this line with the copy on GitHub
+$script:AppVersion   = '2.7.5'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
