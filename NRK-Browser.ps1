@@ -93,7 +93,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.10.5'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.10.7'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -2097,7 +2097,6 @@ $script:IndexMode   = $false
 $script:IndexDir    = Join-Path $script:AppDataDir 'indexer'
 $script:IndexStatusFile  = Join-Path $script:IndexDir 'status.json'
 $script:IndexControlFile = Join-Path $script:IndexDir 'control.json'
-$script:IndexFile   = Join-Path $script:IndexDir 'index.jsonl'   # (older versions wrote it; removed on the next run)
 $script:SearchFile  = Join-Path $script:IndexDir 'search.tsv'    # what "search everything" looks through
 $script:EmptyFile   = Join-Path $script:IndexDir 'empty.txt'     # folders NRK has nothing in
 $script:IndexTaskName = 'NRK Browser indexer'
@@ -2795,7 +2794,9 @@ $script:IdxTvWork = {
             $it.EpCount += $lines.Length; $it.Reused++
             continue
         }
-        $eps = @(Get-NrkSeasonEpisodes -SeriesId $id -Season $sea.Name | Where-Object { $_ -and -not $x.Hidden.Contains("file|episode|$($_.Id)") })
+        # (2.10.6: a season NRK no longer has (404) counts as empty: before, the whole series failed every run)
+        try { $eps = @(Get-NrkSeasonEpisodes -SeriesId $id -Season $sea.Name | Where-Object { $_ -and -not $x.Hidden.Contains("file|episode|$($_.Id)") }) }
+        catch { if ("$($_.Exception.Message)" -match '\bHTTP 404\b') { $eps = @() } else { throw } }
         $it.EpCount += $eps.Count
         if ($eps.Count -eq 0) { $it.Empty.Add("season|$id|$($sea.Name)") }
         foreach ($e in $eps) { Add-SearchRow tvepisode $e.Id $e.Title $e.Subtitle $id $d.Item.Title $sea.Name -Rights $e }
@@ -2841,7 +2842,8 @@ $script:IdxRadioWork = {
             $it.EpCount += $lines.Length; $it.Reused++
             continue
         }
-        $eps = @(Get-NrkRadioEpisodes -Href $sea.Href -Kind $kind -SeriesId $id -SeriesTitle $info.Title -Newest:$sea.Newest)
+        try { $eps = @(Get-NrkRadioEpisodes -Href $sea.Href -Kind $kind -SeriesId $id -SeriesTitle $info.Title -Newest:$sea.Newest) }
+        catch { if ("$($_.Exception.Message)" -match '\bHTTP 404\b') { $eps = @() } else { throw } }   # (2.10.6: see TV above)
         $eps = @($eps | Where-Object { $_ -and -not $x.Hidden.Contains("file|audio|$($_.Id)") })
         $it.EpCount += $eps.Count
         if ($eps.Count -eq 0) { $it.Empty.Add("radioseason|$id|$($sea.Name)") }
@@ -2929,9 +2931,9 @@ function Invoke-Indexer([switch] $Full) {
     [void]$http.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', $script:UserAgent)
     [void]$http.DefaultRequestHeaders.TryAddWithoutValidation('Accept', 'application/json')
 
-    # the last full check: from 2.9 (every run was one) the last run counts
-    $lastDeep = if ($prev -and $prev.LastDeep) { [string]$prev.LastDeep } elseif ($prev -and $prev.LastFull -and -not $prev.Mode) { [string]$prev.LastFull } else { $null }
-    $lastDeepSecs = if ($prev -and $prev.LastDeepSeconds) { $prev.LastDeepSeconds } elseif ($prev -and -not $prev.Mode) { $prev.LastFullSeconds } else { $null }
+    # the last full check (a run of every season of every series)
+    $lastDeep = if ($prev -and $prev.LastDeep) { [string]$prev.LastDeep } else { $null }
+    $lastDeepSecs = if ($prev -and $prev.LastDeepSeconds) { $prev.LastDeepSeconds } else { $null }
     $mode = if ($Full -or -not (Test-Path -LiteralPath $script:SearchFile) -or (Get-IndexAgeHours $lastDeep) -gt $script:IndexDeepDays * 24) { 'full' } else { 'quick' }
     $buckets = New-Object System.Collections.ArrayList
     foreach ($i in 0..3) { [void]$buckets.Add((New-Object System.Collections.Queue)) }
@@ -2967,7 +2969,6 @@ function Invoke-Indexer([switch] $Full) {
         $(if ($mode -eq 'full' -and -not $Full) { $(if ($lastDeep) { " (the last full check was $([int]((Get-IndexAgeHours $lastDeep) / 24)) days ago)" } else { ' (the first one)' }) } else { '' }), $x.Speed, ($script:IndexFreshMin / 60))
     Write-IndexStatus -Force
     try {
-        Remove-Item -LiteralPath $script:IndexFile -Force -ErrorAction SilentlyContinue   # (index.jsonl from older versions: nothing reads it)
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $oldRows = $x.Store.LoadOld($script:SearchFile)
         $x.SeriesState = Read-IndexState
@@ -3050,7 +3051,7 @@ function Invoke-Indexer([switch] $Full) {
         if ($mode -eq 'full') { $x.LastDeep = $x.LastFull; $x.LastDeepSeconds = $secs }
         $x.Phase = 'Finished'; $x.Current = ''
         Write-Log INFO ("Indexer finished ({0} check) in {1}: {2} TV series, {3} programmes, {4} radio series/podcasts, {5} episodes; {6} requests, {7} up to date, {8} series unchanged lately, {9} seasons kept, {10} errors; {11} pages unchanged (not written again), {12:N1} MB written" -f `
-            $mode, (Format-IndexSpan $secs), $x.Tv.Count, $x.Programs.Count, $x.Radio.Count, $x.Episodes, $x.Fetched, $x.Cached, $x.Unchanged, $x.ReusedSeasons, $x.Errors, $x.SameWrites, ($x.Written / 1MB))
+            $mode, (Format-Span $secs), $x.Tv.Count, $x.Programs.Count, $x.Radio.Count, $x.Episodes, $x.Fetched, $x.Cached, $x.Unchanged, $x.ReusedSeasons, $x.Errors, $x.SameWrites, ($x.Written / 1MB))
     } catch {
         if ($_.Exception -is [System.OperationCanceledException] -or $_.Exception.InnerException -is [System.OperationCanceledException] -or $x.State -eq 'stopping') {
             $x.State = 'stopped'; $x.Current = ''
@@ -3073,7 +3074,7 @@ function Invoke-Indexer([switch] $Full) {
     }
 }
 
-function Format-IndexSpan([double] $Seconds) {
+function Format-Span([double] $Seconds) {
     if ($Seconds -lt 60) { return '{0:N0} s' -f $Seconds }
     $t = [TimeSpan]::FromSeconds($Seconds)
     if ($t.TotalHours -ge 1) { return '{0} h {1} min' -f [int][Math]::Floor($t.TotalHours), $t.Minutes }
@@ -4996,6 +4997,7 @@ function Write-PerfNote([string] $Area, [string] $Kind, [string] $Title, [long] 
         if (-not $limit -or $Ms -lt $limit -or -not $script:AppDataDir) { return }
         $k = "$Area|$Kind|$Title"
         if ($script:PerfSeen[$k] -and ((Get-Date) - $script:PerfSeen[$k]).TotalSeconds -lt 60) { return }
+        if ($script:PerfSeen.Count -gt 300) { $script:PerfSeen = @{} }   # (only there to skip repeats within a minute)
         $script:PerfSeen[$k] = Get-Date
         $dir = Join-Path $script:AppDataDir 'diagnostics'
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -13263,26 +13265,9 @@ function Get-IndexScriptPath {
 }
 
 function Get-IndexProgress($S) {
-    # @{ Percent; Eta } of the whole run. 2.10 indexers say so themselves (Percent, 2 steps); an
-    # indexer from before 2.10 that is still running (6 steps, no Percent, a time for the current
-    # step only) is worked out from its counts: steps 1-4 (folders) are the first 5 %, then TV
-    # series and radio series together the rest, with the time per series seen so far.
-    $done = [double]$S.PhaseDone; $tot = [double]$S.PhaseTotal; $no = [int]$S.PhaseNo
-    if ($null -ne $S.Percent -and [int]$S.PhaseCount -eq 2) {
-        $eta = if ($no -ge 2 -and $done -ge 10 -and $null -ne $S.EtaSeconds) { [double]$S.EtaSeconds } else { $null }
-        return @{ Percent = [Math]::Max(0, [Math]::Min(100, [int]$S.Percent)); Eta = $eta }
-    }
-    if ($no -le 4) { return @{ Percent = [int][Math]::Floor(5.0 * [Math]::Max(0, $no - 1) / 4.0); Eta = $null } }
-    $tv = [double]$S.TvSeries; $radio = [double]$S.RadioSeries
-    $all = [Math]::Max(1.0, $tv + $radio)
-    $did = if ($no -eq 5) { $done } else { $tv + $done }
-    $pct = [int][Math]::Floor(5.0 + 94.0 * [Math]::Min(1.0, $did / $all))
-    $eta = $null
-    if ($null -ne $S.EtaSeconds -and $done -ge 10 -and $tot -gt $done) {
-        $per = [double]$S.EtaSeconds / ($tot - $done)   # seconds per series, as it goes now
-        $eta = $per * [Math]::Max(0.0, $all - $did)
-    }
-    return @{ Percent = $pct; Eta = $eta }
+    # @{ Percent; Eta } of the whole run, as the indexer reports it (the time left once 10 series are done)
+    $eta = if ([int]$S.PhaseNo -ge 2 -and [int]$S.PhaseDone -ge 10 -and $null -ne $S.EtaSeconds) { [double]$S.EtaSeconds } else { $null }
+    return @{ Percent = [Math]::Max(0, [Math]::Min(100, [int]$S.Percent)); Eta = $eta }
 }
 
 function Update-IndexProgress {
@@ -13420,12 +13405,6 @@ function Update-IndexSchedulePath {
     }
 }
 
-function Format-Span([double] $Seconds) {
-    if ($Seconds -lt 60) { return '{0:N0} s' -f $Seconds }
-    $t = [TimeSpan]::FromSeconds($Seconds)
-    if ($t.TotalHours -ge 1) { return '{0} h {1} min' -f [int][Math]::Floor($t.TotalHours), $t.Minutes }
-    return '{0} min' -f [int][Math]::Ceiling($t.TotalMinutes)
-}
 
 function Update-IndexerView {
     $ui = $script:IndexUi
@@ -13433,7 +13412,7 @@ function Update-IndexerView {
     $st = Get-IndexerState
     $s = $st.Status
     $fmt = { param($iso) if (-not $iso) { return '' }; try { ([datetime]$iso).ToString('dd.MM.yyyy HH:mm') } catch { '' } }
-    $lastDeep = if ($s -and $s.LastDeep) { $s.LastDeep } elseif ($s -and -not $s.Mode) { $s.LastFull } else { $null }   # (before 2.10 every run was a full one)
+    $lastDeep = if ($s -and $s.LastDeep) { $s.LastDeep } else { $null }
     $last = if ($s -and $s.LastFull) {
         $l = 'Last run: {0}{1}' -f (& $fmt $s.LastFull), $(if ($s.LastFullSeconds) { " (took $(Format-Span $s.LastFullSeconds))" } else { '' })
         if ($lastDeep) { $l += '  ·  last full check: {0}' -f (& $fmt $lastDeep) }
@@ -13446,8 +13425,11 @@ function Update-IndexerView {
         $ui.State.ForeColor = if ($s.State -eq 'paused') { $T.Muted } else { $T.Accent }
         $tot = [int]$s.PhaseTotal; $done = [Math]::Min([int]$s.PhaseDone, $tot)
         $ui.Bar.Maximum = [Math]::Max(1, $tot); $ui.Bar.Value = $done
-        $what = if ($s.Unit) { $s.Unit } elseif ($s.PhaseNo -ge 5) { 'series' } else { 'folders' }
-        $ui.Progress.Text = '{0:N0} / {1:N0} {2}{3}' -f $done, $tot, $what, $(if ($null -ne $s.EtaSeconds -and $s.State -eq 'running') { "  ·  about $(Format-Span $s.EtaSeconds) left in this step" } else { '' })
+        $what = if ($s.Unit) { $s.Unit } else { 'folders' }
+        # (the series step is nearly all of a run: its time left is the run's)
+        $g = Get-IndexProgress $s
+        $eta = if ($null -ne $g.Eta -and $s.State -eq 'running') { "about $(Format-Span $g.Eta) left ($($g.Percent)% done)" } else { '' }
+        $ui.Progress.Text = '{0:N0} / {1:N0} {2}{3}' -f $done, $tot, $what, $(if ($eta) { "  ·  $eta" } else { '' })
         $ui.Current.Text = if ($s.Current) { "Now: $($s.Current)" } else { '' }
     } else {
         $ui.Bar.Value = 0
