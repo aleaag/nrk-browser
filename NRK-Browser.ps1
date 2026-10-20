@@ -43,8 +43,12 @@
     Run this first if the browser shows nothing.
 
 .PARAMETER Index
-    No window. Runs the indexer: walks every TV and radio folder slowly into the local
-    cache (one request at a time). Started from the Indexer window or a daily scheduled task.
+    No window. Runs the indexer: reads every TV and radio folder into the local cache, a few
+    requests at a time, and checks the series in them (a quick check of what can have changed,
+    or a full one every 30 days). Started from the Indexer window or a daily scheduled task.
+
+.PARAMETER IndexFull
+    With -Index: a full check, every season of every series.
 
 .PARAMETER NoGui
     Loads everything and stops before any window (for tests and scripts that dot-source this file).
@@ -77,7 +81,8 @@ param(
     [string] $LogDir,
     [switch] $DumpResponses,
     [switch] $SelfTest,
-    [switch] $Index,                # no window: walk the whole catalogue slowly into the cache (the Indexer)
+    [switch] $Index,                # no window: walk the whole catalogue into the cache (the Indexer)
+    [switch] $IndexFull,            # 2.10.0: with -Index: check every season of every series (not only what can have changed)
     [switch] $NoGui,
     [switch] $ShowConsole,
     [switch] $Tray,                 # start hidden in the system tray (used by "Start with Windows")
@@ -88,7 +93,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.9.12'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.10.3'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -188,7 +193,7 @@ function Write-Log {
         [ValidateSet('DEBUG', 'INFO', 'WARN', 'ERROR', 'DL')] [string] $Level = 'INFO',
         [string] $Message
     )
-    if ($script:IndexMode -and $Level -eq 'DEBUG') { return }   # keep the indexer's log readable
+    if ($script:IndexMode -and ($Level -eq 'DEBUG' -or ($script:IdxQuiet -and $Level -in 'INFO', 'WARN'))) { return }   # keep the indexer's log readable
     $line = '{0} [{1,-5}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Level, $Message
     # always in memory (the Logs window's "This session"), on disk only when switched on
     if (-not $script:LogMem) { $script:LogMem = New-Object System.Collections.Generic.List[string]; $script:LogPending = New-Object System.Collections.Generic.List[string] }
@@ -658,6 +663,7 @@ function Invoke-NrkApi {
     param([Parameter(Mandatory = $true)] [string] $Path)
 
     $uri = if ($Path -match '^https?://') { $Path } else { $script:ApiBase + $Path }
+    if ($script:IndexMode -and $script:IdxCur) { return (Get-IndexPage $uri) }   # (2.10.0: the indexer fetches several pages at once itself)
     $job = $script:ApiJob
     if ($job -and $job.Got.ContainsKey($uri)) {
         # a background job (Start-ApiJob): this page was fetched for it meanwhile
@@ -683,6 +689,7 @@ function Invoke-NrkApi {
         }
     }
     if ($job) { if (-not $job.Need) { $job.Need = $uri }; throw 'NRKB-NEEDFETCH' }   # (fetched in the background, then the job runs again)
+    $script:NetGets++
     Write-Log DEBUG "GET $uri"
     $sw = [Diagnostics.Stopwatch]::StartNew()
     try {
@@ -698,7 +705,7 @@ function Invoke-NrkApi {
         try { if ($_.Exception.Data -and $_.Exception.Data.Contains('Status')) { $code = [int]$_.Exception.Data['Status'] } elseif ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } } catch { }
         Write-Log ERROR ('GET {0} FAILED after {1} ms (HTTP {2})' -f $uri, $sw.ElapsedMilliseconds, $code)
         Write-LogException $_ 'Invoke-NrkApi'
-        if ($script:IndexMode) { $err = $_; Register-IndexFetch $false $code; throw $err }   # (no stale copy: the indexer counts it as an error)
+        if ($script:IndexMode) { throw }   # (no stale copy: the indexer counts it as an error)
         if ($cacheFile -and (Test-Path -LiteralPath $cacheFile) -and $code -notin 404, 410) {
             # offline or NRK down: use the last saved copy
             Write-Log WARN "Using the saved copy of $uri"
@@ -727,7 +734,7 @@ function Invoke-NrkApi {
 
     $parsed = ConvertFrom-JsonSafe -Json $text -Source $uri
     if ($cacheFile -and $r.Status -eq 200) { Save-CacheFile $cacheFile $bytes }   # only when it parsed
-    if ($script:IndexMode) { Register-IndexFetch $true 200 }
+    if ($script:IndexMode) { $script:Idx.Fetched++ }
     return $parsed
 }
 
@@ -1058,6 +1065,7 @@ function Get-NrkCategoryItems {
 
 function Get-NrkSeriesInfo {
     param([Parameter(Mandatory = $true)] [string] $SeriesId)
+    if (-not $script:IndexMode) { Add-IndexPriority -Key "series|$SeriesId" }   # (2.10.0: opened here: the indexer does it next)
     $r = Invoke-NrkApi (Get-ApiPath tvseries -Id $SeriesId)
     $stype = [string](Get-Prop $r 'seriesType')
     $body  = Get-Prop $r $stype
@@ -1375,6 +1383,7 @@ function Get-NrkRadioLetterItems {
 
 function Get-NrkRadioSeriesInfo {
     param([Parameter(Mandatory = $true)] [string] $Kind, [Parameter(Mandatory = $true)] [string] $Id)
+    if (-not $script:IndexMode) { Add-IndexPriority -Key "radioseries|$Kind|$Id" }
     $r = Invoke-NrkApi (Get-ApiPath radioseries -Id $Id -Sub $Kind)
     $body = Get-Prop $r 'series'
     $links = Get-Prop $r '_links'
@@ -2061,16 +2070,29 @@ function Initialize-WebView2 {
 
 #endregion
 
-#region ---------- Indexer (-Index: slow background walk of the whole catalogue) -------
+#region ---------- Indexer (-Index: background walk of the whole catalogue) -------------
 # A second, windowless copy of this script (started with -Index, by hand from the Indexer
-# window or daily by a Windows scheduled task) walks every TV and radio category, the A-Å
-# indexes, every series, season and episode list, one request at a time with a pause in
-# between, and saves them in the same cache the app reads. Folders then open instantly.
-# Entries saved in the last IndexFreshHours are skipped without a request, so a stopped run
-# simply continues where it was. It also writes indexer\search.tsv (one line per series,
+# window or daily by a Windows scheduled task) reads every TV and radio category and A-Å
+# list, then the series and podcasts in them, and saves every page in the same cache the app
+# reads (folders then open instantly). It also writes indexer\search.tsv (one line per series,
 # programme and episode): what Search, New this week and Last chance read.
+# 2.10.0, a smarter walk (the ideas of web crawlers, Scrapy, Plex and Everything):
+#  - several requests at once (Options: speed), the gap between them following NRK's answer
+#    time and growing when NRK says slow down;
+#  - most wanted first: series you open or search for in the app (priority.json), then your
+#    favourites and recently played, then new series, then the rest, longest unchecked first;
+#  - a quick check (most runs) skips series that have been quiet lately (they are looked at
+#    less often, 1-14 days) and reads only the seasons where something can have changed: for
+#    TV the first and last, for radio those whose episode count changed. The rest keeps its
+#    rows from the last run. A full check (every 30 days, or "Check everything") reads all;
+#  - search.tsv is saved during the run too: every series name right after the folders, and
+#    the series you asked for within seconds.
+# Entries saved in the last IndexFreshHours are not fetched again, so a stopped run simply
+# continues where it was.
 #   indexer\status.json   progress, written by the indexer, read by the Indexer window
-#   indexer\control.json  { Command: pause | resume | stop, PaceMs } written by the window
+#   indexer\control.json  { Command: pause | resume | stop, Speed } written by the window
+#   indexer\priority.json { Items: [series keys], Terms: [search words] } written by the app
+#   indexer\state.tsv     per series: when checked, when it last changed, what it held
 $script:IndexMode   = $false
 $script:IndexDir    = Join-Path $script:AppDataDir 'indexer'
 $script:IndexStatusFile  = Join-Path $script:IndexDir 'status.json'
@@ -2080,7 +2102,6 @@ $script:SearchFile  = Join-Path $script:IndexDir 'search.tsv'    # what "search 
 $script:EmptyFile   = Join-Path $script:IndexDir 'empty.txt'     # folders NRK has nothing in
 $script:IndexTaskName = 'NRK Browser indexer'
 $script:IndexFreshMin = 20 * 60
-$script:IndexPaceMs = 1000
 $script:Idx = $null
 
 function Read-JsonFile([string] $Path) {
@@ -2109,6 +2130,154 @@ function Write-JsonFile([string] $Path, $Object) {
     }
 }
 
+$script:IndexPriorityFile = Join-Path $script:IndexDir 'priority.json'   # series the app wants first (opened, searched for)
+$script:IndexStateFile    = Join-Path $script:IndexDir 'state.tsv'       # per series: when checked, when it last changed
+# 2.10.0: how many requests at a time, and the shortest gap between two of them. Within that the
+# indexer adapts by itself (like Scrapy's AutoThrottle): the gap follows NRK's answer time, and
+# when NRK answers 429/5xx or not at all, it at least doubles (5 s or more), never shrinking on errors.
+$script:IndexSpeeds = [ordered]@{
+    gentle = @{ Label = 'Gentle: one at a time, 1 s apart';             Parallel = 1; MinGap = 1000 }
+    normal = @{ Label = 'Normal: up to 3 at a time, 0.15 s apart (default)'; Parallel = 3; MinGap = 150 }
+    fast   = @{ Label = 'Fast: up to 6 at a time';                       Parallel = 6; MinGap = 0 }
+}
+$script:IndexDeepDays    = 30   # a full check (every season of every series) at least this often
+$script:IndexRevisitDays = 14   # a quick check looks at every series at least this often
+$script:IdxCur = $null          # the item whose work is running (Invoke-NrkApi reads its pages)
+$script:IdxQuiet = $false       # (work runs again for each new page: its own log lines would repeat)
+
+if (-not ('NrkIdxStore' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+// The search list (search.tsv) as the indexer keeps it during a run: the rows of the last run,
+// grouped by series and season (reused for what has not changed), the new rows of the series
+// done in this run, and a plain series line for series found in the folders but not done yet.
+public class NrkIdxStore {
+    class Group { public List<string> Head = new List<string>(); public Dictionary<string, List<string>> Seasons = new Dictionary<string, List<string>>(); }
+    Dictionary<string, Group> old = new Dictionary<string, Group>();
+    Dictionary<string, List<string>> fresh = new Dictionary<string, List<string>>();
+    Dictionary<string, string> fallback = new Dictionary<string, string>();
+    public static string KeyOf(string[] f) {
+        if (f.Length < 8) return null;
+        switch (f[0]) {
+            case "tvseries": return "series|" + f[1];
+            case "tvepisode": return f[4].Length > 0 ? "series|" + f[4] : null;
+            case "radioseries": return "radioseries|" + f[7] + "|" + f[1];
+            case "radioepisode": return f[4].Length > 0 ? "radioseries|" + f[7] + "|" + f[4] : null;
+        }
+        return null;
+    }
+    public int LoadOld(string path) {
+        old.Clear();
+        int n = 0;
+        if (!File.Exists(path)) return 0;
+        foreach (var line in File.ReadLines(path, Encoding.UTF8)) {
+            if (line.Length == 0 || line[0] == '#') continue;
+            var f = line.Split('\t');
+            if (f.Length < 12) Array.Resize(ref f, 12);
+            for (int i = 0; i < 12; i++) if (f[i] == null) f[i] = "";
+            var k = KeyOf(f);
+            if (k == null) continue;   // (programmes are listed again from the folders)
+            Group g;
+            if (!old.TryGetValue(k, out g)) { g = new Group(); old[k] = g; }
+            if (f[0] == "tvseries" || f[0] == "radioseries") g.Head.Add(line);
+            else {
+                List<string> s;
+                if (!g.Seasons.TryGetValue(f[6], out s)) { s = new List<string>(); g.Seasons[f[6]] = s; }
+                s.Add(line);
+            }
+            n++;
+        }
+        return n;
+    }
+    public int OldGroups { get { return old.Count; } }
+    public bool HasOld(string k) { return old.ContainsKey(k); }
+    public bool HasSeason(string k, string season) { Group g; return old.TryGetValue(k, out g) && g.Seasons.ContainsKey(season); }
+    static bool Live(string line, string now) {
+        // episodes whose "available to" has passed are left out
+        var f = line.Split('\t');
+        if (f.Length < 11 || f[10].Length == 0) return true;
+        return string.CompareOrdinal(f[10], now) >= 0;
+    }
+    public string[] OldSeason(string k, string season, string now) {
+        Group g; List<string> s;
+        if (!old.TryGetValue(k, out g) || !g.Seasons.TryGetValue(season, out s)) return new string[0];
+        var r = new List<string>();
+        foreach (var l in s) if (Live(l, now)) r.Add(l);
+        return r.ToArray();
+    }
+    public int OldEpisodes(string k, string now) {
+        Group g; int n = 0;
+        if (!old.TryGetValue(k, out g)) return 0;
+        foreach (var s in g.Seasons.Values) foreach (var l in s) if (Live(l, now)) n++;
+        return n;
+    }
+    public void SetNew(string k, IEnumerable<string> lines) { fresh[k] = new List<string>(lines); old.Remove(k); }
+    public bool HasNew(string k) { return fresh.ContainsKey(k); }
+    public void SetFallback(string k, string line) { fallback[k] = line; }
+    public int Publish(string tmp, string target, string header, IEnumerable<string> programs, IEnumerable<string> keys, bool keepUnseen, string now) {
+        int n = 0;
+        var seen = new HashSet<string>();
+        using (var w = new StreamWriter(tmp, false, new UTF8Encoding(false))) {
+            w.WriteLine(header);
+            foreach (var p in programs) { w.WriteLine(p); n++; }
+            foreach (var k in keys) { if (seen.Add(k)) n += WriteGroup(w, k, now); }
+            // folders that could not be read this time: what they had stays findable
+            if (keepUnseen) foreach (var k in new List<string>(old.Keys)) if (seen.Add(k)) n += WriteGroup(w, k, now);
+        }
+        for (int i = 0; ; i++) {
+            try {
+                if (File.Exists(target)) File.Replace(tmp, target, null); else File.Move(tmp, target);
+                break;
+            } catch (IOException) {
+                if (i >= 8) throw;
+                Thread.Sleep(250);   // (the app may be reading it this moment)
+            } catch (UnauthorizedAccessException) {
+                if (i >= 8) throw;
+                Thread.Sleep(250);
+            }
+        }
+        return n;
+    }
+    int WriteGroup(StreamWriter w, string k, string now) {
+        int n = 0; List<string> f; Group g; string fb;
+        if (fresh.TryGetValue(k, out f)) { foreach (var l in f) { w.WriteLine(l); n++; } return n; }
+        if (old.TryGetValue(k, out g)) {
+            foreach (var l in g.Head) { w.WriteLine(l); n++; }
+            foreach (var s in g.Seasons.Values) foreach (var l in s) if (Live(l, now)) { w.WriteLine(l); n++; }
+            if (n > 0) return n;
+        }
+        if (fallback.TryGetValue(k, out fb)) { w.WriteLine(fb); n++; }
+        return n;
+    }
+    // a saved page with exactly these bytes (then it is not written again)
+    public static bool SameBytes(string path, byte[] b) {
+        var a = File.ReadAllBytes(path);
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+    // what a series holds, in short: changes when an episode comes or goes
+    public static string Sig(IEnumerable<string> lines) {
+        var ids = new List<string>();
+        foreach (var l in lines) {
+            var f = l.Split('\t');
+            if (f.Length > 1 && (f[0] == "tvepisode" || f[0] == "radioepisode")) ids.Add(f[1]);
+        }
+        ids.Sort(StringComparer.Ordinal);
+        using (var sha = SHA1.Create()) {
+            var b = sha.ComputeHash(Encoding.UTF8.GetBytes(string.Join("\n", ids.ToArray())));
+            return BitConverter.ToString(b, 0, 8).Replace("-", "").ToLowerInvariant();
+        }
+    }
+}
+'@
+}
+
 function Write-IndexStatus([switch] $Force) {
     $x = $script:Idx
     if (-not $x) { return }
@@ -2121,14 +2290,25 @@ function Write-IndexStatus([switch] $Force) {
         $eta = [int]([Math]::Max(0, $secs / $x.PhaseDone * ($x.PhaseTotal - $x.PhaseDone)))
     }
     Write-JsonFile $script:IndexStatusFile ([ordered]@{
-        State = $x.State; Pid = $PID; Version = $script:AppVersion
+        State = $x.State; Pid = $PID; Version = $script:AppVersion; Mode = $x.Mode
         Started = $x.Started.ToString('o'); Updated = $now.ToString('o'); Finished = $x.Finished
-        Phase = $x.Phase; PhaseNo = $x.PhaseNo; PhaseCount = 6; PhaseDone = $x.PhaseDone; PhaseTotal = $x.PhaseTotal; EtaSeconds = $eta
-        Current = $x.Current; PaceMs = $script:IndexPaceMs
+        Percent = $(if ($x.State -eq 'done') { 100 } else { $f = [Math]::Min(1.0, [double]$x.PhaseDone / [Math]::Max(1.0, [double]$x.PhaseTotal)); if ($x.PhaseNo -le 1) { [int][Math]::Floor(5 * $f) } else { [int][Math]::Floor(5 + 94 * $f) } })   # (99 at most until it is really done)
+        Phase = $x.Phase; PhaseNo = $x.PhaseNo; PhaseCount = 2; PhaseDone = $x.PhaseDone; PhaseTotal = $x.PhaseTotal; Unit = $x.Unit; EtaSeconds = $eta
+        Current = $x.Current; Speed = $x.Speed; Parallel = $x.Parallel; GapMs = [int]$x.Gap; InFlight = $x.InFlight.Count
         Requests = $x.Fetched; Skipped = $x.Cached; Errors = $x.Errors; LastError = $x.LastError
         TvSeries = $x.Tv.Count; RadioSeries = $x.Radio.Count; Programs = $x.Programs.Count; Episodes = $x.Episodes
-        LastFull = $x.LastFull; LastFullSeconds = $x.LastFullSeconds
+        Unchanged = $x.Unchanged; ReusedSeasons = $x.ReusedSeasons; Changed = $x.Changed; SamePages = $x.SameWrites; WrittenMB = [Math]::Round($x.Written / 1MB, 1)
+        LastFull = $x.LastFull; LastFullSeconds = $x.LastFullSeconds; LastDeep = $x.LastDeep; LastDeepSeconds = $x.LastDeepSeconds
     })
+}
+
+function Set-IndexSpeed([string] $Name) {
+    $x = $script:Idx
+    if (-not $script:IndexSpeeds.Contains($Name)) { $Name = 'normal' }
+    $sp = $script:IndexSpeeds[$Name]
+    if ($x.Speed -ne $Name) { Write-Log INFO ("Indexer: speed {0} ({1} at a time, at least {2} ms apart)" -f $Name, $sp.Parallel, $sp.MinGap) }
+    $x.Speed = $Name; $x.Parallel = [int]$sp.Parallel; $x.MinGap = [int]$sp.MinGap
+    $x.Gap = [Math]::Max([double]$x.Gap, [double]$x.MinGap)
 }
 
 function Read-IndexControl {
@@ -2141,7 +2321,7 @@ function Read-IndexControl {
         $x.ControlTime = $t
         $c = Read-JsonFile $script:IndexControlFile
         if (-not $c) { return }
-        if ($c.PaceMs) { $script:IndexPaceMs = [Math]::Max(0, [Math]::Min(60000, [int]$c.PaceMs)) }
+        if ($c.Speed) { Set-IndexSpeed ([string]$c.Speed) }
         switch ([string]$c.Command) {
             'pause'  { if ($x.State -eq 'running') { $x.State = 'paused'; Write-Log INFO 'Indexer: paused' } }
             'resume' { if ($x.State -eq 'paused') { $x.State = 'running'; Write-Log INFO 'Indexer: resumed' } }
@@ -2150,63 +2330,322 @@ function Read-IndexControl {
     } catch { }
 }
 
-function Wait-IndexPace {
-    # after every request to NRK: wait PaceMs (plus any back-off), stay paused while asked, stop when asked
+function Move-IndexItemUp([string] $Key) {
+    # this series next: you opened it, or searched for it, in the app
     $x = $script:Idx
-    $wait = $script:IndexPaceMs + $x.Backoff
-    $sw = [Diagnostics.Stopwatch]::StartNew()
+    if ($x.PhaseNo -lt 2) { if (-not $x.EarlyPrio.Contains($Key)) { $x.EarlyPrio.Add($Key) }; return $false }   # (still reading the folders)
+    $it = $x.SeriesItems[$Key]
+    if (-not $it) {
+        # not due this run (it has not changed lately): check it now anyway
+        $d = $x.AllSeries[$Key]
+        if (-not $d) { return $false }
+        $it = New-IndexSeriesItem $d 0
+        $x.PhaseTotal++
+        if ($x.Store.HasOld($Key) -and $x.Unchanged -gt 0) { $x.Unchanged--; $x.Episodes -= $x.Store.OldEpisodes($Key, $x.NowS) }   # (counted again when it is done)
+        return $true
+    }
+    if ($it.State -ne 'queued' -or $it.Prio -eq 0) { return $false }
+    $it.Prio = 0; $x.Buckets[0].Enqueue($it)
+    return $true
+}
+
+function Read-IndexPriority([switch] $Now) {
+    # priority.json (written by the app): series to do first, and search words to match titles with
+    $x = $script:Idx
+    if (-not $Now -and ((Get-Date) - $x.PrioCheck).TotalMilliseconds -lt 1000) { return }
+    $x.PrioCheck = Get-Date
+    try {
+        if (-not (Test-Path -LiteralPath $script:IndexPriorityFile)) { return }
+        $t = (Get-Item -LiteralPath $script:IndexPriorityFile).LastWriteTimeUtc
+        if ($t -eq $x.PrioTime) { return }
+        $x.PrioTime = $t
+        $p = Read-JsonFile $script:IndexPriorityFile
+        if (-not $p) { return }
+        # (only what was asked for since the last run ended: the app sends its whole list every time)
+        try { $sent = [datetime]$p.Sent; if (((Get-Date) - $sent).TotalHours -gt 24 -or ($x.PrevEnd -and $sent -lt $x.PrevEnd)) { return } } catch { }
+        $n = 0
+        foreach ($k in @($p.Items)) { if ($k -and $x.PrioSeen.Add("k|$k") -and (Move-IndexItemUp ([string]$k))) { $n++ } }
+        foreach ($term in @($p.Terms)) {
+            $q = ([string]$term).Trim().ToLowerInvariant()
+            if ($q.Length -lt 2 -or -not $x.PrioSeen.Add("t|$q")) { continue }
+            if ($x.PhaseNo -lt 2) { if (-not $x.EarlyTerms.Contains($q)) { $x.EarlyTerms.Add($q) }; continue }
+            $m = 0
+            foreach ($d in @($x.AllSeries.Values)) {
+                if ($m -ge 30) { break }
+                if ($d.TitleLower.Contains($q) -and -not $x.Store.HasNew($d.Key) -and (Move-IndexItemUp $d.Key)) { $n++; $m++ }
+            }
+        }
+        if ($n) { Write-Log INFO "Indexer: $n series moved to the front (opened or searched for in the app)" }
+    } catch { Write-Log WARN "Indexer: priority list: $($_.Exception.Message)" }
+}
+
+function New-IndexItem([string] $What, [scriptblock] $Work, [scriptblock] $Commit, [int] $Prio = 2, [string] $Key = '', $Data = $null, [bool] $Counts = $true) {
+    # one unit of work: $Work runs (again) until every page it reads is at hand, then $Commit gets its result
+    $it = @{ What = $What; Work = $Work; Commit = $Commit; Prio = $Prio; Key = $Key; Data = $Data; Counts = $Counts
+             State = 'queued'; Got = @{}; Runs = 0; Need = $null; Pre = $null; TitleLower = '' }
+    $script:Idx.Buckets[$Prio].Enqueue($it)
+    return $it
+}
+
+function Get-IndexPage([string] $Uri) {
+    # Invoke-NrkApi while indexing: a page already fetched for this item, else a fresh saved copy,
+    # else say which page is needed (the engine fetches it, then runs the item again)
+    $cur = $script:IdxCur
+    $h = $cur.Got[$Uri]
+    if ($h) { if ($h.Error) { throw $h.Error }; return $h.Obj }
+    $c = Read-IndexCache $Uri
+    if ($c) { $cur.Got[$Uri] = $c; return $c.Obj }
+    $cur.Need = $Uri
+    throw 'NRKB-NEEDFETCH'
+}
+
+function Test-IndexFresh([string] $Uri) {
+    if ((Get-ApiCacheTtl $Uri) -le 0) { return $false }
+    try {
+        $fi = New-Object IO.FileInfo((Get-CacheFile $Uri))
+        return ($fi.Exists -and ((Get-Date) - $fi.LastWriteTime).TotalMinutes -le $script:IndexFreshMin)
+    } catch { return $false }
+}
+
+function Read-IndexCache([string] $Uri) {
+    # @{ Obj } from the saved copy when it is fresh enough, else $null
+    if (-not (Test-IndexFresh $Uri)) { return $null }
+    try {
+        $o = ConvertFrom-JsonSafe -Json ([IO.File]::ReadAllText((Get-CacheFile $Uri), [Text.Encoding]::UTF8)) -Source "cache:$Uri"
+        $script:Idx.Cached++
+        return @{ Obj = $o }
+    } catch { return $null }
+}
+
+function Add-IndexPrefetch([string[]] $Paths) {
+    # work that knows which pages it will read can ask for all of them at once
+    $cur = $script:IdxCur
+    if (-not $cur) { return }
+    if (-not $cur.Pre) { $cur.Pre = New-Object System.Collections.Generic.List[string] }
+    foreach ($p in $Paths) {
+        if (-not $p) { continue }
+        $u = if ($p -match '^https?://') { $p } else { $script:ApiBase + $p }
+        if (-not $cur.Got.ContainsKey($u) -and -not $cur.Pre.Contains($u) -and -not (Test-IndexFresh $u)) { $cur.Pre.Add($u) }
+    }
+}
+
+function Request-IndexPage([string] $Uri, $It, [bool] $Wake) {
+    $x = $script:Idx
+    if ($It.Got.ContainsKey($Uri)) {
+        if ($Wake -and $It.State -eq 'waiting') { $It.State = 'ready'; $x.Waiting--; $x.Ready.Enqueue($It) }
+        return
+    }
+    $w = $x.Waiters[$Uri]
+    if (-not $w) {
+        $w = New-Object System.Collections.ArrayList
+        $x.Waiters[$Uri] = $w
+        if ($It.Prio -le 1) { $x.FetchHi.Enqueue($Uri) } else { $x.FetchLo.Enqueue($Uri) }
+    } elseif ($It.Prio -le 1 -and -not $x.InFlight.ContainsKey($Uri)) { $x.FetchHi.Enqueue($Uri) }   # (now wanted first)
+    [void]$w.Add(@{ Item = $It; Wake = $Wake })
+}
+
+function Send-IndexPage([string] $Uri, $Entry) {
+    # a page is in (or failed for good): every item waiting for it runs again
+    $x = $script:Idx
+    $w = $x.Waiters[$Uri]
+    [void]$x.Waiters.Remove($Uri)
+    if (-not $w) { return }
+    foreach ($e in $w) {
+        $it = $e.Item
+        if ($it.Got) { $it.Got[$Uri] = $Entry }
+        if ($e.Wake -and $it.State -eq 'waiting') { $it.State = 'ready'; $x.Waiting--; $x.Ready.Enqueue($it) }
+    }
+}
+
+function Get-NextIndexFetch {
+    $x = $script:Idx
+    $now = Get-Date
+    for ($i = 0; $i -lt $x.Retry.Count; $i++) {
+        $r = $x.Retry[$i]
+        if ($now -ge $r.At) { $x.Retry.RemoveAt($i); return $r.Uri }
+    }
+    foreach ($q in $x.FetchHi, $x.FetchLo) {
+        while ($q.Count) {
+            $u = [string]$q.Dequeue()
+            if ($x.Waiters.ContainsKey($u) -and -not $x.InFlight.ContainsKey($u) -and -not $x.RetrySet.Contains($u)) { return $u }
+        }
+    }
+    return $null
+}
+
+function Start-IndexFetch([string] $Uri) {
+    $x = $script:Idx
+    $x.InFlight[$Uri] = @{ Uri = $Uri; Task = $x.Http.GetByteArrayAsync($Uri); Watch = [Diagnostics.Stopwatch]::StartNew() }
+    $x.NextSend = (Get-Date).AddMilliseconds($x.Gap)
+    $x.Current = ($Uri -replace '^https?://[^/]+', '')
+}
+
+function Save-IndexPage([string] $File, [byte[]] $Bytes) {
+    # 2.10.3: the same page as last time is not written again: only its date is moved on (so it
+    # counts as fresh). Most pages a quick check reads have not changed, so this saves most writes.
+    $x = $script:Idx
+    try {
+        $fi = New-Object IO.FileInfo($File)
+        if ($fi.Exists -and $fi.Length -eq $Bytes.Length -and [NrkIdxStore]::SameBytes($File, $Bytes)) { $fi.LastWriteTime = Get-Date; $x.SameWrites++; return }
+    } catch { }
+    Save-CacheFile $File $Bytes
+    $x.Written += $Bytes.Length
+}
+
+function Update-IndexPace([double] $Ms, [bool] $Ok, $Code) {
+    # AutoThrottle: aim for the gap that keeps $Parallel requests busy at NRK's current answer time
+    $x = $script:Idx
+    $target = $Ms / [Math]::Max(1, $x.Parallel)
+    if ($Ok) {
+        $new = ($x.Gap + $target) / 2
+        if (((Get-Date) - $x.LastSlow).TotalSeconds -lt 60) { $new = [Math]::Max($new, $x.Gap * 0.9) }   # (after a "slow down": back up gently)
+    } elseif ("$Code" -match '^(429|5\d\d|n/a)$') {
+        $new = [Math]::Max($x.Gap * 2, 5000); $x.LastSlow = Get-Date
+    } else {
+        $new = [Math]::Max($x.Gap, ($x.Gap + $target) / 2)   # (errors never make it faster)
+    }
+    $x.Gap = [Math]::Min(60000, [Math]::Max([double]$x.MinGap, $new))
+}
+
+function Complete-IndexFetch($F) {
+    $x = $script:Idx
+    $uri = $F.Uri
+    [void]$x.InFlight.Remove($uri)
+    $ms = $F.Watch.ElapsedMilliseconds
+    $t = $F.Task
+    if ($t.IsFaulted -or $t.IsCanceled) {
+        $ex = if ($t.Exception) { $t.Exception.GetBaseException() } else { New-Object TimeoutException('No answer in 30 s') }
+        $code = if ($ex.Message -match '\b([45]\d\d)\b') { [int]$Matches[1] } else { 'n/a' }
+        Update-IndexPace $ms $false $code
+        $tries = 1 + [int]$x.Tries[$uri]; $x.Tries[$uri] = $tries
+        if ("$code" -match '^(429|5\d\d|n/a)$' -and $tries -lt 3) {
+            Write-Log WARN ("Indexer: HTTP {0} for {1}; trying again in {2:N0} s (now {3:N1} s between requests)" -f $code, ($uri -replace '^https?://[^/]+', ''), ($x.Gap / 1000), ($x.Gap / 1000))
+            $x.Retry.Add(@{ Uri = $uri; At = (Get-Date).AddMilliseconds($x.Gap) }); [void]$x.RetrySet.Add($uri)
+            return
+        }
+        Write-Log WARN ("Indexer: GET {0} failed (HTTP {1}): {2}" -f ($uri -replace '^https?://[^/]+', ''), $code, $ex.Message)
+        $err = New-Object System.Exception(("HTTP {0} from NRK for {1}" -f $code, ($uri -replace '^https?://[^/]+', '')), $ex)
+        Send-IndexPage $uri @{ Error = $err }
+        return
+    }
+    $bytes = $t.Result
+    $x.Fetched++
+    try {
+        $obj = ConvertFrom-JsonSafe -Json ([Text.Encoding]::UTF8.GetString($bytes)) -Source $uri
+        if ((Get-ApiCacheTtl $uri) -gt 0) { Save-IndexPage (Get-CacheFile $uri) $bytes }   # (what the app reads: folders open instantly)
+        Update-IndexPace $ms $true 200
+        Send-IndexPage $uri @{ Obj = $obj }
+    } catch {
+        Send-IndexPage $uri @{ Error = $_.Exception }
+    }
+}
+
+function Invoke-IndexItem($It) {
+    $x = $script:Idx
+    $It.Need = $null; $It.Pre = $null; $It.Runs++
+    $It.Rows = New-Object System.Collections.Generic.List[string]
+    $It.Empty = New-Object System.Collections.Generic.List[string]
+    $It.EpCount = 0; $It.Reused = 0; $It.Sigs = @{}; $It.Later = 0
+    $res = $null; $err = $null
+    $script:IdxCur = $It; $script:IdxQuiet = $true
+    try { $res = & $It.Work $It }
+    catch { $err = $_ }
+    finally { $script:IdxCur = $null; $script:IdxQuiet = $false }
+    if ($err -and ($err.Exception -is [System.OperationCanceledException])) { throw $err }
+    if ($It.Pre) { foreach ($u in $It.Pre) { if ($u -ne $It.Need) { Request-IndexPage $u $It $false } } }
+    if ($It.Need) {
+        if ($It.Runs -lt 600) {
+            $It.State = 'waiting'; $x.Waiting++
+            Request-IndexPage $It.Need $It $true
+            return
+        }
+        $err = "more than $($It.Runs) pages"
+    }
+    $It.State = 'done'
+    if ($err) {
+        if ($It.Split) { $x.PhaseDone++ }   # (no second go for this one)
+        $msg = if ($err -is [System.Management.Automation.ErrorRecord]) { $err.Exception.Message } else { [string]$err }
+        $x.Errors++; $x.LastError = "$($It.What): $msg"
+        Write-Log WARN "Indexer: $($x.LastError)"
+        if ($It.Key -and $It.Prio -eq 0) { $x.PublishSoon = $true }
+    } else {
+        try { & $It.Commit $It $res } catch { $x.Errors++; $x.LastError = "$($It.What): $($_.Exception.Message)"; Write-LogException $_ "Indexer: $($It.What)" }
+    }
+    if ($It.Counts) { $x.PhaseDone++ }
+    $It.Got = $null; $It.Rows = $null
+}
+
+function Get-NextIndexItem([bool] $Normal) {
+    $x = $script:Idx
+    for ($b = 0; $b -lt $x.Buckets.Count; $b++) {
+        if ($b -gt 0 -and -not $Normal) { return $null }
+        $q = $x.Buckets[$b]
+        while ($q.Count) {
+            $it = $q.Dequeue()
+            if ($it.State -eq 'queued' -and $it.Prio -eq $b) { return $it }
+        }
+    }
+    return $null
+}
+
+function Test-IndexQueued {
+    foreach ($q in $script:Idx.Buckets) { if ($q.Count) { return $true } }
+    return $false
+}
+
+function Invoke-IndexEngine {
+    # Runs queued items until none are left: up to $Parallel requests at NRK at once, the
+    # most wanted first (bucket 0: asked for in the app; 1: your favourites and recently
+    # played; 2: new; 3: the rest, longest unchecked first)
+    $x = $script:Idx
     while ($true) {
         Read-IndexControl
         if ($x.State -eq 'stopping') { throw (New-Object System.OperationCanceledException('Indexer stopped')) }
         if ($x.State -eq 'paused') {
             $p0 = Get-Date
             Write-IndexStatus -Force
-            Start-Sleep -Milliseconds 500
+            Start-Sleep -Milliseconds 400
             $x.PhasePaused += ((Get-Date) - $p0).TotalSeconds
             continue
         }
-        $left = $wait - $sw.ElapsedMilliseconds
-        if ($left -le 0) { break }
-        Start-Sleep -Milliseconds ([Math]::Min(250, [int]$left))
+        Read-IndexPriority
+        $busy = $false
+        foreach ($f in @($x.InFlight.Values)) { if ($f.Task.IsCompleted) { Complete-IndexFetch $f; $busy = $true } }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($x.Ready.Count -and $sw.ElapsedMilliseconds -lt 400) { Invoke-IndexItem $x.Ready.Dequeue(); $busy = $true }
+        while ($sw.ElapsedMilliseconds -lt 400) {
+            # enough work started to keep NRK busy (items read from saved copies finish at once)
+            $it = Get-NextIndexItem ($x.Waiting -lt ($x.Parallel * 3 + 2))
+            if (-not $it) { break }
+            Invoke-IndexItem $it; $busy = $true
+        }
+        while ($x.InFlight.Count -lt $x.Parallel -and (Get-Date) -ge $x.NextSend) {
+            $u = Get-NextIndexFetch
+            if (-not $u) { break }
+            [void]$x.RetrySet.Remove($u)
+            Start-IndexFetch $u; $busy = $true
+            if ($x.Gap -ge 1) { break }   # (the next one after the gap)
+        }
+        if (-not $x.InFlight.Count -and -not $x.Ready.Count -and -not $x.Retry.Count -and -not $x.FetchHi.Count -and -not $x.FetchLo.Count -and -not (Test-IndexQueued)) {
+            if ($x.Waiting -gt 0) { Write-Log WARN "Indexer: $($x.Waiting) item(s) still waiting for a page that never came" }
+            break
+        }
         Write-IndexStatus
+        if ($x.PhaseNo -ge 2) {
+            $ago = ((Get-Date) - $x.LastPublish).TotalSeconds
+            # (2.10.3: the whole list is rewritten each time, so not too often: the series you asked
+            #  for at most once a minute, otherwise every 30 minutes, and only when something is new)
+            if ($x.Commits -gt 0 -and (($x.PublishSoon -and $ago -ge 60) -or $ago -ge 1800)) { Publish-IndexSearch $(if ($x.PublishSoon) { 'with the series you asked for' } else { 'progress so far' }) }
+        }
+        if (-not $busy) { Start-Sleep -Milliseconds 20 }
     }
 }
 
-function Register-IndexFetch([bool] $Ok, $Code) {
-    # called by Invoke-NrkApi for every request it sends while indexing
+function Start-IndexPhase([int] $No, [string] $Name, [int] $Total, [string] $Unit) {
     $x = $script:Idx
-    $x.Fetched++
-    if ($Ok) { $x.Backoff = [Math]::Max(0, [int]($x.Backoff / 2)) }
-    elseif ("$Code" -match '^(429|5\d\d|n/a)$') {
-        # NRK says slow down, or the connection failed: wait longer, up to a minute
-        $x.Backoff = [Math]::Min(60000, [Math]::Max(5000, $x.Backoff * 2))
-        Write-Log WARN "Indexer: HTTP $Code, waiting $([int]($x.Backoff / 1000)) s longer between requests"
-    }
-    Wait-IndexPace
-}
-
-function Invoke-IndexStep([string] $What, [scriptblock] $Action) {
-    # one unit of work; an NRK error is counted and the walk goes on
-    $x = $script:Idx
-    $x.Current = $What
-    Read-IndexControl
-    if ($x.State -eq 'stopping') { throw (New-Object System.OperationCanceledException('Indexer stopped')) }
-    if ($x.State -eq 'paused') { Wait-IndexPace }
-    Write-IndexStatus
-    try { & $Action }
-    catch [System.OperationCanceledException] { throw }
-    catch {
-        if ($_.Exception -is [System.OperationCanceledException] -or $_.Exception.InnerException -is [System.OperationCanceledException]) { throw }
-        $x.Errors++; $x.LastError = "${What}: $($_.Exception.Message)"
-        Write-Log WARN "Indexer: $($x.LastError)"
-    }
-}
-
-function Start-IndexPhase([int] $No, [string] $Name, [int] $Total) {
-    $x = $script:Idx
-    $x.PhaseNo = $No; $x.Phase = $Name; $x.PhaseTotal = $Total; $x.PhaseDone = 0
+    $x.PhaseNo = $No; $x.Phase = $Name; $x.PhaseTotal = $Total; $x.PhaseDone = 0; $x.Unit = $Unit
     $x.PhaseStarted = Get-Date; $x.PhasePaused = 0
-    Write-Log INFO "Indexer: phase $No/6 $Name ($Total)"
+    Write-Log INFO $(if ($Total) { "Indexer: step $No/2 $Name ($Total $Unit)" } else { "Indexer: step $No/2 $Name" })
     Write-IndexStatus -Force
 }
 
@@ -2220,18 +2659,249 @@ function Add-IndexSeries([hashtable] $Map, [string] $Key, $Item, [string] $Where
     if ($Where -and -not $Map[$Key].Where.Contains($Where)) { $Map[$Key].Where.Add($Where) }
 }
 
-
-function Add-SearchRow {
+function Format-SearchRow {
     # one line of search.tsv: type, id, title, subtitle, series id, series title, season, kind, date,
     # available from, available to, year (from/to: sortable local times; used by New this week / Last chance)
     param([string] $Type, [string] $Id, [string] $Title, [string] $Sub = '', [string] $SeriesId = '', [string] $SeriesTitle = '', [string] $Season = '', [string] $Kind = '', [string] $Date = '', $Rights = $null)
-    $w = $script:Idx.SearchW
-    if (-not $w -or -not $Id) { return }
     $f = foreach ($v in @($Type, $Id, $Title, $Sub, $SeriesId, $SeriesTitle, $Season, $Kind, $Date, $Rights.AvailableFrom, $Rights.AvailableTo, $Rights.Year)) { ([string]$v) -replace '[\t\r\n]+', ' ' }
-    $w.WriteLine(($f -join "`t"))
+    return ($f -join "`t")
 }
 
-function Invoke-Indexer {
+function Add-SearchRow {
+    # a row for the series being indexed (kept only if the whole series gets through)
+    param([string] $Type, [string] $Id, [string] $Title, [string] $Sub = '', [string] $SeriesId = '', [string] $SeriesTitle = '', [string] $Season = '', [string] $Kind = '', [string] $Date = '', $Rights = $null)
+    $cur = $script:IdxCur
+    if (-not $cur -or -not $Id) { return }
+    $cur.Rows.Add((Format-SearchRow @PSBoundParameters))
+}
+
+function Read-IndexState {
+    # state.tsv: key, checked, last changed, contents signature, last full check, season signatures
+    $m = @{}
+    try {
+        if (Test-Path -LiteralPath $script:IndexStateFile) {
+            foreach ($l in [IO.File]::ReadAllLines($script:IndexStateFile, [Text.Encoding]::UTF8)) {
+                if (-not $l -or $l[0] -eq '#') { continue }
+                $f = $l.Split("`t")
+                if ($f.Count -lt 5) { continue }
+                $s = @{}
+                if ($f.Count -gt 5 -and $f[5]) { foreach ($p in $f[5].Split([char]0x1e)) { $kv = $p.Split([char]0x1f); if ($kv.Count -eq 2) { $s[$kv[0]] = $kv[1] } } }
+                $m[$f[0]] = @{ C = $f[1]; Ch = $f[2]; Sig = $f[3]; D = $f[4]; S = $s }
+            }
+        }
+    } catch { Write-Log WARN "Indexer: could not read $($script:IndexStateFile): $($_.Exception.Message) (every series is checked this time)" }
+    return $m
+}
+
+function Save-IndexState {
+    $x = $script:Idx
+    $tmp = "$($script:IndexStateFile).$PID.tmp"
+    try {
+        $w = New-Object System.IO.StreamWriter($tmp, $false, (New-Object Text.UTF8Encoding($false)))
+        try {
+            $w.WriteLine('#nrkb-indexstate 1')
+            foreach ($k in $x.SeriesState.Keys) {
+                $e = $x.SeriesState[$k]
+                $s = (@($e.S.Keys | ForEach-Object { '{0}{1}{2}' -f $_, [char]0x1f, $e.S[$_] }) -join [char]0x1e)
+                $w.WriteLine((@($k, $e.C, $e.Ch, $e.Sig, $e.D, $s) -join "`t"))
+            }
+        } finally { $w.Dispose() }
+        Move-Item -LiteralPath $tmp -Destination $script:IndexStateFile -Force
+    } catch { Write-Log WARN "Indexer: could not save $($script:IndexStateFile): $($_.Exception.Message)"; Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+}
+
+function Publish-IndexSearch([string] $Why) {
+    # search.tsv now: what this run has done, the rest from the last run (the app reloads it by itself)
+    $x = $script:Idx
+    $x.PublishSoon = $false; $x.LastPublish = Get-Date; $x.Commits = 0
+    try {
+        $prog = New-Object System.Collections.Generic.List[string]
+        foreach ($k in $x.Programs.Keys) { $p = $x.Programs[$k]; $prog.Add((Format-SearchRow tvprogram $p.Item.Id $p.Item.Title $p.Item.Description -Rights $p.Item)) }
+        $keys = New-Object System.Collections.Generic.List[string]
+        foreach ($k in $x.AllSeries.Keys) { $keys.Add([string]$k) }
+        $n = $x.Store.Publish($x.SearchTmp, $script:SearchFile, '#nrkb-search 2', $prog, $keys, ($x.ListErrors -gt 0), (Get-Date).ToString('s'))
+        Write-Log INFO ("Indexer: search list saved, {0:N0} entries ({1})" -f $n, $Why)
+        Save-IndexState
+    } catch {
+        Write-Log WARN "Indexer: could not save the search list: $($_.Exception.Message)"
+        Remove-Item -LiteralPath $x.SearchTmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-IndexFavouriteKeys {
+    # your favourites (followed or not) and the series of what you played lately: checked every run, first
+    $set = New-Object 'System.Collections.Generic.HashSet[string]'
+    try { $j = Read-JsonFile (Join-Path $script:AppDataDir 'favourites.json'); if ($j) { foreach ($r in @($j.Items)) { if ($r -and $r.Key) { [void]$set.Add([string]$r.Key) } } } } catch { }
+    try {
+        $j = Read-JsonFile (Join-Path $script:AppDataDir 'recent.json')
+        if ($j) {
+            foreach ($r in @($j.Items)) {
+                if (-not $r) { continue }
+                if ($r.Type -eq 'audio' -and $r.SeriesId) { [void]$set.Add(('radioseries|{0}|{1}' -f $(if ($r.Kind -eq 'podcast') { 'podcast' } else { 'series' }), $r.SeriesId)) }
+                elseif ($r.SeriesItem -and $r.SeriesItem.Id) { [void]$set.Add("series|$($r.SeriesItem.Id)") }
+            }
+        }
+    } catch { }
+    return ,$set
+}
+
+function Get-IndexAgeHours([string] $Iso) {
+    if (-not $Iso) { return [double]::MaxValue }
+    try { return ((Get-Date) - [datetime]::Parse($Iso, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime()).TotalHours } catch { return [double]::MaxValue }
+}
+
+function New-IndexSeriesItem($D, [int] $Prio, [switch] $Rest) {
+    # 2.10.3: a series not in the list yet is done in two goes: first its newest seasons (with
+    # every other new series, so search is useful early), then its older seasons (-Rest), after
+    # all the newest ones. What you ask for in the app is done whole, at once.
+    $x = $script:Idx
+    $work = if ($D.Kind -eq 'tv') { $script:IdxTvWork } else { $script:IdxRadioWork }
+    $what = if ($D.Kind -eq 'tv') { "TV $($D.Item.Title)" } else { "Radio $($D.Item.Title)" }
+    if ($Rest) { $what += ' (older seasons)' }
+    $it = New-IndexItem $what $work $script:IdxSeriesCommit $Prio $D.Key $D
+    $it.TitleLower = $D.TitleLower
+    $it.Split = (-not $Rest) -and (-not $x.Store.HasOld($D.Key)) -and $Prio -ge 1
+    if ($it.Split) { $x.PhaseTotal++ }   # (its second go counted now, so the percentage never goes back)
+    $x.SeriesItems[$D.Key] = $it
+    return $it
+}
+
+# ---- what one series is: TV --------------------------------------------------------------
+# A quick check reads the series and its first and last season (where new episodes land); the
+# seasons in between keep their episodes from the last run. A full check reads every season.
+$script:IdxTvWork = {
+    param($it)
+    $x = $script:Idx; $d = $it.Data; $id = [string]$d.Item.Id
+    $info = Get-NrkSeriesInfo -SeriesId $id
+    Add-SearchRow tvseries $id $d.Item.Title $d.Item.Description
+    $seasons = @($info.Seasons | Where-Object { $_ -and -not $x.Hidden.Contains("season|$id|$($_.Name)") })
+    $real = @($seasons | Where-Object { $_.Name -ne 'ekstramateriale' })
+    $edge = @{}; if ($real.Count) { $edge[[string]$real[0].Name] = 1; $edge[[string]$real[$real.Count - 1].Name] = 1 }
+    $quick = ($x.Mode -eq 'quick')
+    $split = $it.Split -and $it.Prio -ne 0
+    $reuse = @{}; $later = @{}; $want = @()
+    foreach ($sea in $seasons) {
+        if ($split -and -not $edge.ContainsKey([string]$sea.Name)) { $later[[string]$sea.Name] = 1 }
+        elseif ($quick -and -not $edge.ContainsKey([string]$sea.Name) -and $x.Store.HasSeason($it.Key, [string]$sea.Name)) { $reuse[[string]$sea.Name] = 1 }
+        else { $want += (Get-ApiPath tvseason -Id $id -Sub $sea.Name) }
+    }
+    $it.Later = $later.Count
+    Add-IndexPrefetch $want
+    foreach ($sea in $seasons) {
+        if ($later.ContainsKey([string]$sea.Name)) { continue }
+        if ($reuse.ContainsKey([string]$sea.Name)) {
+            $lines = $x.Store.OldSeason($it.Key, [string]$sea.Name, $x.NowS)
+            foreach ($l in $lines) { $it.Rows.Add($l) }
+            $it.EpCount += $lines.Length; $it.Reused++
+            continue
+        }
+        $eps = @(Get-NrkSeasonEpisodes -SeriesId $id -Season $sea.Name | Where-Object { $_ -and -not $x.Hidden.Contains("file|episode|$($_.Id)") })
+        $it.EpCount += $eps.Count
+        if ($eps.Count -eq 0) { $it.Empty.Add("season|$id|$($sea.Name)") }
+        foreach ($e in $eps) { Add-SearchRow tvepisode $e.Id $e.Title $e.Subtitle $id $d.Item.Title $sea.Name -Rights $e }
+    }
+    if ($it.EpCount -eq 0 -and -not $it.Later) { $it.Empty.Add("series|$id") }
+}
+
+# ---- what one series is: radio and podcasts ----------------------------------------------
+# NRK lists each season with its episode count: a quick check reads only the seasons whose
+# count changed (or with no count: the first and last), plus the newest-episodes list.
+$script:IdxRadioWork = {
+    param($it)
+    $x = $script:Idx; $d = $it.Data; $id = [string]$d.Item.Id; $kind = [string]$d.Item.Kind
+    $info = Get-NrkRadioSeriesInfo -Kind $kind -Id $id
+    $stitle = if ($info.Title) { $info.Title } else { $d.Item.Title }
+    Add-SearchRow radioseries $id $stitle $d.Item.Description '' '' '' $kind
+    $now = @{}
+    foreach ($s in @(Get-Prop (Get-Prop $info.Raw '_embedded') 'seasons')) {
+        if ($s -and (Get-Prop $s 'id')) { $now[[string](Get-Prop $s 'id')] = '{0}/{1}' -f (Get-Prop $s 'episodeCount'), (Get-Prop $s 'hasAvailableEpisodes') }
+    }
+    $prev = $x.SeriesState[$it.Key]
+    $prevS = if ($prev -and $prev.S) { $prev.S } else { @{} }
+    $seasons = @($info.Seasons | Where-Object { $_ -and -not $x.Hidden.Contains("radioseason|$id|$($_.Name)") })
+    $edge = @{}; if ($seasons.Count) { $edge[[string]$seasons[0].Name] = 1; $edge[[string]$seasons[$seasons.Count - 1].Name] = 1 }
+    $quick = ($x.Mode -eq 'quick')
+    $split = $it.Split -and $it.Prio -ne 0
+    $reuse = @{}; $later = @{}; $want = @()
+    foreach ($sea in $seasons) {
+        $n = [string]$sea.Name
+        if ($now.ContainsKey($n)) { $it.Sigs[$n] = $now[$n] }
+        if ($split -and -not $sea.Newest -and -not $edge.ContainsKey($n)) { $later[$n] = 1; continue }
+        $can = $quick -and -not $sea.Newest -and $x.Store.HasSeason($it.Key, $n)
+        $same = if ($now.ContainsKey($n)) { $prevS[$n] -eq $now[$n] } else { -not $edge.ContainsKey($n) }
+        if ($can -and $same) { $reuse[$n] = 1 } elseif ($sea.Href) { $want += (Get-ApiPath radioepisodes -Id $sea.Href -Newest:$sea.Newest) }
+    }
+    $it.Later = $later.Count
+    Add-IndexPrefetch $want
+    foreach ($sea in $seasons) {
+        if ($later.ContainsKey([string]$sea.Name)) { continue }
+        if ($reuse.ContainsKey([string]$sea.Name)) {
+            $lines = $x.Store.OldSeason($it.Key, [string]$sea.Name, $x.NowS)
+            foreach ($l in $lines) { $it.Rows.Add($l) }
+            $it.EpCount += $lines.Length; $it.Reused++
+            continue
+        }
+        $eps = @(Get-NrkRadioEpisodes -Href $sea.Href -Kind $kind -SeriesId $id -SeriesTitle $info.Title -Newest:$sea.Newest)
+        $eps = @($eps | Where-Object { $_ -and -not $x.Hidden.Contains("file|audio|$($_.Id)") })
+        $it.EpCount += $eps.Count
+        if ($eps.Count -eq 0) { $it.Empty.Add("radioseason|$id|$($sea.Name)") }
+        foreach ($e in $eps) { Add-SearchRow radioepisode $e.Id $e.Title $e.Description $id $stitle $sea.Name $kind $e.Date -Rights $e }
+    }
+    if ($it.EpCount -eq 0 -and -not $it.Later) { $it.Empty.Add("radioseries|$kind|$id") }
+}
+
+$script:IdxSeriesCommit = {
+    param($it, $res)
+    $x = $script:Idx
+    $x.Commits++
+    if ($it.Later) {
+        # the newest seasons are in (searchable from the next save); the older ones come after every other new series
+        $x.Store.SetNew($it.Key, $it.Rows)
+        foreach ($e in $it.Empty) { $x.Empty.Add($e) }
+        $it.Data.FirstGo = $it.EpCount; $x.Episodes += $it.EpCount
+        $rest = New-IndexSeriesItem $it.Data 3 -Rest
+        if ($it.Prio -eq 0) { $x.PublishSoon = $true }
+        Write-Log INFO ('Indexer: {0}: {1} episodes in the newest season(s); {2} older season(s) later' -f $it.What, $it.EpCount, $it.Later)
+        return
+    }
+    if ($it.Data.FirstGo) { $x.Episodes -= [int]$it.Data.FirstGo; $it.Data.FirstGo = 0 }   # (counted again in full below)
+    if ($it.Split) { $x.PhaseDone++ }   # (done in one go after all: its second unit too)
+    $sig = [NrkIdxStore]::Sig($it.Rows)
+    $x.Store.SetNew($it.Key, $it.Rows)
+    foreach ($e in $it.Empty) { $x.Empty.Add($e) }
+    [void]$x.DoneIds.Add($(if ($it.Data.Kind -eq 'tv') { "tv:$($it.Data.Item.Id)" } else { "radio:$($it.Data.Item.Id)" }))
+    $x.Episodes += $it.EpCount; $x.ReusedSeasons += $it.Reused
+    $prev = $x.SeriesState[$it.Key]
+    $t = (Get-Date).ToString('o')
+    $changed = (-not $prev) -or ($prev.Sig -ne $sig)
+    if ($changed -and $prev) { $x.Changed++ }
+    $x.SeriesState[$it.Key] = @{ C = $t; Ch = $(if ($changed -or -not $prev.Ch) { $t } else { $prev.Ch }); Sig = $sig; S = $it.Sigs; D = $(if ($it.Reused -eq 0) { $t } elseif ($prev) { $prev.D } else { '' }) }
+    $note = @()
+    if ($it.Reused) { $note += "$($it.Reused) unchanged season(s) kept" }
+    if ($changed -and $prev) { $note += 'changed' }
+    if ($it.Prio -eq 0) { $note += 'asked for in the app'; $x.PublishSoon = $true }
+    Write-Log INFO ('Indexer: {0}: {1} episodes{2}' -f $it.What, $it.EpCount, $(if ($note) { ' (' + ($note -join ', ') + ')' } else { '' }))
+}
+
+function Add-IndexListing([string] $What, [scriptblock] $Read, [hashtable] $Map, [string] $EmptyKey, [string] $Where, [string] $Type) {
+    # one folder (a category or a letter): its series (and TV programmes) go on the list
+    $data = @{ Read = $Read; Map = $Map; EmptyKey = $EmptyKey; Where = $Where; Type = $Type }
+    [void](New-IndexItem $What { param($it) & $it.Data.Read $it.Data } {
+        param($it, $res)
+        $x = $script:Idx; $d = $it.Data
+        $items = @($res | Where-Object { $_ })
+        if ($items.Count -eq 0) { $x.Empty.Add($d.EmptyKey) }
+        foreach ($i in $items) {
+            if ($d.Type -eq 'tv') {
+                if ($i.Type -eq 'series') { Add-IndexSeries $x.Tv ([string]$i.Id) $i $d.Where }
+                elseif ($i.Type -eq 'program') { Add-IndexSeries $x.Programs ([string]$i.Id) $i $d.Where }
+            } elseif ($i.Type -eq 'radioseries') { Add-IndexSeries $x.Radio "$($i.Kind)|$($i.Id)" $i $d.Where }
+        }
+    } 2 '' $data)
+    $script:Idx.PhaseTotal++
+}
+
+function Invoke-Indexer([switch] $Full) {
     $mutex = New-Object System.Threading.Mutex($false, 'Local\NRK-Browser-Indexer')
     $owned = $false
     try { $owned = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
@@ -2242,161 +2912,158 @@ function Invoke-Indexer {
     $script:CacheMode = 'Daily'          # every catalogue/page is cacheable while indexing
     $script:CacheBypassUntil = [datetime]::MinValue
     $set = Read-JsonFile (Join-Path $script:AppDataDir 'settings.json')
-    if ($set -and $null -ne $set.IndexPaceMs) { $script:IndexPaceMs = [Math]::Max(0, [int]$set.IndexPaceMs) }
     if ($set -and $set.IndexFreshHours) { $script:IndexFreshMin = [Math]::Max(1, [int]$set.IndexFreshHours) * 60 }
     $prev = Read-JsonFile $script:IndexStatusFile
     New-Item -ItemType Directory -Path $script:IndexDir -Force | Out-Null
     Remove-Item -LiteralPath $script:IndexControlFile -Force -ErrorAction SilentlyContinue
-    # a run that was killed (shutdown, crash) leaves its unfinished list behind
+    # a run that was killed (shutdown, crash) leaves its unfinished files behind
     foreach ($t in @(Get-ChildItem -LiteralPath $script:IndexDir -Filter '*.tmp' -File -ErrorAction SilentlyContinue)) { try { Remove-Item -LiteralPath $t.FullName -Force } catch { } }
 
+    # several requests at once: .NET Framework allows only 2 connections per server by default
+    try { [Net.ServicePointManager]::DefaultConnectionLimit = [Math]::Max([Net.ServicePointManager]::DefaultConnectionLimit, 16) } catch { }
+    if (-not ('System.Net.Http.HttpClient' -as [type])) { Add-Type -AssemblyName System.Net.Http }
+    $handler = New-Object System.Net.Http.HttpClientHandler
+    $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    $http = New-Object System.Net.Http.HttpClient($handler)
+    $http.Timeout = [TimeSpan]::FromSeconds(30)
+    [void]$http.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', $script:UserAgent)
+    [void]$http.DefaultRequestHeaders.TryAddWithoutValidation('Accept', 'application/json')
+
+    # the last full check: from 2.9 (every run was one) the last run counts
+    $lastDeep = if ($prev -and $prev.LastDeep) { [string]$prev.LastDeep } elseif ($prev -and $prev.LastFull -and -not $prev.Mode) { [string]$prev.LastFull } else { $null }
+    $lastDeepSecs = if ($prev -and $prev.LastDeepSeconds) { $prev.LastDeepSeconds } elseif ($prev -and -not $prev.Mode) { $prev.LastFullSeconds } else { $null }
+    $mode = if ($Full -or -not (Test-Path -LiteralPath $script:SearchFile) -or (Get-IndexAgeHours $lastDeep) -gt $script:IndexDeepDays * 24) { 'full' } else { 'quick' }
+    $buckets = New-Object System.Collections.ArrayList
+    foreach ($i in 0..3) { [void]$buckets.Add((New-Object System.Collections.Queue)) }
+
     $script:Idx = @{
-        State = 'running'; Started = (Get-Date); Finished = $null; LastWrite = [datetime]::MinValue; ControlTime = $null
-        Phase = 'Starting'; PhaseNo = 0; PhaseDone = 0; PhaseTotal = 0; PhaseStarted = (Get-Date); PhasePaused = 0
-        Current = ''; Fetched = 0; Cached = 0; Errors = 0; LastError = ''; Backoff = 0; Episodes = 0
-        Tv = @{}; Radio = @{}; Programs = @{}
+        State = 'running'; Mode = $mode; Started = (Get-Date); Finished = $null; LastWrite = [datetime]::MinValue; ControlTime = $null
+        Phase = 'Starting'; PhaseNo = 0; PhaseDone = 0; PhaseTotal = 0; PhaseStarted = (Get-Date); PhasePaused = 0; Unit = ''
+        Current = ''; Fetched = 0; Cached = 0; Errors = 0; LastError = ''; Episodes = 0; ListErrors = 0
+        Unchanged = 0; ReusedSeasons = 0; Changed = 0
+        Tv = @{}; Radio = @{}; Programs = @{}; AllSeries = @{}; SeriesItems = @{}
         LastFull = $(if ($prev) { $prev.LastFull } else { $null }); LastFullSeconds = $(if ($prev) { $prev.LastFullSeconds } else { $null })
-        SearchTmp = Join-Path $script:IndexDir "search.$PID.tmp"; SearchW = $null
+        LastDeep = $lastDeep; LastDeepSeconds = $lastDeepSecs
+        SearchTmp = Join-Path $script:IndexDir "search.$PID.tmp"
         Empty = New-Object System.Collections.Generic.List[string]   # folders NRK has nothing in (hidden in the app)
+        DoneIds = New-Object 'System.Collections.Generic.HashSet[string]'
+        # the engine
+        Http = $http; Speed = ''; Parallel = 3; MinGap = 150; Gap = 150; NextSend = [datetime]::MinValue; LastSlow = [datetime]::MinValue
+        Buckets = $buckets; Ready = New-Object System.Collections.Queue; Waiting = 0
+        FetchHi = New-Object System.Collections.Queue; FetchLo = New-Object System.Collections.Queue
+        InFlight = @{}; Waiters = @{}; Tries = @{}; Retry = New-Object System.Collections.ArrayList; RetrySet = New-Object 'System.Collections.Generic.HashSet[string]'
+        PrioCheck = [datetime]::MinValue; PrioTime = $null; PrioSeen = New-Object 'System.Collections.Generic.HashSet[string]'
+        PrevEnd = $(try { if ($prev -and $prev.Finished) { [datetime]$prev.Finished } else { $null } } catch { $null }); EarlyPrio = New-Object System.Collections.Generic.List[string]; EarlyTerms = New-Object System.Collections.Generic.List[string]
+        PublishSoon = $false; LastPublish = Get-Date; NowS = (Get-Date).ToString('s'); Commits = 0; SameWrites = 0; Written = 0L
+        Store = New-Object NrkIdxStore; SeriesState = @{}
     }
     $x = $script:Idx
+    Set-IndexSpeed $(if ($set -and $set.IndexSpeed) { [string]$set.IndexSpeed } else { 'normal' })
     # what you hid (Options > Hidden items): never fetched or listed again
     $x.Hidden = New-Object 'System.Collections.Generic.HashSet[string]'
     $ex = Read-JsonFile (Join-Path $script:AppDataDir 'excluded.json')
     if ($ex) { foreach ($r in @($ex.Items | Where-Object { $_ -and $_.Key })) { [void]$x.Hidden.Add([string]$r.Key) } }
-    Write-Log INFO ("Indexer {0} started: pace {1} ms, entries younger than {2} h are skipped" -f $script:AppVersion, $script:IndexPaceMs, ($script:IndexFreshMin / 60))
+    Write-Log INFO ("Indexer {0} started: {1} check{2}, speed {3}, entries younger than {4} h are not fetched again" -f $script:AppVersion, $mode,
+        $(if ($mode -eq 'full' -and -not $Full) { $(if ($lastDeep) { " (the last full check was $([int]((Get-IndexAgeHours $lastDeep) / 24)) days ago)" } else { ' (the first one)' }) } else { '' }), $x.Speed, ($script:IndexFreshMin / 60))
     Write-IndexStatus -Force
     try {
         Remove-Item -LiteralPath $script:IndexFile -Force -ErrorAction SilentlyContinue   # (index.jsonl from older versions: nothing reads it)
-        $x.SearchW = New-Object System.IO.StreamWriter($x.SearchTmp, $false, (New-Object Text.UTF8Encoding($false)))
-        $x.SearchW.WriteLine("#nrkb-search 2")
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $oldRows = $x.Store.LoadOld($script:SearchFile)
+        $x.SeriesState = Read-IndexState
+        $oldEmpty = @()
+        try { if (Test-Path -LiteralPath $script:EmptyFile) { $oldEmpty = @([IO.File]::ReadAllLines($script:EmptyFile) | Where-Object { $_ }) } } catch { }
+        Write-Log INFO ("Indexer: the last run's list has {0:N0} entries in {1:N0} series; {2:N0} series have a saved state ({3} ms)" -f $oldRows, $x.Store.OldGroups, $x.SeriesState.Count, $sw.ElapsedMilliseconds)
+        Read-IndexPriority -Now
 
-        # 1. TV categories
-        $cats = @(); Invoke-IndexStep 'TV categories' { $script:IdxCats = @(Get-NrkCategories) }; $cats = @($script:IdxCats)
-        Start-IndexPhase 1 'TV categories' $cats.Count
-        foreach ($c in $cats) {
-            if ($x.Hidden.Contains("category|$($c.Id)")) { $x.PhaseDone++; continue }
-            Invoke-IndexStep "TV category $($c.Title)" {
-                $items = @(Get-NrkCategoryItems -PageId $c.Id)
-                if ($items.Count -eq 0) { $x.Empty.Add("category|$($c.Id)") }
-                foreach ($it in $items) {
-                    if ($it.Type -eq 'series') { Add-IndexSeries $x.Tv $it.Id $it $c.Title }
-                    elseif ($it.Type -eq 'program') { Add-IndexSeries $x.Programs $it.Id $it $c.Title }
-                }
-            }
-            $x.PhaseDone++
+        # 1. every folder: TV categories and A-Å, radio categories and A-Å (in parallel)
+        Start-IndexPhase 1 'Folders' 0 'folders'
+        $roots = @(
+            @{ What = 'TV categories'; Read = { @(Get-NrkCategories) }; Child = {
+                param($c) if ($script:Idx.Hidden.Contains("category|$($c.Id)")) { return }
+                Add-IndexListing "TV category $($c.Title)" ([scriptblock]::Create("@(Get-NrkCategoryItems -PageId '$($c.Id -replace "'", "''")')")) $script:Idx.Tv "category|$($c.Id)" $c.Title 'tv' } }
+            @{ What = 'TV A-Å'; Read = { @(Get-NrkLetters) }; Child = {
+                param($l) if ($script:Idx.Hidden.Contains("letter|$($l.Id)")) { return }
+                Add-IndexListing "TV letter $($l.Title)" ([scriptblock]::Create("@(Get-NrkLetterItems -Letter '$($l.Id -replace "'", "''")')")) $script:Idx.Tv "letter|$($l.Id)" '' 'tv' } }
+            @{ What = 'Radio categories'; Read = { @(Get-NrkRadioCategories) }; Child = {
+                param($c) if ($script:Idx.Hidden.Contains("radiocategory|$($c.Id)")) { return }
+                Add-IndexListing "Radio category $($c.Title)" ([scriptblock]::Create("@(Get-NrkRadioPageItems -PageId '$($c.Id -replace "'", "''")')")) $script:Idx.Radio "radiocategory|$($c.Id)" $c.Title 'radio' } }
+            @{ What = 'Radio A-Å'; Read = { @(Get-NrkRadioLetters) }; Child = {
+                param($l) if ($script:Idx.Hidden.Contains("radioletter|$($l.Id)")) { return }
+                Add-IndexListing "Radio letter $($l.Title)" ([scriptblock]::Create("@(Get-NrkRadioLetterItems -Letter '$($l.Id -replace "'", "''")')")) $script:Idx.Radio "radioletter|$($l.Id)" '' 'radio' } }
+        )
+        foreach ($r in $roots) {
+            [void](New-IndexItem $r.What { param($it) & $it.Data.Read } { param($it, $res) foreach ($c in @($res | Where-Object { $_ })) { & $it.Data.Child $c } } 1 '' $r $false)
         }
-        # 2. TV A-Å
-        $letters = @(); Invoke-IndexStep 'TV A-Å' { $script:IdxLetters = @(Get-NrkLetters) }; $letters = @($script:IdxLetters)
-        Start-IndexPhase 2 'TV A-Å' $letters.Count
-        foreach ($l in $letters) {
-            if ($x.Hidden.Contains("letter|$($l.Id)")) { $x.PhaseDone++; continue }
-            Invoke-IndexStep "TV letter $($l.Title)" {
-                $items = @(Get-NrkLetterItems -Letter $l.Id)
-                if ($items.Count -eq 0) { $x.Empty.Add("letter|$($l.Id)") }
-                foreach ($it in $items) {
-                    if ($it.Type -eq 'series') { Add-IndexSeries $x.Tv $it.Id $it '' }
-                    elseif ($it.Type -eq 'program') { Add-IndexSeries $x.Programs $it.Id $it '' }
-                }
-            }
-            $x.PhaseDone++
-        }
-        # 3. Radio categories
-        $rcats = @(); Invoke-IndexStep 'Radio categories' { $script:IdxRcats = @(Get-NrkRadioCategories) }; $rcats = @($script:IdxRcats)
-        Start-IndexPhase 3 'Radio categories' $rcats.Count
-        foreach ($c in $rcats) {
-            if ($x.Hidden.Contains("radiocategory|$($c.Id)")) { $x.PhaseDone++; continue }
-            Invoke-IndexStep "Radio category $($c.Title)" {
-                $items = @(Get-NrkRadioPageItems -PageId $c.Id)
-                if ($items.Count -eq 0) { $x.Empty.Add("radiocategory|$($c.Id)") }
-                foreach ($it in $items) {
-                    if ($it.Type -eq 'radioseries') { Add-IndexSeries $x.Radio "$($it.Kind)|$($it.Id)" $it $c.Title }
-                }
-            }
-            $x.PhaseDone++
-        }
-        # 4. Radio A-Å
-        $rl = @(); Invoke-IndexStep 'Radio A-Å' { $script:IdxRl = @(Get-NrkRadioLetters) }; $rl = @($script:IdxRl)
-        Start-IndexPhase 4 'Radio A-Å' $rl.Count
-        foreach ($l in $rl) {
-            if ($x.Hidden.Contains("radioletter|$($l.Id)")) { $x.PhaseDone++; continue }
-            Invoke-IndexStep "Radio letter $($l.Title)" {
-                $items = @(Get-NrkRadioLetterItems -Letter $l.Id)
-                if ($items.Count -eq 0) { $x.Empty.Add("radioletter|$($l.Id)") }
-                foreach ($it in $items) {
-                    if ($it.Type -eq 'radioseries') { Add-IndexSeries $x.Radio "$($it.Kind)|$($it.Id)" $it '' }
-                }
-            }
-            $x.PhaseDone++
-        }
-        foreach ($k in $x.Programs.Keys) {
-            $p = $x.Programs[$k]
-            Add-SearchRow tvprogram $p.Item.Id $p.Item.Title $p.Item.Description -Rights $p.Item
-        }
-        # 5. TV series: seasons and episode lists
-        Start-IndexPhase 5 'TV series' $x.Tv.Count
-        foreach ($k in @($x.Tv.Keys | Sort-Object)) {
-            $s = $x.Tv[$k]
-            Invoke-IndexStep "TV $($s.Item.Title)" {
-                $info = Get-NrkSeriesInfo -SeriesId $s.Item.Id
-                $total = 0
-                Add-SearchRow tvseries $s.Item.Id $s.Item.Title $s.Item.Description
-                foreach ($sea in @($info.Seasons)) {
-                    if ($x.Hidden.Contains("season|$($s.Item.Id)|$($sea.Name)")) { continue }
-                    $eps = @(Get-NrkSeasonEpisodes -SeriesId $s.Item.Id -Season $sea.Name | Where-Object { -not $x.Hidden.Contains("file|episode|$($_.Id)") })
-                    $x.Episodes += $eps.Count; $total += $eps.Count
-                    if ($eps.Count -eq 0) { $x.Empty.Add("season|$($s.Item.Id)|$($sea.Name)") }
-                    foreach ($e in $eps) { Add-SearchRow tvepisode $e.Id $e.Title $e.Subtitle $s.Item.Id $s.Item.Title $sea.Name -Rights $e }
-                }
-                if ($total -eq 0) { $x.Empty.Add("series|$($s.Item.Id)") }
-            }
-            $x.PhaseDone++
-        }
-        # 6. Radio series and podcasts
-        Start-IndexPhase 6 'Radio series and podcasts' $x.Radio.Count
-        foreach ($k in @($x.Radio.Keys | Sort-Object)) {
-            $s = $x.Radio[$k]
-            Invoke-IndexStep "Radio $($s.Item.Title)" {
-                $info = Get-NrkRadioSeriesInfo -Kind $s.Item.Kind -Id $s.Item.Id
-                $total = 0
-                $stitle = if ($info.Title) { $info.Title } else { $s.Item.Title }
-                Add-SearchRow radioseries $s.Item.Id $stitle $s.Item.Description '' '' '' $s.Item.Kind
-                foreach ($sea in @($info.Seasons)) {
-                    if ($x.Hidden.Contains("radioseason|$($s.Item.Id)|$($sea.Name)")) { continue }
-                    $eps = @(Get-NrkRadioEpisodes -Href $sea.Href -Kind $s.Item.Kind -SeriesId $s.Item.Id -SeriesTitle $info.Title -Newest:$sea.Newest)
-                    $eps = @($eps | Where-Object { -not $x.Hidden.Contains("file|audio|$($_.Id)") })
-                    $x.Episodes += $eps.Count; $total += $eps.Count
-                    if ($eps.Count -eq 0) { $x.Empty.Add("radioseason|$($s.Item.Id)|$($sea.Name)") }
-                    foreach ($e in $eps) { Add-SearchRow radioepisode $e.Id $e.Title $e.Description $s.Item.Id $stitle $sea.Name $s.Item.Kind $e.Date -Rights $e }
-                }
-                if ($total -eq 0) { $x.Empty.Add("radioseries|$($s.Item.Kind)|$($s.Item.Id)") }
-            }
-            $x.PhaseDone++
-        }
+        Invoke-IndexEngine
+        $x.ListErrors = $x.Errors   # (a folder that could not be read: what it had last time stays in search)
 
-        $x.SearchW.Close(); $x.SearchW = $null
-        Move-Item -LiteralPath $x.SearchTmp -Destination $script:SearchFile -Force
-        # only a complete walk knows what is empty
+        # 2. series and podcasts: which to check this time, most wanted first
+        $fav = Get-IndexFavouriteKeys
+        $all = New-Object System.Collections.ArrayList
+        foreach ($k in $x.Tv.Keys) { $s = $x.Tv[$k]; [void]$all.Add(@{ Key = "series|$($s.Item.Id)"; Kind = 'tv'; Item = $s.Item }) }
+        foreach ($k in $x.Radio.Keys) { $s = $x.Radio[$k]; [void]$all.Add(@{ Key = "radioseries|$($s.Item.Kind)|$($s.Item.Id)"; Kind = 'radio'; Item = $s.Item }) }
+        $due = New-Object System.Collections.ArrayList
+        $fresh = $script:IndexFreshMin / 60
+        foreach ($d in $all) {
+            $d.TitleLower = ([string]$d.Item.Title).ToLowerInvariant()
+            $x.AllSeries[$d.Key] = $d
+            $x.Store.SetFallback($d.Key, $(if ($d.Kind -eq 'tv') { Format-SearchRow tvseries $d.Item.Id $d.Item.Title $d.Item.Description } else { Format-SearchRow radioseries $d.Item.Id $d.Item.Title $d.Item.Description '' '' '' $d.Item.Kind }))
+            $st = $x.SeriesState[$d.Key]
+            $hasOld = $x.Store.HasOld($d.Key)
+            $checked = if ($st) { Get-IndexAgeHours $st.C } else { [double]::MaxValue }
+            if (-not $hasOld -or -not $st) { $prio = 2; $isDue = $true }
+            elseif ($mode -eq 'full') { $prio = $(if ($fav.Contains($d.Key)) { 1 } else { 3 }); $isDue = (Get-IndexAgeHours $st.D) -ge $fresh }   # (a stopped full check goes on where it was)
+            elseif ($fav.Contains($d.Key)) { $prio = 1; $isDue = $checked -ge $fresh }
+            else {
+                # quiet series less often: about a quarter of the time since it last changed, 1 to 14 days
+                $every = [Math]::Min($script:IndexRevisitDays * 24, [Math]::Max($fresh, (Get-IndexAgeHours $st.Ch) / 4))
+                $prio = 3; $isDue = $checked -ge $every
+            }
+            if ($isDue) { $d.Prio = $prio; $d.Checked = $checked; [void]$due.Add($d) }
+            else { $x.Unchanged++; $x.Episodes += $x.Store.OldEpisodes($d.Key, $x.NowS) }
+        }
+        # the old empty-folder notes of series not looked at this time stay
+        Start-IndexPhase 2 'Series and podcasts' $due.Count 'series'
+        foreach ($d in @($due | Sort-Object @{ e = { $_.Prio } }, @{ e = { $_.Checked }; Descending = $true })) { [void](New-IndexSeriesItem $d $d.Prio) }
+        Write-Log INFO ("Indexer: {0:N0} TV series, {1:N0} programmes, {2:N0} radio series/podcasts; {3:N0} to check now, {4:N0} unchanged lately (kept as they were)" -f $x.Tv.Count, $x.Programs.Count, $x.Radio.Count, $due.Count, $x.Unchanged)
+        foreach ($k in @($x.EarlyPrio)) { [void](Move-IndexItemUp $k) }
+        foreach ($q in @($x.EarlyTerms)) { foreach ($d in @($x.AllSeries.Values)) { if ($d.TitleLower.Contains($q)) { [void](Move-IndexItemUp $d.Key) } } }
+        # search finds every series from here on (not needed when the list has every one already)
+        $newNames = @($x.AllSeries.Keys | Where-Object { -not $x.Store.HasOld($_) }).Count
+        if ($newNames -gt 0 -or $x.Store.OldGroups -gt ($x.AllSeries.Count - $newNames)) { Publish-IndexSearch 'every series name from the folders' }
+        else { $x.LastPublish = Get-Date }
+        Invoke-IndexEngine
+
+        $x.NowS = (Get-Date).ToString('s')
+        Publish-IndexSearch 'finished'
+        # only a complete walk knows what is empty (series not looked at this time keep their notes)
+        foreach ($l in $oldEmpty) {
+            $p = $l.Split('|')
+            $id = if ($p[0] -in 'season', 'series') { "tv:$($p[1])" } elseif ($p[0] -eq 'radioseason') { "radio:$($p[1])" } elseif ($p[0] -eq 'radioseries' -and $p.Count -ge 3) { "radio:$($p[2])" } else { $null }
+            if ($id -and -not $x.DoneIds.Contains($id)) { $x.Empty.Add($l) }
+        }
         [IO.File]::WriteAllLines($script:EmptyFile, [string[]]@($x.Empty | Select-Object -Unique), (New-Object Text.UTF8Encoding($false)))
         $x.State = 'done'
-        $x.LastFull = (Get-Date).ToString('o'); $x.LastFullSeconds = [int]((Get-Date) - $x.Started).TotalSeconds
+        $secs = [int]((Get-Date) - $x.Started).TotalSeconds
+        $x.LastFull = (Get-Date).ToString('o'); $x.LastFullSeconds = $secs
+        if ($mode -eq 'full') { $x.LastDeep = $x.LastFull; $x.LastDeepSeconds = $secs }
         $x.Phase = 'Finished'; $x.Current = ''
-        Write-Log INFO ("Indexer finished in {0:N0} min: {1} TV series, {2} programmes, {3} radio series/podcasts, {4} episodes; {5} requests, {6} up to date, {7} errors" -f `
-            ($x.LastFullSeconds / 60), $x.Tv.Count, $x.Programs.Count, $x.Radio.Count, $x.Episodes, $x.Fetched, $x.Cached, $x.Errors)
+        Write-Log INFO ("Indexer finished ({0} check) in {1}: {2} TV series, {3} programmes, {4} radio series/podcasts, {5} episodes; {6} requests, {7} up to date, {8} series unchanged lately, {9} seasons kept, {10} errors; {11} pages unchanged (not written again), {12:N1} MB written" -f `
+            $mode, (Format-IndexSpan $secs), $x.Tv.Count, $x.Programs.Count, $x.Radio.Count, $x.Episodes, $x.Fetched, $x.Cached, $x.Unchanged, $x.ReusedSeasons, $x.Errors, $x.SameWrites, ($x.Written / 1MB))
     } catch {
         if ($_.Exception -is [System.OperationCanceledException] -or $_.Exception.InnerException -is [System.OperationCanceledException] -or $x.State -eq 'stopping') {
             $x.State = 'stopped'; $x.Current = ''
-            # no search list yet: the part found so far is better than nothing
-            if (-not (Test-Path -LiteralPath $script:SearchFile) -and $x.SearchW) {
-                try { $x.SearchW.Close(); $x.SearchW = $null; Move-Item -LiteralPath $x.SearchTmp -Destination $script:SearchFile -Force } catch { }
-            }
+            # what this run did so far is kept (the next run goes on from there)
+            if ($x.PhaseNo -ge 2) { $x.NowS = (Get-Date).ToString('s'); Publish-IndexSearch 'stopped' }
             Write-Log INFO ("Indexer stopped: {0} requests, {1} up to date. The next run continues from the saved data." -f $x.Fetched, $x.Cached)
         } else {
             $x.State = 'failed'; $x.LastError = $_.Exception.Message
             Write-LogException $_ 'Indexer'
         }
     } finally {
-        if ($x.SearchW) { try { $x.SearchW.Close() } catch { } }
+        foreach ($f in @($x.InFlight.Values)) { try { if (-not $f.Task.IsCompleted) { [void]$f.Task.Wait(2000) } } catch { } }
+        try { $http.Dispose() } catch { }
         Remove-Item -LiteralPath $x.SearchTmp -Force -ErrorAction SilentlyContinue
         $x.Finished = (Get-Date).ToString('o')
         Write-IndexStatus -Force
@@ -2404,6 +3071,13 @@ function Invoke-Indexer {
         try { $mutex.ReleaseMutex() } catch { }
         $mutex.Dispose()
     }
+}
+
+function Format-IndexSpan([double] $Seconds) {
+    if ($Seconds -lt 60) { return '{0:N0} s' -f $Seconds }
+    $t = [TimeSpan]::FromSeconds($Seconds)
+    if ($t.TotalHours -ge 1) { return '{0} h {1} min' -f [int][Math]::Floor($t.TotalHours), $t.Minutes }
+    return '{0} min' -f [int][Math]::Ceiling($t.TotalMinutes)
 }
 
 #endregion
@@ -2472,7 +3146,7 @@ if ($SelfTest) { $script:CacheBypassUntil = [datetime]::MaxValue; Invoke-SelfTes
 if ($Index) {
     # the indexer has its own day-file next to the app's logs
     if ($script:LogDir) { $script:LogFile = Join-Path $script:LogDir ('NRK-Indexer_{0}.log' -f (Get-Date -Format 'yyyy-MM-dd')) }
-    Invoke-Indexer; return
+    Invoke-Indexer -Full:$IndexFull; return
 }
 if ($NoGui) { return }
 
@@ -3420,7 +4094,7 @@ $script:SettingDefaults = [ordered]@{
     VideoPlayer = 'builtin'   # programmes/episodes: builtin (our own player) or web (NRK's page)
     ResumePlayback = $false; LastPlayed = ''   # continue where you left off (LastPlayed: JSON)
     IndexAuto = $true   # run the indexer by itself when the saved data is more than a day old
-    IndexPaceMs = 1000; IndexFreshHours = 20; IndexSchedule = $false; IndexTime = '03:00'   # the Indexer
+    IndexSpeed = 'normal'; IndexFreshHours = 20; IndexSchedule = $false; IndexTime = '03:00'   # the Indexer
     SortOrder = 'desc'   # folders and files: desc (Z-A), asc (A-Z) or nrk (NRK's own order)
     LogDays = 3   # days of log files to keep (settings.json only)
     ListDescriptions = $true   # files list: the description on a second line
@@ -3552,7 +4226,7 @@ function Update-InstallProgress {
             $u.Counter.Text = 'Step {0} of {1}' -f [Math]::Max(1, $st.Step), $st.Total
             # a running step counts as half done so the bar moves as soon as it starts
             $doneSteps = [Math]::Max(0, $st.Step - 1) + 0.5
-            $u.Fill.Width = [int]($u.Track.Width * [Math]::Min(1, $doneSteps / $st.Total))
+            $u.Fill.Width = [int]($u.Track.Width * [Math]::Min(1.0, [double]$doneSteps / $st.Total))
         }
     }
 
@@ -4308,6 +4982,33 @@ function Set-Status([string] $Text) {
     $statusLabel.Refresh()
 }
 
+# ---- slow-load notes (2.10.2) --------------------------------------------------------------
+# Opening a folder, filling the tree or the file list that took longer than expected is noted in
+# diagnostics\perf.jsonl (one JSON line each: what, how long per stage, how many items, how many
+# requests went to NRK). Nothing is shown; it is there to look at later. Kept small (about 1 MB,
+# plus the previous file), and the same folder is noted at most once a minute.
+$script:NetGets = 0
+$script:PerfLimits = @{ folder = 800; tree = 600; list = 200 }   # ms
+$script:PerfSeen = @{}
+function Write-PerfNote([string] $Area, [string] $Kind, [string] $Title, [long] $Ms, $Stages, [int] $Net) {
+    try {
+        $limit = [int]$script:PerfLimits[$Area]
+        if (-not $limit -or $Ms -lt $limit -or -not $script:AppDataDir) { return }
+        $k = "$Area|$Kind|$Title"
+        if ($script:PerfSeen[$k] -and ((Get-Date) - $script:PerfSeen[$k]).TotalSeconds -lt 60) { return }
+        $script:PerfSeen[$k] = Get-Date
+        $dir = Join-Path $script:AppDataDir 'diagnostics'
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $file = Join-Path $dir 'perf.jsonl'
+        if ((Test-Path -LiteralPath $file) -and (Get-Item -LiteralPath $file).Length -gt 1MB) { Move-Item -LiteralPath $file -Destination (Join-Path $dir 'perf.1.jsonl') -Force }
+        $rec = [ordered]@{ At = (Get-Date).ToString('s'); Version = $script:AppVersion; Area = $Area; Kind = $Kind; Title = $Title; Ms = $Ms; LimitMs = $limit; Requests = $Net }
+        if ($Stages) { foreach ($s in $Stages.Keys) { $rec[$s] = $Stages[$s] } }
+        $rec.PS = '{0} {1}' -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion
+        [IO.File]::AppendAllText($file, (($rec | ConvertTo-Json -Compress -Depth 3) + "`r`n"), (New-Object Text.UTF8Encoding($false)))
+        Write-Log DEBUG ("Slow {0} '{1}': {2} ms (expected under {3} ms) - noted in diagnostics\perf.jsonl" -f $Area, $Title, $Ms, $limit)
+    } catch { }
+}
+
 function Invoke-Ui {
     # Runs a UI action with a wait cursor; logs and shows any error instead of crashing.
     param([string] $What, [scriptblock] $Action)
@@ -4484,7 +5185,16 @@ function Sort-ByTitle {
 function Set-NodeChildren {
     # Replaces a folder's children, remembering NRK's order and showing them in the chosen sort order.
     param([System.Windows.Forms.TreeNode] $Parent, [object[]] $Children)
-    $kids = @($Children | Where-Object { $_ -and -not (Test-KnownEmpty $_) -and -not (Test-Excluded (Get-NodeKey $_)) })
+    # (2.10.2: one pass, the folder's key worked out once: "empty" and "hidden" are both looked up with it)
+    $ex = Get-ExcludedMap; $empty = $script:KnownEmpty
+    $kids = New-Object System.Collections.Generic.List[object]
+    foreach ($c in $Children) {
+        if (-not $c) { continue }
+        $k = Get-NodeKey $c
+        if ($k -and ($empty.Contains($k) -or $ex.ContainsKey($k))) { continue }
+        $kids.Add($c)
+    }
+    $kids = $kids.ToArray()
     for ($i = 0; $i -lt $kids.Count; $i++) { if ($kids[$i].Tag -is [hashtable] -and $null -eq $kids[$i].Tag.Order) { $kids[$i].Tag.Order = $i } }
     $sorted = Sort-ByTitle $kids { param($n) if ($n.Tag.Title) { $n.Tag.Title } else { $n.Text } } { param($n) [int]$n.Tag.Order }
     $Parent.Nodes.Clear()
@@ -4592,44 +5302,54 @@ function Expand-FolderNode {
     if ($tag.Loaded) { return $true }
     # (a hashtable, because the Invoke-Ui script block runs in a child scope)
     $result = @{ Ok = $false }
+    $perf = [Diagnostics.Stopwatch]::StartNew(); $net0 = $script:NetGets; $stage = [ordered]@{}
     Invoke-Ui "Loading $($tag.Kind) $($tag.Title)" {
-        $children = @()
+        # (2.10.2: a list that grows in place; "+=" copied the whole array for every folder added)
+        $children = New-Object System.Collections.Generic.List[object]
         switch ($tag.Kind) {
             { $_ -in 'category', 'letter' } {
                 $items = if ($tag.Kind -eq 'category') { @(Get-Cached "cat:$($tag.Id)" { Get-NrkCategoryItems -PageId $tag.Id }) }
                          else { @(Get-Cached "letter:$($tag.Id)" { Get-NrkLetterItems -Letter $tag.Id }) }
                 $tag.Items = $items
-                foreach ($s in $items | Where-Object Type -eq 'series') {
-                    $children += New-FolderNode $s.Title @{ Kind = 'series'; Title = $s.Title; Item = $s } -Lazy
+                $stage.Data = $perf.ElapsedMilliseconds
+                foreach ($s in $items) {
+                    if ($s.Type -eq 'series') { $children.Add((New-FolderNode $s.Title @{ Kind = 'series'; Title = $s.Title; Item = $s } -Lazy)) }
                 }
             }
             { $_ -in 'radiocategory', 'radioletter' } {
                 $items = if ($tag.Kind -eq 'radioletter') { @(Get-Cached "rletter:$($tag.Id)" { Get-NrkRadioLetterItems -Letter $tag.Id }) }
                          else { @(Get-Cached "rcat:$($tag.Id)" { Get-NrkRadioPageItems -PageId $tag.Id }) }
                 $tag.Items = $items
-                foreach ($s in $items | Where-Object Type -eq 'radioseries') {
-                    $children += New-FolderNode $s.Title @{ Kind = 'radioseries'; Title = $s.Title; Item = $s } -Lazy
+                $stage.Data = $perf.ElapsedMilliseconds
+                foreach ($s in $items) {
+                    if ($s.Type -eq 'radioseries') { $children.Add((New-FolderNode $s.Title @{ Kind = 'radioseries'; Title = $s.Title; Item = $s } -Lazy)) }
                 }
             }
             'radioseries' {
                 $info = @(Get-Cached "rseries:$($tag.Item.Kind):$($tag.Item.Id)" { Get-NrkRadioSeriesInfo -Kind $tag.Item.Kind -Id $tag.Item.Id })[0]
                 $tag.Info = $info
+                $stage.Data = $perf.ElapsedMilliseconds
                 foreach ($s in $info.Seasons) {
-                    $children += New-FolderNode $s.Title @{ Kind = 'radioseason'; Title = $s.Title; Season = $s; Item = $tag.Item; Info = $info }
+                    $children.Add((New-FolderNode $s.Title @{ Kind = 'radioseason'; Title = $s.Title; Season = $s; Item = $tag.Item; Info = $info }))
                 }
             }
             'series' {
                 $info = Get-Cached "series:$($tag.Item.Id)" { Get-NrkSeriesInfo -SeriesId $tag.Item.Id }
                 $info = @($info)[0]
                 $tag.Info = $info
+                $stage.Data = $perf.ElapsedMilliseconds
                 foreach ($s in $info.Seasons) {
-                    $children += New-FolderNode $s.Title @{ Kind = 'season'; Title = $s.Title; Season = $s.Name; Item = $tag.Item; Info = $info }
+                    $children.Add((New-FolderNode $s.Title @{ Kind = 'season'; Title = $s.Title; Season = $s.Name; Item = $tag.Item; Info = $info }))
                 }
             }
         }
+        $stage.Folders = $perf.ElapsedMilliseconds - [int]$stage.Data
+        $t0 = $perf.ElapsedMilliseconds
         $folderTree.BeginUpdate()
-        Set-NodeChildren $Node $children
+        Set-NodeChildren $Node $children.ToArray()
         $folderTree.EndUpdate()
+        $stage.Tree = $perf.ElapsedMilliseconds - $t0
+        $stage.Count = $children.Count
         $tag.Loaded = $true; $tag.LoadedAt = Get-Date
         $result.Ok = $true
         # loaded fine, but nothing in it: hide it
@@ -4637,6 +5357,7 @@ function Expand-FolderNode {
         if ($Node.Nodes.Count -eq 0 -and -not $hasFiles) { $result.Empty = $true }
     }
     if ($result.Empty) { Hide-EmptyNode $Node }
+    if ($result.Ok) { Write-PerfNote 'tree' $tag.Kind ([string]$tag.Title) $perf.ElapsedMilliseconds $stage ($script:NetGets - $net0) }
     if ($result.Ok) { try { Request-FolderPrefetch $Node } catch { Write-Log DEBUG "Prefetch: $($_.Exception.Message)" } }
     if (-not $result.Ok) {
         $Node.Nodes.Clear()
@@ -4957,6 +5678,7 @@ function Invoke-SearchAll([string] $Query) {
     $n = [NrkSearch]::Load($script:SearchFile)
     $flt = Get-SearchFilter
     $hits = [NrkSearch]::Find($q, $script:SearchMax, $flt.Types, $flt.Available, (Get-Date).ToString('s'), $flt.YearMin, $flt.YearMax)
+    Add-IndexPriority -Term $q   # (2.10.0: series with this in the name are indexed next)
     $folders = New-Object System.Collections.Generic.List[object]
     $files = New-Object System.Collections.Generic.List[object]
     $seriesItems = @{}
@@ -4982,7 +5704,8 @@ function Invoke-SearchAll([string] $Query) {
     if ($folderTree.SelectedNode -eq $script:SearchNode) { Open-Folder $script:SearchNode } else { $folderTree.SelectedNode = $script:SearchNode }
     $script:SearchNode.Expand()
     $more = if ($hits.Count -ge $script:SearchMax) { "  ·  showing the best $($script:SearchMax): add a word to narrow it down" } else { '' }
-    Set-Status ("'{0}': {1} series (folders), {2} programmes and episodes (files){3}{4}" -f $q, $folders.Count, $files.Count, $more, $(if ($flt.Note) { "  ·  filters: $($flt.Note)" } else { '' }))
+    $idx = if ((Get-IndexerState).Running) { "  ·  the indexer is checking series named like this first: search again in a moment for more" } else { '' }
+    Set-Status ("'{0}': {1} series (folders), {2} programmes and episodes (files){3}{4}{5}" -f $q, $folders.Count, $files.Count, $more, $(if ($flt.Note) { "  ·  filters: $($flt.Note)" } else { '' }), $idx)
 }
 
 # ---- search filters (the button next to the search box) -------------------------------------
@@ -5621,7 +6344,7 @@ $script:WatchDraw = {
     $d = [double]$r.Dur
     if ($d -le 0 -or [double]$r.Pos -lt 15) { return }
     $G.FillRectangle((Get-Brush $T.Border), $x0, $y, $w, 2)
-    $G.FillRectangle((Get-Brush $T.Accent), $x0, $y, [int]($w * [Math]::Min(1, [double]$r.Pos / $d)), 2)
+    $G.FillRectangle((Get-Brush $T.Accent), $x0, $y, [int]($w * [Math]::Min(1.0, [double]$r.Pos / $d)), 2)
 }
 
 # ---- empty folders ---------------------------------------------------------------------
@@ -5639,7 +6362,6 @@ function Read-KnownEmpty {
     foreach ($k in $script:EmptyNow) { [void]$script:KnownEmpty.Add($k) }
 }
 
-function Test-KnownEmpty($Node) { return $script:KnownEmpty.Contains((Get-NodeKey $Node)) }
 
 function Hide-EmptyNode($Node) {
     # after the current event has finished (the folder may be the one being opened)
@@ -5780,10 +6502,16 @@ $script:ShownCache = @{ Key = ''; List = @() }
 function Get-ShownFiles {
     # $script:Files in display order, sorted once per folder (not on every keystroke of the filter)
     $all = @($script:Files)
-    $files = @($all | Where-Object { $_.Type -ne 'more' -and -not (Test-Excluded (Get-FileKey $_)) })
-    $tail = @($all | Where-Object { $_.Type -eq 'more' })
-    $key = '{0}|{1}|{2}|{3}|{4}' -f [System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($script:Files), $files.Count, (Get-SortOrder), [bool]$script:FilesNoSort, $script:ExcludedVer
+    # (2.10.2: the cache is checked before anything is filtered: a keystroke costs nothing here)
+    $key = '{0}|{1}|{2}|{3}|{4}' -f [System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($script:Files), $all.Count, (Get-SortOrder), [bool]$script:FilesNoSort, $script:ExcludedVer
     if ($script:ShownCache.Key -eq $key) { return ,$script:ShownCache.List }
+    $ex = Get-ExcludedMap
+    $files = New-Object System.Collections.Generic.List[object]; $tail = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $all) {
+        if ($f.Type -eq 'more') { $tail.Add($f) }
+        elseif (-not $ex.ContainsKey((Get-FileKey $f))) { $files.Add($f) }
+    }
+    $files = $files.ToArray(); $tail = $tail.ToArray()
     $shown = $files
     if (-not $script:FilesNoSort -and $files.Count -gt 1 -and @($files | Where-Object { $_.Type -notin 'live', 'radiolive' }).Count -gt 0) {
         $pos = @{}; for ($i = 0; $i -lt $files.Count; $i++) { $pos[[System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode($files[$i])] = $i }
@@ -5803,7 +6531,15 @@ function Get-ShownFiles {
 }
 
 function Show-Files {
+    $perf = [Diagnostics.Stopwatch]::StartNew()
     $q = $search.Text.Trim()
+    # 2.10.1: the filter belongs to the folder it was typed in: another folder starts unfiltered
+    # (typing "19" to find a series, then opening its season, left that season looking empty)
+    if ($q -and $script:FilterNode -and -not [object]::ReferenceEquals($folderTree.SelectedNode, $script:FilterNode)) {
+        $script:FilterSkip = $true
+        try { $search.Text = '' } finally { $script:FilterSkip = $false }
+        $script:FilterNode = $null; $q = ''
+    }
     $itemsList.BeginUpdate()
     $itemsList.Items.Clear()
     $n = 0
@@ -5830,32 +6566,59 @@ function Show-Files {
     Initialize-GridView (Test-GridView)
     $itemsList.Tag = if ($wantTall) { 'two' } else { '' }
     $hideWatched = [bool](Get-AppSettings).HideWatched
+    $nWatched = 0; $nFiltered = 0
+    # (2.10.2: each file's row is made once - text, second line, icon, colour - and kept on the file
+    #  until the day, the theme or the second-line setting changes; typing in the filter only picks rows)
+    $stamp = '{0}|{1}|{2}' -f (Get-Date).ToString('yyyyMMdd'), $T.Muted.ToArgb(), $two
+    $rows = New-Object System.Collections.Generic.List[System.Windows.Forms.ListViewItem]
+    $sel = $null
     foreach ($f in $shown) {
-        if ($hideWatched -and (Test-Watched $f)) { continue }
-        $label = if ($f.ListTitle) { [string]$f.ListTitle } else { [string]$f.Title }
-        if ($q -and ($label -notmatch [regex]::Escape($q)) -and ($f.Description -notmatch [regex]::Escape($q)) -and ($f.Id -notmatch [regex]::Escape($q))) { continue }
-        $icon = switch ($f.Type) { 'program' { 'program' } 'live' { 'live' } 'radiolive' { 'live' } 'episode' { 'episode' } 'audio' { 'episode' } default { 'other' } }
-        # going soon (two weeks or less): how long it is still there
-        $left = ''
-        if ($f.Type -in 'episode', 'audio', 'program') { $dl = Get-DaysLeft ([string]$f.AvailableTo); if ($null -ne $dl -and $dl -ge 0 -and $dl -le 14) { $left = Format-AvailableUntil $f -Short } }
-        $second = switch ($f.Type) {
-            { $_ -in 'live', 'radiolive' } { if ($f.District) { 'regional' } else { '' } }
-            'episode' { (@($f.Duration, $left) | Where-Object { $_ }) -join '  ·  ' }
-            'audio' { (@($f.Date, $f.Duration, $left) | Where-Object { $_ }) -join '  ·  ' }
-            'program' { $left }
-            default { '' }
+        if ($hideWatched -and (Test-Watched $f)) { $nWatched++; continue }
+        $rc = $f.PSObject.Properties['RowCache']
+        if (-not $rc -or $rc.Value.Stamp -ne $stamp) {
+            $label = if ($f.ListTitle) { [string]$f.ListTitle } else { [string]$f.Title }
+            $icon = switch ($f.Type) { 'program' { 'program' } 'live' { 'live' } 'radiolive' { 'live' } 'episode' { 'episode' } 'audio' { 'episode' } default { 'other' } }
+            # going soon (two weeks or less): how long it is still there
+            $left = ''
+            if ($f.Type -in 'episode', 'audio', 'program') { $dl = Get-DaysLeft ([string]$f.AvailableTo); if ($null -ne $dl -and $dl -ge 0 -and $dl -le 14) { $left = Format-AvailableUntil $f -Short } }
+            $second = switch ($f.Type) {
+                { $_ -in 'live', 'radiolive' } { if ($f.District) { 'regional' } else { '' } }
+                'episode' { (@($f.Duration, $left) | Where-Object { $_ }) -join '  ·  ' }
+                'audio' { (@($f.Date, $f.Duration, $left) | Where-Object { $_ }) -join '  ·  ' }
+                'program' { $left }
+                default { '' }
+            }
+            $dim = (-not $f.Playable) -or ($f.Type -in 'episode', 'audio' -and -not (Test-FileAvailable $f))
+            $item = New-Object System.Windows.Forms.ListViewItem($label)
+            [void]$item.SubItems.Add([string]$second)
+            $item.ImageKey = $icon
+            if ($dim) { $item.ForeColor = $T.Muted }
+            $item.Tag = $f
+            $f | Add-Member -NotePropertyName RowCache -NotePropertyValue @{ Stamp = $stamp; Item = $item; Find = ('{0}{1}{2}{1}{3}' -f $label, "`n", [string]$f.Description, [string]$f.Id) } -Force
+            $rc = $f.PSObject.Properties['RowCache']
         }
-        $dim = (-not $f.Playable) -or ($f.Type -in 'episode', 'audio' -and -not (Test-FileAvailable $f))
-        $row = Add-DarkListRow $itemsList $label ([string]$second) $f $icon -Dim:$dim
-        if ($script:SelectedFile -and $f -eq $script:SelectedFile) { $row.Selected = $true }
+        $c = $rc.Value
+        if ($q -and $c.Find.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -lt 0) { $nFiltered++; continue }
+        $c.Item.Selected = $false
+        $rows.Add($c.Item)
+        if ($script:SelectedFile -and $f -eq $script:SelectedFile) { $sel = $c.Item }
         $n++
     }
+    if ($rows.Count) { $itemsList.Items.AddRange($rows.ToArray()) }
+    if ($sel) { $sel.Selected = $true }
     $itemsList.EndUpdate()
     $total = @($script:Files).Count
     $folder = $folderTree.SelectedNode
     $what = switch (@($script:Files | Select-Object -First 1).Type) { 'live' { 'channels' } 'radiolive' { 'channels' } 'episode' { 'episodes' } 'audio' { 'recordings' } default { 'files' } }
-    Set-ItemsHeader $(if ($folder) { '{0}  ·  {1} {2}' -f $folder.Tag.Title, $total, $what } else { 'Pick a folder' })
+    # (2.10.1: say so when files are left out, so a short or empty list never looks like a fault)
+    $hid = @()
+    if ($nFiltered) { $hid += ('{0} not matching "{1}" (Esc clears)' -f $nFiltered, $q) }
+    if ($nWatched) { $hid += ('{0} watched hidden' -f $nWatched) }
+    Set-ItemsHeader $(if (-not $folder) { 'Pick a folder' }
+                      elseif ($hid) { '{0}  ·  {1} of {2} {3} shown  ·  {4}' -f $folder.Tag.Title, $n, $total, $what, ($hid -join ', ') }
+                      else { '{0}  ·  {1} {2}' -f $folder.Tag.Title, $total, $what })
     if ($q) { Set-Status ('{0} of {1} {2} match "{3}"' -f $n, $total, $what, $q) }
+    if ($folder) { Write-PerfNote 'list' ([string]$folder.Tag.Kind) ([string]$folder.Tag.Title) $perf.ElapsedMilliseconds ([ordered]@{ Count = $total; Shown = $n; Filter = [bool]$q }) 0 }
 }
 
 function Set-Preview {
@@ -6094,6 +6857,7 @@ function Open-Folder {
     $tag = $Node.Tag
     if (-not $tag -or $tag.Kind -eq 'placeholder') { return }
     Write-Log INFO ("UI: folder {0} '{1}'" -f $tag.Kind, $tag.Title)
+    $perf = [Diagnostics.Stopwatch]::StartNew(); $net0 = $script:NetGets
     $script:SelectedFile = $null
     $script:Files = @()
     $script:FilesNoSort = ($tag.Kind -in $script:MixedKinds)   # newest first / best match first / soonest gone first
@@ -6200,9 +6964,14 @@ function Open-Folder {
         }
     }
     if ($loaded.Ok -and $tag.Kind -in 'season', 'radioseason' -and @($script:Files).Count -eq 0) { Hide-EmptyNode $Node }
+    $stage = [ordered]@{ Data = $perf.ElapsedMilliseconds }
     Show-Files
+    $stage.List = $perf.ElapsedMilliseconds - $stage.Data
     Show-FolderPreview
     Update-Actions; Update-Crumb
+    $stage.Details = $perf.ElapsedMilliseconds - $stage.Data - $stage.List
+    $stage.Count = @($script:Files).Count
+    Write-PerfNote 'folder' ([string]$tag.Kind) ([string]$tag.Title) $perf.ElapsedMilliseconds $stage ($script:NetGets - $net0)
     try { Request-FilesPrefetch } catch { Write-Log DEBUG "Prefetch: $($_.Exception.Message)" }
 }
 
@@ -7102,9 +7871,112 @@ $script:PointerLeaveJs = @'
   window.__nrkbLeave = leave;
   // the browser did notice the mouse leaving the page: make sure nothing is left hovered
   // (a moment later, after the real events, so this is a no-op when they worked)
-  document.addEventListener('mouseout', e => { if (e.isTrusted && !e.relatedTarget) setTimeout(leave, 0); }, true);
-  window.addEventListener('blur', () => setTimeout(leave, 0));
-  document.addEventListener('visibilitychange', () => { if (document.hidden) leave(); });
+  document.addEventListener('mouseout', e => { if (e.isTrusted && !e.relatedTarget) setTimeout(() => window.__nrkbLeave(), 0); }, true);
+  window.addEventListener('blur', () => setTimeout(() => window.__nrkbLeave(), 0));
+  document.addEventListener('visibilitychange', () => { if (document.hidden) window.__nrkbLeave(); });
+
+  // ---- NRK's timeline preview: up while you hover or drag the timeline, gone after ----
+  // NRK's player keeps the preview picture (and its time label) up after the mouse has moved
+  // off the timeline, until the controls hide. We find the preview without knowing NRK's
+  // markup: it is whatever sits above the timeline and moves sideways with the mouse while
+  // you hover it. Once the mouse is off the timeline (and not dragging), those parts are
+  // hidden; the next hover shows them again.
+  const P = window.__nrkbPreview = { followers: [], hidden: [], inZone: false, drag: false, x: 0, y: 0, lastX: null, snap: new WeakMap(), sliders: [], found: 0, raf: 0, timer: 0, told: false };
+  function deep(root, out) {
+    root.querySelectorAll('[role="slider"], input[type="range"]').forEach(e => out.push(e));
+    root.querySelectorAll('*').forEach(e => { if (e.shadowRoot) deep(e.shadowRoot, out); });
+    return out;
+  }
+  function sliders() {
+    // the timeline is the wide slider (the volume slider is small); looked up at most every 2 s
+    if (Date.now() - P.found > 2000 || P.sliders.some(e => !e.isConnected)) {
+      P.found = Date.now();
+      P.sliders = deep(document, []).filter(e => { const r = e.getBoundingClientRect(); return r.width >= Math.max(200, innerWidth * 0.3); });
+    }
+    return P.sliders;
+  }
+  function zoneOf(x, y) {
+    for (const s of sliders()) {
+      const r = s.getBoundingClientRect();
+      if (r.width && x >= r.left - 4 && x <= r.right + 4 && y >= r.top - 14 && y <= r.bottom + 14) return s;
+    }
+    return null;
+  }
+  function containerOf(s) {
+    // the controls around the timeline: climb while the box stays well below full height
+    let c = s, n = s;
+    for (let i = 0; i < 8; i++) {
+      n = n.parentNode instanceof ShadowRoot ? n.parentNode.host : n.parentNode;
+      if (!(n instanceof Element) || n.getBoundingClientRect().height > innerHeight * 0.6) break;
+      c = n;
+    }
+    return c;
+  }
+  function all(root, out) {
+    root.querySelectorAll('*').forEach(e => { out.push(e); if (e.shadowRoot) all(e.shadowRoot, out); });
+    return out;
+  }
+  function learn(s) {
+    // which parts above the timeline moved along with the mouse since the last sample?
+    const dx = P.lastX == null ? 0 : P.x - P.lastX; P.lastX = P.x;
+    const top = s.getBoundingClientRect().top;
+    const list = all(containerOf(s), []);
+    for (let i = 0; i < list.length && i < 1500; i++) {
+      const el = list[i], r = el.getBoundingClientRect();
+      if (!r.width || !r.height || r.bottom > top + 2 || r.width > innerWidth * 0.6) continue;
+      const prev = P.snap.get(el); P.snap.set(el, r.left);
+      if (prev == null || Math.abs(dx) < 3) continue;
+      if (Math.abs((r.left - prev) - dx) <= Math.max(3, Math.abs(dx) * 0.4) && !P.followers.includes(el)) {
+        P.followers.push(el);
+        if (!P.told) { P.told = true; post({ type: 'preview', slider: s.tagName.toLowerCase() + (s.className && typeof s.className === 'string' ? '.' + s.className.split(' ')[0] : ''), part: el.tagName.toLowerCase() + (typeof el.className === 'string' && el.className ? '.' + el.className.split(' ')[0] : '') }); }
+      }
+    }
+  }
+  function post(m) { try { window.chrome.webview.postMessage(JSON.stringify(m)); } catch (e) { } }
+  function hide() {
+    clearTimeout(P.timer);
+    if (P.drag) return;
+    P.followers = P.followers.filter(e => e.isConnected);
+    for (const el of P.followers) {
+      if (P.hidden.some(h => h.el === el)) continue;
+      P.hidden.push({ el, v: el.style.getPropertyValue('visibility'), p: el.style.getPropertyPriority('visibility') });
+      el.style.setProperty('visibility', 'hidden', 'important');
+    }
+  }
+  function show() {
+    clearTimeout(P.timer);
+    for (const h of P.hidden) { if (h.v) h.el.style.setProperty('visibility', h.v, h.p); else h.el.style.removeProperty('visibility'); }
+    P.hidden = [];
+  }
+  function sample() {
+    P.raf = 0;
+    const s = zoneOf(P.x, P.y);
+    if (s) {
+      if (!P.inZone) { P.inZone = true; P.lastX = null; show(); }
+      learn(s);
+    } else if (P.inZone) {
+      P.inZone = false;
+      if (!P.drag) { clearTimeout(P.timer); P.timer = setTimeout(hide, 150); }
+    } else if (P.drag) {
+      learn(P.sliders[0] || document.body);   // dragging above the bar: the preview still follows
+    }
+  }
+  document.addEventListener('pointermove', e => {
+    if (!e.isTrusted || e.pointerType !== 'mouse') return;
+    P.x = e.clientX; P.y = e.clientY;
+    if (!P.raf) P.raf = requestAnimationFrame(sample);
+  }, true);
+  document.addEventListener('pointerdown', e => { if (e.isTrusted && e.pointerType === 'mouse' && zoneOf(e.clientX, e.clientY)) { P.drag = true; show(); } }, true);
+  const up = e => {
+    if (!P.drag) return;
+    P.drag = false;
+    if (!zoneOf(e.clientX, e.clientY)) { P.inZone = false; P.timer = setTimeout(hide, 150); }
+  };
+  window.addEventListener('pointerup', up, true);
+  window.addEventListener('pointercancel', up, true);
+  // the mouse left the page or the window lost focus (leave() above): no preview either
+  const plain = leave;
+  window.__nrkbLeave = () => { plain(); if (!P.drag) { P.inZone = false; hide(); } };
 })();
 '@
 
@@ -7254,6 +8126,7 @@ function New-WebViewControl {
                     }
                     'levels' { if ($script:PlayerWin) { $script:PlayerWin.Levels = @($m.list); $script:PlayerWin.Level = [int]$m.cur; $script:PlayerWin.LevelNow = [int]$m.now; Update-PlayerExtras } }
                     'shot' { Save-PlayerShot $m }
+                    'preview' { Write-Log INFO ("Player: found NRK's timeline preview ({0} above {1}); it hides when the mouse leaves the timeline" -f $m.part, $m.slider) }
                     'isolated' { Write-Log INFO ("Player only: isolated <{0} class='{1}'>{2} on {3}" -f $m.tag, $m.cls, $(if ($m.chapters) { ' + chapter row' } else { '' }), $m.url) }
                     'chapters' { Write-Log INFO ("Player only: chapter row added ({0} buttons) on {1}" -f $m.n, $m.url) }
                     'autostart' {
@@ -7681,6 +8554,8 @@ function Watch-PlayerPointer {
         if (-not $pw.Form.Visible -or $pw.Form.WindowState -eq 'Minimized' -or -not $pw.WebView.CoreWebView2) { $pw.PtrIn = $false; return }
         try {
             $wv = $pw.WebView
+            # (a mouse button held = maybe dragging the timeline: the page has the mouse, leave it be)
+            if ([System.Windows.Forms.Control]::MouseButtons -ne [System.Windows.Forms.MouseButtons]::None) { return }
             $inside = $wv.RectangleToScreen($wv.ClientRectangle).Contains([System.Windows.Forms.Cursor]::Position)
             if ($pw.PtrIn -and -not $inside) { Send-PlayerPointerLeave }
             $pw.PtrIn = $inside
@@ -9301,7 +10176,7 @@ function Invoke-CastCommand([string] $What, [double] $Value = 0) {
         }
         'rel'    { Invoke-CastCommand 'seek' ((Get-CastPosition $s) + $Value) }
         'volume' {
-            $v = [Math]::Max(0, [Math]::Min(1, $Value)); $s.Volume = $v
+            $v = [Math]::Max(0.0, [Math]::Min(1.0, [double]$Value)); $s.Volume = $v   # (1.0, not 1: Min(1, 0.4) is 0 in PowerShell)
             if ($isCast) { Send-CastJson 'receiver-0' $script:CastNs.Recv ([ordered]@{ type = 'SET_VOLUME'; volume = [ordered]@{ level = $v } }) }
             elseif ($s.Device.Rc) { [void](Invoke-DlnaAction $s.Device.Rc 'RenderingControl' 'SetVolume' ('<Channel>Master</Channel><DesiredVolume>{0}</DesiredVolume>' -f [int]($v * 100))) }
         }
@@ -10147,7 +11022,7 @@ function Invoke-DrawGridItem($E) {
     if ($rec) {
         $yb = $img.Bottom - 4
         if ($rec.Done) { $g.FillRectangle((Get-Brush $T.Ok), $img.X, $yb, $img.Width, 4) }
-        elseif ([double]$rec.Dur -gt 0 -and [double]$rec.Pos -ge 15) { $g.FillRectangle((Get-Brush $T.Border), $img.X, $yb, $img.Width, 4); $g.FillRectangle((Get-Brush $T.Accent), $img.X, $yb, [int]($img.Width * [Math]::Min(1, [double]$rec.Pos / [double]$rec.Dur)), 4) }
+        elseif ([double]$rec.Dur -gt 0 -and [double]$rec.Pos -ge 15) { $g.FillRectangle((Get-Brush $T.Border), $img.X, $yb, $img.Width, 4); $g.FillRectangle((Get-Brush $T.Accent), $img.X, $yb, [int]($img.Width * [Math]::Min(1.0, [double]$rec.Pos / [double]$rec.Dur)), 4) }
     }
     $fore = if ($item.ForeColor -eq $T.Muted) { $T.Muted } else { $T.Text }
     $t1 = New-Object System.Drawing.Rectangle(($box.X + 4), ($img.Bottom + 4), ($box.Width - 8), 36)
@@ -12368,12 +13243,50 @@ function Show-LogsWindow {
 
 $script:IndexUi = $null
 # (string keys: an [ordered] dictionary indexed with a number picks by position, not by key)
-$script:IndexPaces = [ordered]@{ '250' = '0.25 s (fast)'; '500' = '0.5 s'; '1000' = '1 s (default)'; '2000' = '2 s'; '5000' = '5 s'; '10000' = '10 s (very gentle)' }
+function Add-IndexPriority([string] $Key, [string] $Term) {
+    # 2.10.0: a series you opened, or words you searched for: the indexer does those next
+    # (priority.json; a running indexer reads it within a second, the next run within a day)
+    if ($script:IndexMode -or -not $script:AppDataDir) { return }
+    try {
+        if (-not $script:IndexPrio) { $script:IndexPrio = @{ Items = New-Object System.Collections.Generic.List[string]; Terms = New-Object System.Collections.Generic.List[string] } }
+        $p = $script:IndexPrio
+        if ($Key) { if ($p.Items.Contains($Key)) { return }; $p.Items.Add($Key); if ($p.Items.Count -gt 40) { $p.Items.RemoveAt(0) } }
+        if ($Term) { $Term = $Term.Trim(); if (-not $Term -or $p.Terms.Contains($Term)) { return }; $p.Terms.Add($Term); if ($p.Terms.Count -gt 10) { $p.Terms.RemoveAt(0) } }
+        Write-JsonFile $script:IndexPriorityFile ([ordered]@{ Items = @($p.Items); Terms = @($p.Terms); Sent = (Get-Date).ToString('o') })
+    } catch { }
+}
 
 function Get-IndexScriptPath {
     # the copy the scheduled task runs: the installed one when installed, else this file
     if (Test-Path -LiteralPath $script:InstalledScript) { return $script:InstalledScript }
     return $PSCommandPath
+}
+
+function Update-IndexProgress {
+    # 2.10.3: while the indexer runs, the main window shows how far it is: "Indexing 42%, about
+    # 1 h 10 min left" in the title (and the taskbar), a thin bar under the Indexer button and its
+    # tooltip. status.json is read only when the indexer has written it again.
+    try {
+        $fi = New-Object IO.FileInfo($script:IndexStatusFile)
+        $stamp = if ($fi.Exists) { $fi.LastWriteTimeUtc.Ticks } else { 0 }
+        if ($stamp -eq $script:IdxSeen -and ((Get-Date) - $script:IdxSeenAt).TotalSeconds -lt 15) { return }   # (unchanged; checked again now and then: has it stopped?)
+        $script:IdxSeen = $stamp; $script:IdxSeenAt = Get-Date
+        $st = Get-IndexerState
+        $part = ''; $pct = -1; $tip = 'Indexer  (saves every folder in the background, Ctrl+I)'
+        if ($st.Running -and $st.Status) {
+            $s = $st.Status
+            $pct = [Math]::Max(0, [Math]::Min(100, [int]$s.Percent))
+            $left = if ($s.State -eq 'running' -and $null -ne $s.EtaSeconds -and [int]$s.PhaseNo -ge 2 -and [int]$s.PhaseDone -ge 10) { ', about {0} left' -f (Format-Span ([double]$s.EtaSeconds)) } else { '' }
+            $part = switch ($s.State) { 'paused' { "  ·  Indexing paused at $pct%" } 'stopping' { '  ·  Indexer stopping' } default { "  ·  Indexing $pct%$left" } }
+            $tip = 'Indexer: {0}%{1}{2}  ·  {3}  (Ctrl+I)' -f $pct, $left, $(if ($s.Mode -eq 'full') { ', full check' } elseif ($s.Mode -eq 'quick') { ', quick check' } else { '' }), $s.Phase
+        }
+        $t = $form.Text
+        if ($script:TitleIdx -and $t.EndsWith($script:TitleIdx)) { $t = $t.Substring(0, $t.Length - $script:TitleIdx.Length) }
+        if ($form.Text -ne "$t$part") { $form.Text = "$t$part" }
+        $script:TitleIdx = $part
+        $topTips.SetToolTip($btnIndexer, $tip)
+        if ($script:IdxProgress -ne $pct) { $script:IdxProgress = $pct; $btnIndexer.Invalidate() }
+    } catch { }
 }
 
 function Get-IndexerState {
@@ -12391,15 +13304,15 @@ function Get-IndexerState {
     [pscustomobject]@{ Status = $s; Running = $alive }
 }
 
-function Start-Indexer {
+function Start-Indexer([switch] $Full) {
     $st = Get-IndexerState
     if ($st.Running) { Set-Status 'The indexer is already running'; return }
     $hostExe = Get-LaunchHost
-    $argLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Index' -f $PSCommandPath
+    $argLine = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Index{1}' -f $PSCommandPath, $(if ($Full) { ' -IndexFull' } else { '' })
     Write-Log INFO "Indexer: starting $hostExe $argLine"
     Remove-Item -LiteralPath $script:IndexControlFile -Force -ErrorAction SilentlyContinue
     Start-Process -FilePath $hostExe -ArgumentList $argLine -WindowStyle Hidden | Out-Null
-    Set-Status 'Indexer started: it walks every folder slowly in the background'
+    Set-Status $(if ($Full) { 'Indexer started: a full check of every series, in the background' } else { 'Indexer started: it checks what is new, in the background' })
 }
 
 function Invoke-IndexAuto {
@@ -12419,7 +13332,7 @@ function Invoke-IndexAuto {
 }
 
 function Send-IndexerCommand([string] $Command) {
-    Write-JsonFile $script:IndexControlFile ([ordered]@{ Command = $Command; PaceMs = [int](Get-AppSettings).IndexPaceMs; Sent = (Get-Date).ToString('o') })
+    Write-JsonFile $script:IndexControlFile ([ordered]@{ Command = $Command; Speed = [string](Get-AppSettings).IndexSpeed; Sent = (Get-Date).ToString('o') })
     Write-Log INFO "Indexer: sent '$Command'"
 }
 
@@ -12496,14 +13409,20 @@ function Update-IndexerView {
     $st = Get-IndexerState
     $s = $st.Status
     $fmt = { param($iso) if (-not $iso) { return '' }; try { ([datetime]$iso).ToString('dd.MM.yyyy HH:mm') } catch { '' } }
-    $last = if ($s -and $s.LastFull) { 'Last full run: {0}{1}' -f (& $fmt $s.LastFull), $(if ($s.LastFullSeconds) { " (took $(Format-Span $s.LastFullSeconds))" } else { '' }) } else { 'No full run yet' }
+    $lastDeep = if ($s -and $s.LastDeep) { $s.LastDeep } elseif ($s -and -not $s.Mode) { $s.LastFull } else { $null }   # (before 2.10 every run was a full one)
+    $last = if ($s -and $s.LastFull) {
+        $l = 'Last run: {0}{1}' -f (& $fmt $s.LastFull), $(if ($s.LastFullSeconds) { " (took $(Format-Span $s.LastFullSeconds))" } else { '' })
+        if ($lastDeep) { $l += '  ·  last full check: {0}' -f (& $fmt $lastDeep) }
+        $l
+    } else { 'No run yet' }
     if ($st.Running) {
         $word = switch ($s.State) { 'paused' { 'Paused' } 'stopping' { 'Stopping...' } default { 'Running' } }
-        $ui.State.Text = '{0}  ·  step {1} of {2}: {3}' -f $word, $s.PhaseNo, $s.PhaseCount, $s.Phase
+        $kind = switch ($s.Mode) { 'full' { 'full check' } 'quick' { 'quick check' } default { '' } }
+        $ui.State.Text = '{0}{1}  ·  step {2} of {3}: {4}' -f $word, $(if ($kind) { " ($kind)" } else { '' }), $s.PhaseNo, $s.PhaseCount, $s.Phase
         $ui.State.ForeColor = if ($s.State -eq 'paused') { $T.Muted } else { $T.Accent }
         $tot = [int]$s.PhaseTotal; $done = [Math]::Min([int]$s.PhaseDone, $tot)
         $ui.Bar.Maximum = [Math]::Max(1, $tot); $ui.Bar.Value = $done
-        $what = if ($s.PhaseNo -ge 5) { 'series' } else { 'folders' }
+        $what = if ($s.Unit) { $s.Unit } elseif ($s.PhaseNo -ge 5) { 'series' } else { 'folders' }
         $ui.Progress.Text = '{0:N0} / {1:N0} {2}{3}' -f $done, $tot, $what, $(if ($null -ne $s.EtaSeconds -and $s.State -eq 'running') { "  ·  about $(Format-Span $s.EtaSeconds) left in this step" } else { '' })
         $ui.Current.Text = if ($s.Current) { "Now: $($s.Current)" } else { '' }
     } else {
@@ -12522,12 +13441,18 @@ function Update-IndexerView {
     }
     if ($s) {
         $ui.Counts.Text = 'Found {0:N0} TV series, {1:N0} programmes, {2:N0} radio series and podcasts, {3:N0} episodes' -f [int]$s.TvSeries, [int]$s.Programs, [int]$s.RadioSeries, [int]$s.Episodes
+        $kept = @()
+        if ([int]$s.Unchanged) { $kept += '{0:N0} quiet series kept as they were' -f [int]$s.Unchanged }
+        if ([int]$s.ReusedSeasons) { $kept += '{0:N0} unchanged seasons kept' -f [int]$s.ReusedSeasons }
+        if ($kept) { $ui.Counts.Text += '  ·  ' + ($kept -join ', ') }
         $ui.Requests.Text = 'Requests to NRK: {0:N0}  ·  already up to date: {1:N0}  ·  errors: {2:N0}' -f [int]$s.Requests, [int]$s.Skipped, [int]$s.Errors
+        if ($st.Running -and $s.Parallel) { $ui.Requests.Text += '  ·  {0} at a time, {1:N1} s apart' -f [int]$s.Parallel, ([double]$s.GapMs / 1000) }
         $ui.Error.Text = if ($s.LastError) { "Last error: $($s.LastError)" } else { '' }
         if ($st.Running) { $ui.Last.Text = $last } else { $ui.Last.Text = '' }
     } else { $ui.Counts.Text = 'The indexer has not run yet.'; $ui.Requests.Text = ''; $ui.Error.Text = ''; $ui.Last.Text = '' }
     if ($script:CacheMode -eq 'Off') { $ui.Error.Text = 'Note: Options > "Refresh saved NRK data" is set to "Always fetch from NRK", so the app does not use what the indexer saves.' }
     $ui.Run.Enabled = -not $st.Running
+    $ui.Full.Enabled = -not $st.Running
     $ui.Pause.Enabled = $st.Running -and $s.State -ne 'stopping'
     if ($st.Running -and $s.State -eq 'paused') { Set-IconText $ui.Pause 'play' 'Resume' } else { Set-IconText $ui.Pause 'pause' 'Pause' }   # (2.9.3: icons)
     $ui.Stop.Enabled = $st.Running -and $s.State -ne 'stopping'
@@ -12580,7 +13505,7 @@ function Show-IndexerWindow {
         $l.ForeColor = if ($Muted) { $T.Muted } else { $T.Text }
         & $add $l 20 $y
     }
-    [void](& $label 'Walks every TV and radio folder slowly, one request at a time, and saves it on this computer, so folders open instantly. It runs as its own background process: you can close this window and the app.' 12 -Muted)
+    [void](& $label 'Reads every TV and radio folder and saves it on this computer, so folders open instantly and Search finds everything. Most runs only check what can have changed; series you open or search for go first. It runs as its own background process: you can close this window and the app.' 12 -Muted)
     $ui.Intro = $w.Controls[$w.Controls.Count - 1]; $ui.Intro.Height = 36
     $ui.State = & $label '' 56 -Big
     $ui.Bar = New-Object System.Windows.Forms.ProgressBar
@@ -12600,20 +13525,25 @@ function Show-IndexerWindow {
     $ui.Stop = New-FlatButton 'Stop' 100
     [void](& $add $ui.Stop 270 248)
     $bFolder = New-FlatButton 'Open folder' 130
+    $ui.Full = New-FlatButton 'Check everything' 160
     Set-IconText $ui.Run 'play' 'Run now' -Primary; Set-IconText $ui.Pause 'pause' 'Pause'; Set-IconText $ui.Stop 'stop' 'Stop'; Set-IconText $bFolder 'folder' 'Open folder'   # (2.9.3)
+    Set-IconText $ui.Full 'reload' 'Check everything'
     [void](& $add $bFolder 380 248)
+    [void](& $add $ui.Full 520 248)
+    $tips = New-Object System.Windows.Forms.ToolTip
+    $tips.SetToolTip($ui.Run, 'Checks what can have changed since the last run (a full check by itself every 30 days)')
+    $tips.SetToolTip($ui.Full, 'Reads every season of every series again, also those that seem unchanged (takes much longer)')
 
-    $lblPace = New-Object System.Windows.Forms.Label; $lblPace.Text = 'Pause between requests'; $lblPace.AutoSize = $true
+    $lblPace = New-Object System.Windows.Forms.Label; $lblPace.Text = 'Speed'; $lblPace.AutoSize = $true
     [void](& $add $lblPace 22 304)
     $ui.Pace = New-Object System.Windows.Forms.ComboBox
-    $ui.Pace.DropDownStyle = 'DropDownList'; $ui.Pace.FlatStyle = 'Flat'; $ui.Pace.Width = 200
+    $ui.Pace.DropDownStyle = 'DropDownList'; $ui.Pace.FlatStyle = 'Flat'; $ui.Pace.Width = 260
     $ui.Pace.BackColor = $T.Surface; $ui.Pace.ForeColor = $T.Text
-    foreach ($k in @($script:IndexPaces.Keys)) { [void]$ui.Pace.Items.Add([string]$script:IndexPaces[[string]$k]) }
-    $keys = @($script:IndexPaces.Keys | ForEach-Object { [int]$_ })
-    $i = [array]::IndexOf($keys, [int]$st.IndexPaceMs); if ($i -lt 0) { $i = 2 }
+    foreach ($k in @($script:IndexSpeeds.Keys)) { [void]$ui.Pace.Items.Add([string]$script:IndexSpeeds[$k].Label) }
+    $i = @($script:IndexSpeeds.Keys).IndexOf([string]$st.IndexSpeed); if ($i -lt 0) { $i = 1 }
     $ui.Pace.SelectedIndex = $i
     [void](& $add $ui.Pace 200 300)
-    [void](& $label 'Slower is kinder to NRK and your connection; the whole catalogue takes several hours at 1 s.' 330 -Muted)
+    [void](& $label 'Requests at NRK at the same time. It slows down by itself when NRK answers slowly or asks it to.' 330 -Muted)
 
     $ui.Daily = New-Object System.Windows.Forms.CheckBox
     $ui.Daily.Text = 'Run every day at'; $ui.Daily.AutoSize = $true; $ui.Daily.ForeColor = $T.Text
@@ -12652,6 +13582,7 @@ function Show-IndexerWindow {
     }
 
     $ui.Run.Add_Click({ Start-Indexer; Start-Sleep -Milliseconds 300; Update-IndexerView })
+    $ui.Full.Add_Click({ Start-Indexer -Full; Start-Sleep -Milliseconds 300; Update-IndexerView })
     $ui.Pause.Add_Click({
         $s = (Get-IndexerState).Status
         Send-IndexerCommand $(if ($s -and $s.State -eq 'paused') { 'resume' } else { 'pause' })
@@ -12660,12 +13591,12 @@ function Show-IndexerWindow {
     $ui.Auto.Add_CheckedChanged({ $s = Get-AppSettings; $s.IndexAuto = $this.Checked; Save-AppSettings $s; Write-Log INFO "Option IndexAuto = $($this.Checked)" })
     $bFolder.Add_Click({ New-Item -ItemType Directory -Path $script:IndexDir -Force | Out-Null; Start-Process $script:IndexDir })
     $ui.Pace.Add_SelectedIndexChanged({
-        $ms = [int]@($script:IndexPaces.Keys)[$this.SelectedIndex]
-        $s = Get-AppSettings; if ([int]$s.IndexPaceMs -eq $ms) { return }
-        $s.IndexPaceMs = $ms; Save-AppSettings $s
-        Write-Log INFO "Option IndexPaceMs = $ms"
+        $sp = [string]@($script:IndexSpeeds.Keys)[$this.SelectedIndex]
+        $s = Get-AppSettings; if ([string]$s.IndexSpeed -eq $sp) { return }
+        $s.IndexSpeed = $sp; Save-AppSettings $s
+        Write-Log INFO "Option IndexSpeed = $sp"
         $cur = (Get-IndexerState).Status
-        if ((Get-IndexerState).Running) { Send-IndexerCommand $(if ($cur.State -eq 'paused') { 'pause' } else { 'resume' }) }   # carries the new pace
+        if ((Get-IndexerState).Running) { Send-IndexerCommand $(if ($cur.State -eq 'paused') { 'pause' } else { 'resume' }) }   # carries the new speed
     })
     $applySchedule = {
         $u = $script:IndexUi
@@ -15442,11 +16373,20 @@ $scheduleList.Add_DoubleClick({
     } else { Start-Player }   # on now / upcoming: watch the channel live
 })
 
-$search.Add_TextChanged({ Show-Files })
+$search.Add_TextChanged({
+    if ($script:FilterSkip) { return }
+    $script:FilterNode = $folderTree.SelectedNode
+    # (2.10.2: waits until typing pauses; clearing the box shows everything at once)
+    if (-not $search.Text) { $script:FilterTimer.Stop(); Show-Files; return }
+    $script:FilterTimer.Stop(); $script:FilterTimer.Start()
+})
+$script:FilterTimer = New-Object System.Windows.Forms.Timer
+$script:FilterTimer.Interval = 150
+$script:FilterTimer.Add_Tick({ $script:FilterTimer.Stop(); Show-Files })
 $search.Add_HandleCreated({ try { [NrkNative]::Placeholder($search.Handle, 'Filter files  ·  Enter: search everything') } catch { } })
 $search.Add_KeyDown({
     param($s, $e)
-    if ($e.KeyCode -eq 'Return') { $e.Handled = $true; $e.SuppressKeyPress = $true; Invoke-SearchAll $search.Text }
+    if ($e.KeyCode -eq 'Return') { $e.Handled = $true; $e.SuppressKeyPress = $true; $script:FilterTimer.Stop(); Invoke-SearchAll $search.Text }
     elseif ($e.KeyCode -eq 'Escape' -and $search.Text) { $e.Handled = $true; $e.SuppressKeyPress = $true; $search.Text = '' }
 })
 $topTips.SetToolTip($search, 'Type to filter the files in this folder. Press Enter to search all of NRK TV and radio (needs the Indexer).')
@@ -15467,6 +16407,19 @@ $btnSettings.Add_Click({ Show-OptionsWindow })
 $btnFilter.Add_Click({ Show-SearchFilterMenu })
 $btnLogs.Add_Click({ Show-LogsWindow })
 $btnIndexer.Add_Click({ Open-IndexerWindow })
+$script:IdxProgress = -1; $script:IdxSeen = -1; $script:IdxSeenAt = [datetime]::MinValue; $script:TitleIdx = ''
+$btnIndexer.Add_Paint({
+    # (2.10.3) the indexer's progress: a thin line along the bottom of the button while it runs
+    param($s, $e)
+    $p = [int]$script:IdxProgress
+    if ($p -lt 0) { return }
+    $h = 3; $y = $s.ClientSize.Height - $h
+    $bg = New-Object System.Drawing.SolidBrush($T.Hover); $fg = New-Object System.Drawing.SolidBrush($T.Accent)
+    try {
+        $e.Graphics.FillRectangle($bg, 0, $y, $s.ClientSize.Width, $h)
+        $e.Graphics.FillRectangle($fg, 0, $y, [int]($s.ClientSize.Width * $p / 100), $h)
+    } finally { $bg.Dispose(); $fg.Dispose() }
+})
 $btnDownloads.Add_Click({ Show-DownloadsWindow })
 
 $btnPlay.Add_Click({ Start-Player })
@@ -15616,6 +16569,11 @@ $form.Add_Shown({
     $script:IndexAutoTimer.Interval = 90000
     $script:IndexAutoTimer.Add_Tick({ $script:IndexAutoTimer.Interval = 1800000; try { Invoke-IndexAuto } catch { Write-LogException $_ 'Indexer (automatic)' } })
     $script:IndexAutoTimer.Start()
+    # how far the indexer is (title, Indexer button): looked at every 2 s, read when it changed
+    $script:IndexProgressTimer = New-Object System.Windows.Forms.Timer
+    $script:IndexProgressTimer.Interval = 2000
+    $script:IndexProgressTimer.Add_Tick({ Update-IndexProgress })
+    $script:IndexProgressTimer.Start()
     # continue where you left off: shortly after the window is up
     if ((Get-AppSettings).ResumePlayback) {
         $script:ResumeTimer = New-Object System.Windows.Forms.Timer

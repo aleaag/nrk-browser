@@ -102,7 +102,8 @@ with subtitles, chapters and covers, all without a browser tab.
   favourite podcasts as OPML.
 
 ### Fits into Windows
-- Light and dark theme (follows Windows), 11 looks for the top-bar icons.
+- Light and dark theme (follows Windows), and 11 looks for the icons in the top bar and on the
+  buttons of every window (Options › General › Icon style).
 - System tray: minimize or close to the tray and keep playing; Pause, Mute, Sleep timer,
   Check for updates, Exit.
 - Start with Windows, one copy at a time, sound output for this app only.
@@ -121,7 +122,15 @@ with subtitles, chapters and covers, all without a browser tab.
 - Components window: checks everything the app needs and installs what's missing, with your
   permission. Never needs administrator rights.
 - An **indexer** saves every folder in the background (daily, or by itself when the saved data is
-  old), so folders open instantly and search covers everything.
+  old), so folders open instantly and search covers everything. It sends several requests at once
+  and slows down by itself when NRK answers slowly or asks it to. Series you open or search for
+  go first, then your favourites and what you played lately. Most runs are a quick check: series
+  that have been quiet lately are looked at less often, and only the seasons where something can
+  have changed are read again. A full check runs every 30 days, or with **Check everything**.
+  Search finds every series name a few minutes into a run, and the newest seasons of every series
+  come before the older ones. While it runs, the window title shows how far it is and the time
+  left, and a thin bar fills under the Indexer button. Pages that haven't changed aren't written
+  to disk again.
 
 ---
 
@@ -129,6 +138,7 @@ with subtitles, chapters and covers, all without a browser tab.
 
 - Windows 10 or Windows 11
 - Windows PowerShell 5.1 (built in) or PowerShell 7+
+- .NET Framework 4.7.2 or later (part of Windows 10 1803 and newer)
 
 Everything else is checked at startup and installed on request:
 
@@ -137,7 +147,7 @@ Everything else is checked at startup and installed on request:
 | Microsoft Edge WebView2 Runtime | the video player and the radio bar (normally part of Windows) | winget |
 | WebView2 SDK for .NET | lets PowerShell host WebView2 | nuget.org |
 | hls.js | NRK's streams in the player and the radio bar | jsDelivr |
-| FFmpeg | downloads, and casting to a TV | winget (`Gyan.FFmpeg`) |
+| FFmpeg | downloads, recordings, and casting to a TV | winget (`Gyan.FFmpeg`) |
 | winget | installing the above (only if needed) | App Installer |
 
 ## Getting started
@@ -175,7 +185,7 @@ Everything else is checked at startup and installed on request:
 | `Ctrl+G` | Files as thumbnails / as a list |
 | `Ctrl+W` | Watch later (selected files) |
 | `Ctrl+R` | Recordings |
-| `Ctrl+Alt+P`, `Ctrl+Alt+←/→`, `Ctrl+Alt+↑/↓`, `Ctrl+Alt+M`, `Ctrl+Alt+N` | Anywhere in Windows: play/pause, previous/next, volume, mute, show the app |
+| `Ctrl+Alt+P`, `Ctrl+Alt+Shift+←/→`, `Ctrl+Alt+Shift+↑/↓`, `Ctrl+Alt+M`, `Ctrl+Alt+N` | Anywhere in Windows: play/pause, previous/next, volume, mute, show the app |
 | `F11` / `Esc` | Player full screen / leave full screen |
 | `Space`, `←` / `→` | Player and radio bar: play/pause, back/forward |
 | `Ctrl+↑` / `Ctrl+↓`, `Del` | Downloads: move or remove the selected files |
@@ -185,7 +195,8 @@ Everything else is checked at startup and installed on request:
 | Option | Effect |
 |---|---|
 | `-Tray` | start hidden in the system tray (used by "Start with Windows") |
-| `-Index` | no window: run the indexer |
+| `-Index` | no window: run the indexer (a quick check, or a full one when the last is 30 days old) |
+| `-Index -IndexFull` | no window: run the indexer and check every season of every series |
 | `-SelfTest` | no window: call each NRK endpoint once, print a summary and write the log |
 | `-DumpResponses` | also save every raw NRK API response to the log folder |
 | `-LogDir <folder>` | write logs somewhere else |
@@ -220,7 +231,8 @@ choose in **Options › Downloads**.
 - **Nothing loads**: run with `-SelfTest`, then look at **Logs** (`Ctrl+L`). **Pause** there stops
   the view from scrolling while you read; the app keeps logging.
 - **Search, New this week or Last chance is empty**: they come from the indexer; open it
-  (`Ctrl+I`) and let a full run finish.
+  (`Ctrl+I`) and let the first run get through the folders (series names are searchable after a few
+  minutes; their episodes follow).
 - **A programme plays on NRK's page instead of the built-in player**: it's copy-protected, so only
   NRK's own player can play it.
 - **Casting finds nothing / a TV shows an error**: the PC and the device must be on the same
