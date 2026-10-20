@@ -93,7 +93,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.10.11'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.10.13'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -294,7 +294,7 @@ $script:CacheModes = [ordered]@{
     Normal = @{ Label = 'Normal (pages hourly, catalogues every 12 hours)'; Pages = 60; Catalog = 720 }
     Slow   = @{ Label = 'Every 6 hours';                    Pages = 360;    Catalog = 1440 }
     Daily  = @{ Label = 'Once a day';                       Pages = 1440;   Catalog = 1440 }
-    Manual = @{ Label = 'Only when I press Reload';         Pages = 525600; Catalog = 525600 }
+    Manual = @{ Label = 'Only when I fetch everything again'; Pages = 525600; Catalog = 525600 }
 }
 $script:CacheMode = 'Normal'   # read from the settings at startup
 
@@ -3832,14 +3832,6 @@ function New-TopIcon([string] $Kind, [string] $Style, [System.Drawing.Color] $Co
                 foreach ($y in 6, 12, 18) { $g.DrawLine($pen, 9, $y, 20, $y); $g.FillEllipse($dbr, 3.1, $y - 1.4, 2.8, 2.8) }
             }
         }
-        'reload' {
-            $p2 = if ($fill) { New-Object System.Drawing.Pen($Color, ($sw + 0.8)) } else { $pen }
-            $p2.StartCap = 'Round'; $p2.EndCap = 'Round'; $p2.LineJoin = 'Round'
-            $g.DrawArc($p2, 4.5, 4.5, 15, 15, 0, 315)
-            $ap = if ($fill) { $p2 } else { $dpen }
-            $g.DrawLines($ap, [System.Drawing.PointF[]]@((& $pt 19.5 4), (& $pt 19.5 8.6), (& $pt 14.9 8.6)))
-            if ($fill) { $p2.Dispose() }
-        }
         'opts' {
             $state = $g.Save()
             for ($i = 0; $i -lt 8; $i++) {
@@ -3856,13 +3848,13 @@ function New-TopIcon([string] $Kind, [string] $Style, [System.Drawing.Color] $Co
 }
 
 function Set-TopBarIcons {
-    # applies the chosen look to the six top-bar buttons (again after a theme change)
+    # applies the chosen look to the five top-bar buttons (again after a theme change)
     $style = [string](Get-AppSettings).TopIcons
     if (-not $script:TopIconStyles.Contains($style)) { $style = 'text' }
     $script:SoftTile = if ($script:ThemeEffective -eq 'Light') { [System.Drawing.Color]::FromArgb(205, 232, 235) } else { [System.Drawing.Color]::FromArgb(24, 51, 56) }
     $defs = @(
         @($btnBack, 'back', [string][char]0x2039, 'Back'), @($btnIndexer, 'index', [string][char]0x25A6, 'Indexer'), @($btnDownloads, 'down', [string][char]0x2193, 'Downloads'),
-        @($btnLogs, 'logs', [string][char]0x2630, 'Logs'), @($btnReload, 'reload', [string][char]0x27F3, 'Reload'), @($btnSettings, 'opts', [string][char]0x2699, 'Options'))
+        @($btnLogs, 'logs', [string][char]0x2630, 'Logs'), @($btnSettings, 'opts', [string][char]0x2699, 'Options'))
     foreach ($d in $defs) {
         $b = $d[0]
         if ($b.Tag -is [hashtable] -and $b.Tag.On) { try { $b.Tag.On.Dispose() } catch { } }   # (the hover picture of "Muted")
@@ -4577,8 +4569,6 @@ $script:CrumbTips = New-Object System.Windows.Forms.ToolTip
 
 $btnSettings = New-FlatButton ([string][char]0x2699) 40 -Icon
 $btnSettings.Dock = 'Right'
-$btnReload = New-FlatButton ([string][char]0x27F3) 40 -Icon
-$btnReload.Dock = 'Right'
 $btnLogs = New-FlatButton ([string][char]0x2630) 40 -Icon
 $btnLogs.Dock = 'Right'
 $btnDownloads = New-FlatButton ([string][char]0x2193) 40 -Icon
@@ -4592,7 +4582,6 @@ $gap4 = New-Object System.Windows.Forms.Panel; $gap4.Dock = 'Right'; $gap4.Width
 $topTips = New-Object System.Windows.Forms.ToolTip
 $topTips.InitialDelay = 300; $topTips.ShowAlways = $true
 $topTips.SetToolTip($btnBack, 'Back  (to the folder above)')
-$topTips.SetToolTip($btnReload, 'Reload  (fetch everything from NRK again)')
 $topTips.SetToolTip($btnDownloads, 'Downloads  (queue and progress, Ctrl+D)')
 $topTips.SetToolTip($btnLogs, 'Logs  (Ctrl+L)')
 $topTips.SetToolTip($btnIndexer, 'Indexer  (saves every folder in the background, Ctrl+I)')
@@ -4614,7 +4603,6 @@ $top.Controls.Add($btnFilter)    # (left of the search box)
 $top.Controls.Add($gapF)
 $top.Controls.Add($searchHost)
 $top.Controls.Add($gap2)
-$top.Controls.Add($btnReload)
 $top.Controls.Add($gap1)
 $top.Controls.Add($btnIndexer)
 $top.Controls.Add($gap5)
@@ -4689,6 +4677,14 @@ function New-ThemedMenu {
     $m.Font = $script:FontUi; $m.ShowImageMargin = $false
     if ($script:DarkRenderer) { $m.Renderer = $script:DarkRenderer }
     $m.BackColor = $T.Surface; $m.ForeColor = $T.Text
+    # 2.10.12: with no image margin there is nowhere for Windows to draw a tick: a menu with ticked
+    # items (or Tag 'checks': one you tick things in while it stays open) gets the tick margin
+    $m.Add_Opening({
+        param($s, $e)
+        $any = ($s.Tag -eq 'checks')
+        if (-not $any) { foreach ($i in $s.Items) { if ($i -is [System.Windows.Forms.ToolStripMenuItem] -and $i.Checked) { $any = $true; break } } }
+        $s.ShowCheckMargin = $any
+    })
     return $m
 }
 function New-ThemedMenuItem([string] $Text) {
@@ -5455,7 +5451,7 @@ function Show-ExcludedWindow {
     $w.StartPosition = 'CenterParent'
     $w.Font = $script:FontUi; $w.BackColor = $T.Bg; $w.ForeColor = $T.Text
     $info = New-Object System.Windows.Forms.Label
-    $info.Text = "Things you hid. They are not shown in folders, lists or search, and the indexer skips them. Remove them from this list to see them again (after Reload)."
+    $info.Text = "Things you hid. They are not shown in folders, lists or search, and the indexer skips them. Remove them from this list to see them again (Reload, below)."
     $info.Dock = 'Top'; $info.Height = 46; $info.Padding = New-Object System.Windows.Forms.Padding(14, 10, 14, 0); $info.ForeColor = $T.Muted
     $lv = New-Object System.Windows.Forms.ListView
     $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.MultiSelect = $true; $lv.HideSelection = $false; $lv.Dock = 'Fill'
@@ -5500,7 +5496,7 @@ function Show-ExcludedWindow {
         if ($script:ExclUi.List.Items.Count -eq 0) { return }
         if ([System.Windows.Forms.MessageBox]::Show($script:ExclUi.Form, 'Show everything on the list again?', 'Hidden items', 'YesNo', 'Question') -eq 'Yes') { & $script:ExclRemove @($script:ExclUi.List.Items | ForEach-Object { [string]$_.Tag }) }
     })
-    $bReload.Add_Click({ $script:ExclUi.Changed = $false; $btnReload.PerformClick() })
+    $bReload.Add_Click({ $script:ExclUi.Changed = $false; Invoke-Reload })
     $bClose.Add_Click({ $script:ExclUi.Form.Close() })
     $lv.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Delete') { & $script:ExclRemove @($script:ExclUi.List.SelectedItems | ForEach-Object { [string]$_.Tag }); $e.Handled = $true } })
     & $script:ExclFill
@@ -5512,7 +5508,7 @@ function Show-ExcludedWindow {
     $script:ExclUi = $null; $w.Dispose()
     if ($changed) {
         Show-Files
-        if ([System.Windows.Forms.MessageBox]::Show($form, 'Reload the folders now, so the items you put back show up?', 'Hidden items', 'YesNo', 'Question') -eq 'Yes') { $btnReload.PerformClick() }
+        if ([System.Windows.Forms.MessageBox]::Show($form, 'Reload the folders now, so the items you put back show up?', 'Hidden items', 'YesNo', 'Question') -eq 'Yes') { Invoke-Reload }
     }
 }
 
@@ -5730,6 +5726,7 @@ function Invoke-SearchAll([string] $Query) {
 function Show-SearchFilterMenu {
     if (-not $script:FilterMenu) {
         $m = New-ThemedMenu
+        $m.Tag = 'checks'   # (2.10.12: the ticks show: before, a click changed the filter but showed nothing)
         # stays open while you tick things; the search runs again when it closes
         $m.Add_Closing({ param($s, $e) if ($e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::ItemClicked) { $e.Cancel = $true } })
         $m.Add_Closed({ Update-SearchFilterButton; if ($script:FilterChanged -and $script:SearchNode -and $script:SearchNode.TreeView -and $script:SearchNode.Tag.Query) { $script:FilterChanged = $false; Invoke-SearchAll $script:SearchNode.Tag.Query } })
@@ -5745,12 +5742,12 @@ function Show-SearchFilterMenu {
         $i.Add_Click({ $s = Get-AppSettings; $k = [string]$this.Tag; $s.$k = -not [bool]$s.$k; Save-AppSettings $s; $this.Checked = [bool]$s.$k; $script:FilterChanged = $true })
         [void]$m.Items.Add($i)
     }
-    & $flag '   TV' 'SearchTv'; & $flag '   Radio' 'SearchRadio'
+    & $flag 'TV' 'SearchTv'; & $flag 'Radio' 'SearchRadio'
     [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-    & $flag '   Series and podcasts' 'SearchSeries'; & $flag '   Programmes' 'SearchPrograms'; & $flag '   Episodes' 'SearchEpisodes'
+    & $flag 'Series and podcasts' 'SearchSeries'; & $flag 'Programmes' 'SearchPrograms'; & $flag 'Episodes' 'SearchEpisodes'
     [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-    & $flag '   Only what can be watched now' 'SearchAvailable'
-    $year = New-ThemedMenuItem '   Year'
+    & $flag 'Only what can be watched now' 'SearchAvailable'
+    $year = New-ThemedMenuItem 'Year'
     foreach ($k in $script:SearchYears.Keys) {
         $y = New-ThemedMenuItem $script:SearchYears[$k].Label; $y.Tag = $k; $y.Checked = ([string]$st.SearchYear -eq $k)
         $y.Add_Click({
@@ -6416,7 +6413,7 @@ function Hide-EmptyNode($Node) {
             $script:HideQueue.Clear()
             if ($names.Count) {
                 Write-Log INFO ("Empty folder hidden: {0}" -f ($names -join ', '))
-                Set-Status ("'{0}' has nothing in it right now, so it is hidden (Reload checks again)" -f ($names -join "', '"))
+                Set-Status ("'{0}' has nothing in it right now, so it is hidden (Options > Install & files > Fetch everything from NRK again checks again)" -f ($names -join "', '"))
             }
             if ($script:HideQueue.Count) { $script:HideTimer.Start() }
         })
@@ -11200,7 +11197,7 @@ function Set-ChildMode([bool] $On) {
     Save-AppSettings $s
     Write-Log INFO "Child mode: $(if ($On) { 'on' } else { 'off' })"
     $form.Text = "NRK Browser $($script:AppVersion)$(if ($On) { '  ·  Child mode' })"
-    $btnReload.PerformClick()   # the folders again, with or without the grown-up parts
+    Invoke-Reload   # the folders again, with or without the grown-up parts
     return $true
 }
 
@@ -14642,6 +14639,11 @@ function Show-AudioFxMenu {
     if (-not $script:FxMenu) { $script:FxMenu = New-ThemedMenu }
     $m = $script:FxMenu; $m.Items.Clear()
     $st = Get-AppSettings
+    # 2.10.12: one choice that puts the sound back to normal (both effects off)
+    $o = New-ThemedMenuItem 'Normal sound (effects off)'; $o.Checked = -not ([bool]$st.SkipSilence -or [bool]$st.VoiceBoost)
+    $o.Add_Click({ $s = Get-AppSettings; $s.SkipSilence = $false; $s.VoiceBoost = $false; Save-AppSettings $s; Send-AudioFx; Write-Log INFO 'Option SkipSilence = False, VoiceBoost = False (normal sound)' })
+    [void]$m.Items.Add($o)
+    [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $a = New-ThemedMenuItem 'Skip silences (quiet parts play faster)'; $a.Checked = [bool]$st.SkipSilence
     $a.Add_Click({ $s = Get-AppSettings; $s.SkipSilence = -not [bool]$s.SkipSilence; Save-AppSettings $s; Send-AudioFx; Write-Log INFO "Option SkipSilence = $($s.SkipSilence)" })
     $b = New-ThemedMenuItem 'Voice boost (clearer, more even speech)'; $b.Checked = [bool]$st.VoiceBoost
@@ -15882,13 +15884,18 @@ function Show-OptionsWindow {
     foreach ($k in $script:CacheModes.Keys) { [void]$ui.CacheMode.Items.Add($script:CacheModes[$k].Label) }
     $ui.CacheMode.SelectedIndex = [Math]::Max(0, @($script:CacheModes.Keys).IndexOf($script:CacheMode))
     [void](& $add $ui.CacheMode 220 338)
-    $ui.LogDisk = & $check 'Save logs to disk (kept for 3 days; the Logs window always shows this session)' ([bool]$st.Logging) 26 386
-    & $header 'Back up' 432
-    [void](& $muted 'Your settings, favourites, hidden items, what you have watched (and where you stopped), Continue watching, Finished watching, Watch later, recordings and the download list, in one file.' 26 470 600 36)
+    $bFetch = New-FlatButton 'Fetch everything from NRK again' 300
+    [void](& $add $bFetch 220 376)
+    Set-IconText $bFetch 'reload' 'Fetch everything from NRK again'
+    $optTips.SetToolTip($bFetch, 'Only needed when something looks out of date or wrong: every folder is read from NRK again instead of the saved copies (they refresh by themselves).')
+    $bFetch.Add_Click({ Invoke-Reload; Set-Status 'Fetching everything from NRK again' })
+    $ui.LogDisk = & $check 'Save logs to disk (kept for 3 days; the Logs window always shows this session)' ([bool]$st.Logging) 26 426
+    & $header 'Back up' 472
+    [void](& $muted 'Your settings, favourites, hidden items, what you have watched (and where you stopped), Continue watching, Finished watching, Watch later, recordings and the download list, in one file.' 26 510 600 36)
     $bBackup = New-FlatButton 'Back up...' 140 -Primary
-    [void](& $add $bBackup 24 512)
+    [void](& $add $bBackup 24 552)
     $bRestore = New-FlatButton 'Restore...' 140
-    [void](& $add $bRestore 176 512)
+    [void](& $add $bRestore 176 552)
     $bBackup.Add_Click({
         $dlg = New-Object System.Windows.Forms.SaveFileDialog
         $dlg.Filter = 'NRK Browser backup (*.zip)|*.zip'; $dlg.FileName = 'NRK-Browser-backup-{0:yyyy-MM-dd}.zip' -f (Get-Date)
@@ -16461,7 +16468,9 @@ $search.Add_KeyDown({
 })
 $topTips.SetToolTip($search, 'Type to filter the files in this folder. Press Enter to search all of NRK TV and radio (needs the Indexer).')
 
-$btnReload.Add_Click({
+function Invoke-Reload {
+    # 2.10.13: Options > Install & files > "Fetch everything from NRK again" (no longer a top-bar
+    # button: the saved copies refresh by themselves, so this is only for when something looks wrong)
     Write-Log INFO 'UI: reload requested - fetching fresh data from NRK (the saved copies are updated too)'
     $script:Cache = @{}; $script:CacheAt = @{}
     $script:EmptyNow.Clear()                 # look again at folders that were empty
@@ -16471,7 +16480,7 @@ $btnReload.Add_Click({
     Show-Files
     Initialize-Tree
     Show-FolderPreview; Update-Actions; Update-Crumb
-})
+}
 $btnBack.Add_Click({ Invoke-Back })
 $btnSettings.Add_Click({ Show-OptionsWindow })
 $btnFilter.Add_Click({ Show-SearchFilterMenu })
