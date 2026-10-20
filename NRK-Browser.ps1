@@ -88,7 +88,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.9.10'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.9.12'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -7063,6 +7063,51 @@ function Get-AudioOutputDevices {
     return ,@($names | Sort-Object -Unique)
 }
 
+# 2.9.12: runs in every page of the video player. When the mouse leaves the WebView fast, the
+# page often never hears about it, so NRK's timeline keeps its hover state and the preview
+# picture above it stays up (and comes back stale when the mouse returns). __nrkbLeave() sends
+# the hovered elements the "mouse left" events the browser skipped; the app calls it when the
+# cursor leaves the player (Watch-PlayerPointer), and the page calls it itself on blur.
+$script:PointerLeaveJs = @'
+(() => {
+  if (window.__nrkbLeave) return;
+  let busy = false, last = [];
+  // remember what the mouse was last over (its path up to the window, also through shadow
+  // roots); the :hover list is not reliable once the browser has lost track of the mouse
+  const seen = e => { if (e.isTrusted) last = e.composedPath().filter(n => n instanceof Element); };
+  document.addEventListener('pointerover', seen, true);
+  document.addEventListener('mouseover', seen, true);
+  function hovered() {
+    // outermost first
+    const list = last.slice().reverse().filter(n => n.isConnected);
+    return list.length ? list : Array.from(document.querySelectorAll(':hover'));
+  }
+  function leave() {
+    if (busy) return; busy = true;
+    try {
+      const list = hovered(), deep = list[list.length - 1];
+      last = [];
+      if (!deep) return;
+      const p = { pointerId: 1, pointerType: 'mouse', isPrimary: true };
+      const out = { bubbles: true, cancelable: true, composed: true, relatedTarget: null, clientX: -1, clientY: -1, view: window };
+      const lv = { bubbles: false, cancelable: false, composed: false, relatedTarget: null, clientX: -1, clientY: -1, view: window };
+      deep.dispatchEvent(new PointerEvent('pointerout', Object.assign({}, p, out)));
+      deep.dispatchEvent(new MouseEvent('mouseout', out));
+      for (let i = list.length - 1; i >= 0; i--) {
+        list[i].dispatchEvent(new PointerEvent('pointerleave', Object.assign({}, p, lv)));
+        list[i].dispatchEvent(new MouseEvent('mouseleave', lv));
+      }
+    } catch (e) { } finally { busy = false; }
+  }
+  window.__nrkbLeave = leave;
+  // the browser did notice the mouse leaving the page: make sure nothing is left hovered
+  // (a moment later, after the real events, so this is a no-op when they worked)
+  document.addEventListener('mouseout', e => { if (e.isTrusted && !e.relatedTarget) setTimeout(leave, 0); }, true);
+  window.addEventListener('blur', () => setTimeout(leave, 0));
+  document.addEventListener('visibilitychange', () => { if (document.hidden) leave(); });
+})();
+'@
+
 # runs in every page of both players: sends all sound to the chosen device (by its name)
 $script:AudioSinkJs = @'
 (() => {
@@ -7137,6 +7182,7 @@ function New-WebViewControl {
             Write-Log INFO "WebView2 ready (browser $($core.Environment.BrowserVersionString))"
             $core.Settings.IsStatusBarEnabled = $false
             [void]$core.AddScriptToExecuteOnDocumentCreatedAsync($script:PlayerOnlyJs)
+            [void]$core.AddScriptToExecuteOnDocumentCreatedAsync($script:PointerLeaveJs)   # (2.9.12: preview picture left up)
             [void]$core.AddScriptToExecuteOnDocumentCreatedAsync($script:AudioSinkJs)   # sound output (Options > Playback)
             if ((Get-AppSettings).AudioDevice) { Set-AudioSinkPermission $true }
             # the built-in player page, hls.js and subtitles, served from memory
@@ -7369,6 +7415,7 @@ function Get-PlayerWindow {
                            Speed = $bSpeed; Subs = $bSubs; Audio = $bAudio; Sleep = $bSleep; StartOver = $bStartOver; LiveBack = $bLiveBack; LiveGo = $bLiveGo
                            SubList = @(); SubIndex = -1; ATracks = @(); ATrack = -1; Versions = @()
                            Qual = $bQual; Shot = $bShot; MiniBtn = $bMini; Mini = $null; Levels = @(); Level = -1; LevelNow = -1 }
+    Watch-PlayerPointer   # (2.9.12: hide NRK's timeline preview when the mouse leaves)
     $bPrev.Add_Click({ Start-PlayerStep -1 })
     $bNext.Add_Click({ Start-PlayerStep 1 })
 
@@ -7608,6 +7655,40 @@ function Resume-LastPlayed {
     # it was cast: to the same Chromecast or TV again
     if ($last.Player -eq 'cast' -and $last.Device -and $last.Device.Ip) { Write-Log INFO "Resume: casting to $($last.Device.Name) again"; Start-Cast ([pscustomobject]@{ Kind = [string]$last.Device.Kind; Name = [string]$last.Device.Name; Ip = [string]$last.Device.Ip; Port = [int]$last.Device.Port; Avt = [string]$last.Device.Avt; Rc = [string]$last.Device.Rc; Model = [string]$last.Device.Model }) $file; return }
     Start-Player
+}
+
+function Send-PlayerPointerLeave {
+    # 2.9.12: the cursor has left the player. Move the page's mouse off the page (so the
+    # browser's own hover state ends, as when the mouse leaves slowly), then end any hover
+    # the page still holds (PointerLeaveJs).
+    $pw = $script:PlayerWin
+    if (-not $pw -or $pw.Form.IsDisposed -or -not $pw.WebView.CoreWebView2) { return }
+    $core = $pw.WebView.CoreWebView2
+    try { [void]$core.CallDevToolsProtocolMethodAsync('Input.dispatchMouseEvent', '{"type":"mouseMoved","x":-1,"y":-1,"button":"none"}') } catch { Write-Log DEBUG "Pointer leave (move): $($_.Exception.Message)" }
+    try { [void]$core.ExecuteScriptAsync('window.__nrkbLeave && window.__nrkbLeave()') } catch { Write-Log DEBUG "Pointer leave (script): $($_.Exception.Message)" }
+}
+
+function Watch-PlayerPointer {
+    # 2.9.12: five times a second while the player is on screen: has the cursor just left the
+    # page area? (WebView2 often misses a fast exit, so we can't wait for the page to notice.)
+    $pw = $script:PlayerWin
+    if (-not $pw -or $pw.PtrTimer) { return }
+    $t = New-Object System.Windows.Forms.Timer
+    $t.Interval = 200
+    $t.Add_Tick({
+        $pw = $script:PlayerWin
+        if (-not $pw -or $pw.Form.IsDisposed) { $this.Stop(); return }
+        if (-not $pw.Form.Visible -or $pw.Form.WindowState -eq 'Minimized' -or -not $pw.WebView.CoreWebView2) { $pw.PtrIn = $false; return }
+        try {
+            $wv = $pw.WebView
+            $inside = $wv.RectangleToScreen($wv.ClientRectangle).Contains([System.Windows.Forms.Cursor]::Position)
+            if ($pw.PtrIn -and -not $inside) { Send-PlayerPointerLeave }
+            $pw.PtrIn = $inside
+        } catch { }
+    })
+    $pw.PtrTimer = $t
+    $pw.Form.Add_Disposed({ try { $script:PlayerWin.PtrTimer.Stop(); $script:PlayerWin.PtrTimer.Dispose() } catch { } })
+    $t.Start()
 }
 
 function Sync-PlayerPointer {
@@ -9907,7 +9988,7 @@ function Invoke-FollowCheck([string] $Only = '', [switch] $Background) {
         if ($script:FollowRun -and $script:FollowRun.Left -gt 0) { return }   # (still busy with the last one)
         $script:FollowRun = @{ Left = $favs.Count; Total = 0 }
         foreach ($r in $favs) {
-            [void](Start-ApiJob "Follow $($r.Item.Title)" { param($rec) ,@(Get-FollowFiles $rec) } {
+            [void](Start-ApiJob "Follow $($r.Item.Title)" { param($rec) Get-FollowFiles $rec } {   # (no @(): Get-FollowFiles already hands back one list
                 param($files, $rec)
                 $script:FollowRun.Total += (Add-FollowNew $rec @($files))
                 Complete-FollowRun
@@ -9917,7 +9998,8 @@ function Invoke-FollowCheck([string] $Only = '', [switch] $Background) {
     }
     $total = 0
     foreach ($r in $favs) {
-        try { $total += (Add-FollowNew $r @(Get-FollowFiles $r)) } catch { Write-LogException $_ "Follow $($r.Item.Title)" }
+        # (not @(Get-FollowFiles ...): that wraps the list in another one)
+        try { $total += (Add-FollowNew $r (Get-FollowFiles $r)) } catch { Write-LogException $_ "Follow $($r.Item.Title)" }
     }
     Save-FavMap
     if ($total) { Show-AppNotification 'New episodes' ('{0} new episode(s) of followed series are downloading' -f $total) }
@@ -10408,7 +10490,7 @@ function Get-NodeFiles {
         'recent' { @(Get-RecentFiles | Where-Object { $_.Downloadable }) }
         'continue' { @(Get-ContinueFiles | Where-Object { $_.Downloadable }) }
         'watchlater' { @(Get-WatchLaterFiles | Where-Object { $_.Downloadable }) }
-        { $_ -in 'newweek', 'expiring' } { @(@(Get-DatedFiles $tag.Kind.Replace('newweek', 'new')) | Where-Object { $_ -and $_.Downloadable }) }
+        { $_ -in 'newweek', 'expiring' } { @((Get-DatedFiles $tag.Kind.Replace('newweek', 'new')) | Where-Object { $_ -and $_.Downloadable }) }
         { $_ -in 'category', 'letter', 'radiocategory', 'radioletter' } {
             # the programmes/recordings listed in the folder (not every series inside it)
             if (Expand-FolderNode $Node) { @($tag.Items | Where-Object { $_.Type -in 'program', 'audio' }) }
@@ -13827,7 +13909,7 @@ function Add-Recording($Channel, [datetime] $Start, [datetime] $End, [string] $T
     $r = @{ Id = [guid]::NewGuid().ToString('N').Substring(0, 10); Title = $(if ($Title) { $Title } else { [string]$Channel.Title }); Medium = $medium
             ChannelId = [string]$Channel.Id; ChannelTitle = [string]$Channel.Title; Manifest = [string]$Channel.ManifestPath
             Start = $Start.ToString('o'); End = $End.ToString('o'); Status = 'Scheduled'; File = ''; Note = '' }
-    [void](Get-Recordings).Add($r)
+    [void](Get-Recordings); [void]$script:Recs.Add($r)   # (the list itself: a function hands back its items, not the list)
     Save-Recordings
     Write-Log INFO ("Recording planned: {0} on {1}, {2:dd.MM HH:mm}-{3:HH:mm}" -f $r.Title, $r.ChannelTitle, $Start, $End)
     Start-RecordTimer
@@ -13897,8 +13979,15 @@ function Start-RecordingNow($r) {
         $name = Get-SafeFileName ('{0} {1:yyyy-MM-dd HH.mm} {2}' -f $rec.ChannelTitle, (Get-Date), $(if ($rec.Title -ne $rec.ChannelTitle) { $rec.Title } else { '' })).Trim()
         $out = Join-Path $dir "$name.$ext"
         # fragmented MP4: what is recorded stays playable even if the recording is cut off
-        $argv = @('-hide_banner', '-loglevel', 'error', '-y', '-user_agent', $script:UserAgent, '-i', $res.Url, '-t', "$secs")
-        if ($rec.Medium -eq 'radio') { $argv += @('-vn', '-c:a', 'copy') } else { $argv += @('-c', 'copy') }
+        $argv = @('-hide_banner', '-loglevel', 'error', '-y')
+        if ($rec.Medium -eq 'radio') { $argv += @('-user_agent', $script:UserAgent, '-i', $res.Url, '-t', "$secs", '-vn', '-c:a', 'copy') }
+        else {
+            # TV: one picture quality (Options > Download rules > Quality) and its sound, as downloads do
+            $src = Select-HlsVariant $res.Url
+            foreach ($a in @($src.Inputs)) { if ($a -eq '-i') { $argv += @('-user_agent', $script:UserAgent) }; $argv += $a }
+            $argv += @($src.Maps) + @('-t', "$secs", '-c', 'copy')
+            Write-Log DEBUG "Recording $($rec.Title): $($src.Label)"
+        }
         $argv += @('-movflags', '+frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', $out)
         try {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -13991,7 +14080,7 @@ function Show-RecordingsWindow {
     $script:RecUi = @{ Form = $w; List = $lv }
     $sel = { @($script:RecUi.List.SelectedItems | ForEach-Object { $_.Tag }) }
     $bStop.Add_Click({ foreach ($r in (& $sel)) { Stop-RecordingNow $r }; Update-RecordingsList })
-    $bRemove.Add_Click({ foreach ($r in (& $sel)) { if ($r.Status -ne 'Recording') { [void](Get-Recordings).Remove($r) } }; Save-Recordings; Update-RecordingsList })
+    $bRemove.Add_Click({ foreach ($r in (& $sel)) { if ($r.Status -ne 'Recording') { [void](Get-Recordings); $script:Recs.Remove($r) } }; Save-Recordings; Update-RecordingsList })
     $bPlay.Add_Click({ $r = @(& $sel) | Select-Object -First 1; if ($r -and $r.File -and (Test-Path -LiteralPath $r.File)) { Start-Process -FilePath 'explorer.exe' -ArgumentList "/select,`"$($r.File)`"" } })
     $bDir.Add_Click({ $d = Get-RecordDir 'tv'; New-Item -ItemType Directory -Path $d -Force | Out-Null; Start-Process $d })
     $w.Add_FormClosed({ $script:RecUi = $null })
@@ -14050,7 +14139,8 @@ $script:AppActions = [ordered]@{
     playpause = 'Play / pause'; next = 'Next'; prev = 'Previous'; back = 'Back 15 seconds'; fwd = 'Forward 15 seconds'
     volup = 'Volume up'; voldown = 'Volume down'; mute = 'Mute'; stop = 'Stop'; show = 'Show NRK Browser'
 }
-$script:HotkeyDefaults = [ordered]@{ playpause = 'Ctrl+Alt+P'; next = 'Ctrl+Alt+Right'; prev = 'Ctrl+Alt+Left'; back = ''; fwd = ''; volup = 'Ctrl+Alt+Up'; voldown = 'Ctrl+Alt+Down'; mute = 'Ctrl+Alt+M'; stop = ''; show = 'Ctrl+Alt+N' }
+# (no Ctrl+Alt+arrows: Intel graphics drivers rotate the screen with those)
+$script:HotkeyDefaults = [ordered]@{ playpause = 'Ctrl+Alt+P'; next = 'Ctrl+Alt+Shift+Right'; prev = 'Ctrl+Alt+Shift+Left'; back = ''; fwd = ''; volup = 'Ctrl+Alt+Shift+Up'; voldown = 'Ctrl+Alt+Shift+Down'; mute = 'Ctrl+Alt+M'; stop = ''; show = 'Ctrl+Alt+N' }
 $script:KeyActions = [ordered]@{ options = 'Options'; logs = 'Logs'; downloads = 'Downloads'; indexer = 'Indexer'; filter = 'Search / filter box'; grid = 'Thumbnails / list'; later = 'Watch later (selected)'; recordings = 'Recordings' }
 $script:KeyDefaults = [ordered]@{ options = 'Ctrl+Oemcomma'; logs = 'Ctrl+L'; downloads = 'Ctrl+D'; indexer = 'Ctrl+I'; filter = 'Ctrl+F'; grid = 'Ctrl+G'; later = 'Ctrl+W'; recordings = 'Ctrl+R' }
 
@@ -14146,7 +14236,9 @@ function Invoke-AppShortcut($E) {
     # the main window's own shortcuts (Options > Shortcuts); $true when one matched
     $txt = ConvertTo-KeyText $E.KeyData
     if (-not $txt) { return $false }
-    if (-not $script:KeyMapCache -or $script:KeyMapCacheAt -ne (Get-AppSettings).KeyMap) { $script:KeyMapCache = Get-KeyMapSetting 'KeyMap' $script:KeyDefaults; $script:KeyMapCacheAt = (Get-AppSettings).KeyMap }
+    if (-not ($E.Control -or $E.Alt) -and [string]$E.KeyCode -notmatch '^F\d+$') { return $false }   # (shortcuts have Ctrl or Alt, or are F-keys: plain keys and arrows go straight on)
+    $km = [string](Get-AppSettings).KeyMap
+    if (-not $script:KeyMapCache -or $script:KeyMapCacheAt -ne $km) { $script:KeyMapCache = Get-KeyMapSetting 'KeyMap' $script:KeyDefaults; $script:KeyMapCacheAt = $km }
     foreach ($a in $script:KeyMapCache.Keys) {
         if ($script:KeyMapCache[$a] -ne $txt) { continue }
         switch ($a) {
@@ -14188,6 +14280,13 @@ function Initialize-Taskbar {
         $script:TbIcons = @{ prev = (New-TaskbarIcon 'prev'); next = (New-TaskbarIcon 'next'); play = (New-TaskbarIcon 'play'); pause = (New-TaskbarIcon 'pause') }
         $script:Taskbar = New-Object NrkTaskbar($form.Handle, [Action[int]]{ param($id) try { switch ($id) { 1 { Invoke-AppAction 'prev' } 2 { Invoke-AppAction 'playpause' } 3 { Invoke-AppAction 'next' } } } catch { Write-LogException $_ 'Taskbar button' } })
         $script:Taskbar.SetButtons($script:TbIcons.prev, $script:TbIcons.play, $script:TbIcons.next, 'Previous', 'Play / pause', 'Next')
+        if (-not $script:TbHandleWired) {
+            # (Windows can make the main window again, e.g. when it goes to the tray: the buttons with it)
+            $script:TbHandleWired = $true
+            $form.Add_HandleCreated({ try { if ($script:Taskbar) { Write-Log DEBUG 'Taskbar: window made again, buttons again'; Initialize-Taskbar } } catch { } })
+        }
+        if ($script:TbTimer) { $script:TbTimer.Stop(); $script:TbTimer.Dispose() }
+        $script:TbState = $null
         $script:TbTimer = New-Object System.Windows.Forms.Timer; $script:TbTimer.Interval = 1000
         $script:TbTimer.Add_Tick({ Update-TaskbarButtons })
         $script:TbTimer.Start()
