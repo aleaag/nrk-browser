@@ -74,7 +74,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.9.1'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.9.3'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -2576,6 +2576,16 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::add_ThreadException({
     param($s, $e)
     Write-Log ERROR ("Unhandled UI exception: {0}: {1}`n{2}" -f $e.Exception.GetType().FullName, $e.Exception.Message, $e.Exception.StackTrace)
+    # (2.9.2) which script line: PowerShell's own position and call stack
+    try {
+        $er = $e.Exception.ErrorRecord
+        if ($er) {
+            if ($er.InvocationInfo -and $er.InvocationInfo.PositionMessage) { Write-Log ERROR ("  at: {0}" -f ($er.InvocationInfo.PositionMessage -replace '\s+', ' ')) }
+            if ($er.ScriptStackTrace) { Write-Log ERROR ("  script stack: {0}" -f ($er.ScriptStackTrace -replace "`r?`n", ' <- ')) }
+        }
+        $inner = $e.Exception.InnerException
+        if ($inner) { Write-Log ERROR ("  inner: {0}: {1}" -f $inner.GetType().FullName, $inner.Message) }
+    } catch { }
     try { $statusLabel.Text = "Error: $($e.Exception.Message) (see Logs)" } catch { }
 })
 
@@ -2721,7 +2731,10 @@ function Update-MaxBounds {
             $fy = [NrkNative]::GetSystemMetrics(33) + [NrkNative]::GetSystemMetrics(92)   # SM_CYSIZEFRAME + SM_CXPADDEDBORDER
             $r = New-Object System.Drawing.Rectangle(($wa.X - $b.X - $fx), ($wa.Y - $b.Y - $fy), ($wa.Width + 2 * $fx), ($wa.Height + 2 * $fy))
         }
-        if ($Window.MaximizedBounds -ne $r) { $Window.MaximizedBounds = $r }
+        # (MaximizedBounds is "protected" in Windows Forms: PowerShell can't see it, so through reflection.
+        #  Before 2.9.2 this failed silently, which is why maximized windows covered the taskbar.)
+        if (-not $script:MaxBoundsProp) { $script:MaxBoundsProp = [System.Windows.Forms.Form].GetProperty('MaximizedBounds', [System.Reflection.BindingFlags]'Instance, NonPublic, Public') }
+        if ($script:MaxBoundsProp -and $script:MaxBoundsProp.GetValue($Window, $null) -ne $r) { $script:MaxBoundsProp.SetValue($Window, $r, $null) }
     } catch { Write-Log DEBUG "Update-MaxBounds: $($_.Exception.Message)" }
 }
 
@@ -2827,7 +2840,12 @@ $script:AssetBase = 'https://raw.githubusercontent.com/{0}/refs/heads/main' -f $
 $script:AssetsDir = Join-Path $script:AppDataDir 'assets'
 $script:AssetImgs = @{}
 $script:AssetTopStyles = @('thin', 'bold', 'solid', 'accent', 'duotone', 'ring', 'tiles', 'soft', 'muted', 'muted-hover')
-$script:AssetTopNames = @('back', 'index', 'down', 'logs', 'reload', 'options')
+$script:AssetTopNames = @('back', 'index', 'down', 'logs', 'reload', 'options',
+    # 2.9.2: the buttons of the Downloads and Logs windows, the main window and the cast bar
+    'play', 'pause', 'stop', 'cancel', 'check', 'selectall', 'minus', 'folder', 'copy', 'edit', 'trash', 'web', 'link', 'cast', 'rewind', 'forward', 'volume',
+    'previous', 'next', 'window', 'record',
+    # 2.9.3: the video player's bar
+    'startover', 'speed', 'subtitles', 'quality', 'sleep', 'pin', 'fullscreen', 'mini', 'camera')
 $script:AssetListKinds = @('folder', 'program', 'episode', 'live', 'other', 'star', 'new', 'clock')
 $script:AssetPictures = @{ continue = 'continue-watching'; watchlater = 'watch-later'; tv = 'tv'; radio = 'radio'; recent = 'recently-played'; fav = 'favourites'; new = 'new-this-week'; last = 'last-chance' }
 
@@ -2968,7 +2986,7 @@ function Update-AssetPictures {
     foreach ($k in @($script:Placeholders.Keys)) { $script:Placeholders.Remove($k) }
     $script:SmallPlaceholders = @{}
     Reset-ListIcons
-    Set-TopBarIcons
+    Set-TopBarIcons   # (also the other buttons: Update-IconButtons)
     try { if (-not $script:SelectedFile) { $pic.Image = $null; Show-FolderPreview } } catch { }
     try { $itemsList.Refresh(); $folderTree.Refresh() } catch { }
     $shown = try { $pic.Image } catch { $null }
@@ -3210,6 +3228,60 @@ function Set-TopBarIcons {
             $d[0].Add_MouseLeave({ if ($this.Tag -is [hashtable] -and $this.Tag.Off) { $this.Image = $this.Tag.Off } })
         }
     }
+    try { Update-IconButtons } catch { }   # (2.9.2: the other windows' buttons in the same look)
+}
+
+# ---- 2.9.2: icons on the buttons of the Downloads and Logs windows, the main window and the cast bar
+# The same look as the top bar (Options > General > Top bar icons): icons\<theme>\<style>\<kind>.png from
+# the repository. "Text symbols" (or a missing file): the old symbol in the text, as before.
+# The teal (primary) buttons use the "tiles" icons, which are made for a teal background.
+$script:IconButtons = New-Object System.Collections.ArrayList   # @{ Button; Kind; Text; Glyph; Primary; IconOnly }
+$script:BtnIconCache = @{}
+
+function Get-ButtonIcon([string] $Kind, [bool] $Primary, [int] $Size = 18) {
+    $style = [string](Get-AppSettings).TopIcons
+    if (-not $style -or $style -eq 'text') { return $null }
+    # (on an ordinary button: label = thin; ring = thin, the ring is too small at 18 px; tiles = solid,
+    #  its dark icons are made for a teal tile)
+    $folder = if ($Primary) { 'tiles' } else { switch ($style) { 'label' { 'thin' } 'ring' { 'thin' } 'tiles' { 'solid' } default { $style } } }
+    $key = '{0}|{1}|{2}|{3}' -f (Get-AssetTheme), $folder, $Kind, $Size
+    if ($script:BtnIconCache.ContainsKey($key)) { return $script:BtnIconCache[$key] }
+    $png = Get-AssetImage ('icons/{0}/{1}/{2}.png' -f (Get-AssetTheme), $folder, $Kind)
+    $img = if ($png) { New-ScaledImage $png $Size $Size } else { $null }
+    $script:BtnIconCache[$key] = $img
+    return $img
+}
+
+function Set-IconText($Button, [string] $Kind, [string] $Text, [string] $Glyph = '', [switch] $Primary, [switch] $IconOnly, [string] $Plain = '') {
+    # (-Plain: the exact text when there is no icon, e.g. "-15")
+    # sets a button's icon and text (and remembers them, so a change of look or theme redraws it)
+    if (-not $Button) { return }
+    $meta = $null
+    foreach ($m in $script:IconButtons) { if ([object]::ReferenceEquals($m.Button, $Button)) { $meta = $m; break } }
+    if (-not $meta) { $meta = @{ Button = $Button }; [void]$script:IconButtons.Add($meta); $Button.Add_Disposed({ $me = $this; foreach ($m in @($script:IconButtons)) { if ([object]::ReferenceEquals($m.Button, $me)) { $script:IconButtons.Remove($m) } } }) }
+    $meta.Kind = $Kind; $meta.Text = $Text; $meta.Glyph = $Glyph; $meta.Primary = [bool]$Primary; $meta.IconOnly = [bool]$IconOnly; $meta.Plain = $Plain
+    $img = Get-ButtonIcon $Kind ([bool]$Primary) $(if ($IconOnly) { 20 } else { 18 })
+    if ($img) {
+        if (-not [object]::ReferenceEquals($Button.Image, $img)) { $Button.Image = $img }
+        $Button.TextImageRelation = 'ImageBeforeText'
+        if ($Button.TextAlign -eq 'MiddleLeft') { $Button.ImageAlign = 'MiddleLeft' } else { $Button.ImageAlign = 'MiddleCenter' }
+        $t = if ($IconOnly) { '' } else { ' ' + $Text }
+    } else {
+        if ($Button.Image -and $script:BtnIconCache.Count -ge 0) { $Button.Image = $null }
+        $Button.TextImageRelation = 'Overlay'
+        $t = if ($Plain) { $Plain } elseif ($IconOnly) { $Glyph } elseif ($Glyph) { '{0}  {1}' -f $Glyph, $Text } else { $Text }
+    }
+    if ($Button.Text -ne $t) { $Button.Text = $t }
+}
+
+function Update-IconButtons {
+    # the look or the theme changed (or new icons arrived): every remembered button again
+    $old = $script:BtnIconCache; $script:BtnIconCache = @{}
+    foreach ($m in @($script:IconButtons)) {
+        if (-not $m.Button -or $m.Button.IsDisposed) { $script:IconButtons.Remove($m); continue }
+        Set-IconText $m.Button $m.Kind $m.Text $m.Glyph -Primary:$m.Primary -IconOnly:$m.IconOnly -Plain ([string]$m.Plain)
+    }
+    foreach ($v in @($old.Values)) { if ($v) { try { $v.Dispose() } catch { } } }
 }
 
 
@@ -3989,6 +4061,12 @@ $btnCast = New-FlatButton ("Cast  {0}" -f [char]0x25BE) 96
 $btnOpenWeb = New-FlatButton 'Open on NRK' 0
 $btnCopyUrl = New-FlatButton 'Copy URL' 0
 $pActions.Controls.AddRange(@($btnPlay, $btnDownload, $btnCast, $btnOpenWeb, $btnCopyUrl))
+$btnCast.Width = 110
+# (2.9.2: icons in the chosen look; Play is set in Update-Actions)
+Set-IconText $btnDownload 'down' ("Download  {0}" -f [char]0x25BE)
+Set-IconText $btnCast 'cast' ("Cast  {0}" -f [char]0x25BE)
+Set-IconText $btnOpenWeb 'web' 'Open on NRK'
+Set-IconText $btnCopyUrl 'link' 'Copy URL'
 $pDesc = New-Object System.Windows.Forms.Label
 $pDesc.Dock = 'Top'; $pDesc.Height = 24; $pDesc.ForeColor = $T.Muted; $pDesc.AutoEllipsis = $true
 $pDesc.Padding = New-Object System.Windows.Forms.Padding(0, 10, 0, 0)
@@ -4195,6 +4273,7 @@ function Set-AppTheme {
     Write-Log INFO "Theme switched to $eff (setting: $Mode)"
 
     Reset-ListIcons
+    try { Update-IconButtons } catch { }   # (2.9.2)
 
     $script:DarkRenderer = New-ThemeRenderer
     foreach ($m in @($downloadMenu, $filesMenu, $treeMenu) + @($(if ($script:DlUi) { $script:DlUi.Menu }))) {
@@ -5302,23 +5381,26 @@ function Update-ContinueRecord($File, [double] $Pos, [bool] $Done) {
 
 function Get-ContinueFiles {
     # started and not finished (newest first), then the next episode of series you are watching
-    $out = New-Object System.Collections.Generic.List[object]
-    $series = @{}
-    foreach ($r in (Get-ContinueMap).Values) {
+    $out = @()
+    $have = @{}
+    foreach ($r in @((Get-ContinueMap).Values)) {
+        if (-not $r -or -not $r.File) { continue }
         $f = ConvertFrom-FileRecord $r.File
         $rec = Get-PlayRecord $f
-        if ($f.SeriesItem -and $f.SeriesItem.Id) { if (-not $series.ContainsKey([string]$f.SeriesItem.Id)) { $series[[string]$f.SeriesItem.Id] = $r } }
         if ($rec -and -not $rec.Done -and [double]$rec.Pos -ge 15) {
             if ($f.SeriesItem -and $f.SeriesItem.Title -and -not $f.ListTitle) { $f | Add-Member -NotePropertyName ListTitle -NotePropertyValue ('{0}  ·  {1}' -f $f.SeriesItem.Title, $f.Title) -Force }
-            $out.Add($f)
+            $out += $f
+            $have[('{0}|{1}' -f $f.Type, $f.Id)] = $true
         }
     }
     foreach ($n in @($script:ContNext)) {
         if (-not $n) { continue }
-        $dup = $false; foreach ($x in $out) { if ($x.Type -eq $n.Type -and $x.Id -eq $n.Id) { $dup = $true; break } }
-        if (-not $dup -and -not (Test-Watched $n)) { $out.Add($n) }
+        $k = '{0}|{1}' -f $n.Type, $n.Id
+        if (-not $have.ContainsKey($k) -and -not (Test-Watched $n)) { $out += $n; $have[$k] = $true }
     }
-    return ,@($out)
+    # (no ",$out": with nothing started that gave the folder one empty "file" - the real cause of
+    #  "Argument types do not match"; callers always use @(...))
+    return $out
 }
 
 function Get-ContinueNextWork {
@@ -6268,14 +6350,16 @@ function Update-Actions {
     $btnOpenWeb.Enabled = [bool](($f -and $f.WebUrl) -or (-not $f -and ($inSeries -or ($tag -and $tag.Kind -in 'radioseries', 'radioseason'))))
     $btnCopyUrl.Enabled = $btnOpenWeb.Enabled
     $btnCast.Enabled = [bool]((Test-CastableFile $f) -or $script:Cast.Session)
-    $btnPlay.Text = if ($f -and $f.Type -eq 'live') { "{0}  Watch live" -f [char]0x25CF }
-                    elseif ($f -and $f.Type -eq 'radiolive') { "{0}  Listen live" -f [char]0x25CF }
-                    elseif ($f -and $f.Type -eq 'audio') { "{0}  Listen" -f [char]0x25B6 }
-                    elseif (-not $f -and $tag -and $tag.Kind -eq 'radioseason') { "{0}  Listen" -f [char]0x25B6 }
-                    elseif ($f -and $f.Type -eq 'episode') { "{0}  Play episode" -f [char]0x25B6 }
-                    elseif (-not $f -and $tag -and $tag.Kind -eq 'season') { "{0}  Play season" -f [char]0x25B6 }
-                    else { "{0}  Play" -f [char]0x25B6 }
-    $btnPlay.Width = if ($btnPlay.Text.Length -gt 8) { 150 } else { 120 }
+    $pt = if ($f -and $f.Type -eq 'live') { 'Watch live' }
+          elseif ($f -and $f.Type -eq 'radiolive') { 'Listen live' }
+          elseif ($f -and $f.Type -eq 'audio') { 'Listen' }
+          elseif (-not $f -and $tag -and $tag.Kind -eq 'radioseason') { 'Listen' }
+          elseif ($f -and $f.Type -eq 'episode') { 'Play episode' }
+          elseif (-not $f -and $tag -and $tag.Kind -eq 'season') { 'Play season' }
+          else { 'Play' }
+    $live = [bool]($f -and $f.Type -in 'live', 'radiolive')
+    Set-IconText $btnPlay 'play' $pt $(if ($live) { [string][char]0x25CF } else { [string][char]0x25B6 }) -Primary   # (2.9.2: the icon in the chosen look)
+    $btnPlay.Width = if ($pt.Length -gt 5) { 150 } else { 120 }
     $btnBack.Enabled = [bool]($f -or ($folderTree.SelectedNode -and $folderTree.SelectedNode.Parent))
 }
 
@@ -6586,7 +6670,7 @@ function Send-PlayerOnlyMode {
     if (-not $pw -or -not $pw.WebView.CoreWebView2) { return }
     $flag = if ($script:PlayerOnly) { 'true' } else { 'false' }
     try { [void]$pw.WebView.CoreWebView2.ExecuteScriptAsync("window.__nrkbSetPlayerOnly && window.__nrkbSetPlayerOnly($flag)") } catch { }
-    $pw.BtnMode.Text = if ($script:PlayerOnly) { 'Show full page' } else { 'Player only' }
+    Set-IconText $pw.BtnMode 'window' $(if ($script:PlayerOnly) { 'Show full page' } else { 'Player only' })
 }
 
 # ---- built-in video player ---------------------------------------------------------------
@@ -7200,6 +7284,25 @@ function Get-PlayerWindow {
     foreach ($x in $bSpeed, $bSubs, $bAudio, $bStartOver, $bLiveBack, $bLiveGo) { $x.Visible = $false }
     $hint.ForeColor = $T.Muted; $hint.AutoEllipsis = $true
     $bar.Controls.AddRange(@($bPrev, $bNext, $bStartOver, $bLiveBack, $bLiveGo, $bSpeed, $bSubs, $bAudio, $bQual, $bSleep, $bMode, $bTop, $bFull, $bMini, $bShot, $bReload, $bExt, $bCast, $hint))
+    # 2.9.3: icons in the chosen look (Options > General > Top bar icons); -Plain = the text as before
+    Set-IconText $bPrev 'previous' 'Previous' -Plain ("{0}  Previous" -f [char]0x2039)
+    Set-IconText $bNext 'next' 'Next' -Plain ("Next  {0}" -f [char]0x203A)
+    Set-IconText $bStartOver 'startover' 'Start over' -Plain ("{0}  Start over" -f [char]0x21E4)
+    Set-IconText $bLiveBack 'rewind' '1 min' -Plain ("{0} 1 min" -f [char]0x21BA)
+    Set-IconText $bLiveGo 'record' 'LIVE' -Plain ("{0} LIVE" -f [char]0x25CF)
+    Set-IconText $bSpeed 'speed' $bSpeed.Text -Plain $bSpeed.Text
+    Set-IconText $bSubs 'subtitles' ("Subtitles  {0}" -f [char]0x25BE)
+    Set-IconText $bAudio 'volume' ("Audio  {0}" -f [char]0x25BE)
+    Set-IconText $bQual 'quality' ("Quality  {0}" -f [char]0x25BE)
+    Set-IconText $bSleep 'sleep' ("Sleep  {0}" -f [char]0x25BE)
+    Set-IconText $bMode 'window' $bMode.Text
+    Set-IconText $bTop 'pin' 'Keep on top'
+    Set-IconText $bFull 'fullscreen' 'Fullscreen'
+    Set-IconText $bMini 'mini' 'Mini'
+    Set-IconText $bShot 'camera' 'Screenshot'
+    Set-IconText $bReload 'reload' 'Reload'
+    Set-IconText $bExt 'web' 'Open in browser'
+    Set-IconText $bCast 'cast' ("Cast  {0}" -f [char]0x25BE)
     $navTips.SetToolTip($bQual, 'Picture quality (Auto: picked by your connection)')
     $navTips.SetToolTip($bShot, 'Save the picture you see now (Pictures\NRK-Browser)')
     $navTips.SetToolTip($bMini, 'A small window that stays on top (again: back to normal size)')
@@ -7213,7 +7316,7 @@ function Get-PlayerWindow {
         $i = [array]::IndexOf($script:VideoRates, $cur); $r = $script:VideoRates[($i + 1) % $script:VideoRates.Count]
         $s.VideoRate = $r.ToString([Globalization.CultureInfo]::InvariantCulture); Save-AppSettings $s
         Invoke-PlayerScript ("nrkb.rate({0})" -f $r.ToString([Globalization.CultureInfo]::InvariantCulture))
-        $this.Text = 'Speed ' + (Format-Rate $r)
+        Set-IconText $this 'speed' ('Speed ' + (Format-Rate $r)) -Plain ('Speed ' + (Format-Rate $r))
     })
     $bSubs.Add_Click({ Show-PlayerSubsMenu })
     $bAudio.Add_Click({ Show-PlayerAudioMenu })
@@ -7365,7 +7468,7 @@ function Start-Player {
         $pw.Versions = if ($mode -eq 'builtin' -and $x) { $x.Versions } else { @() }; $pw.ATracks = @(); $pw.ATrack = -1
         Update-PlayerExtras
         $pw.Hint.Text = if ($note) { $note } else { 'Loading...' }
-        $pw.BtnMode.Text = if ($mode -eq 'builtin') { 'Open NRK page' } elseif ($script:PlayerOnly) { 'Show full page' } else { 'Player only' }
+        Set-IconText $pw.BtnMode $(if ($mode -eq 'builtin') { 'web' } else { 'window' }) $(if ($mode -eq 'builtin') { 'Open NRK page' } elseif ($script:PlayerOnly) { 'Show full page' } else { 'Player only' })
         $pw.Form.Text = "$($playTarget.Title)  -  NRK"
         if (-not $pw.Form.Visible) {
             $pw.Form.Show()
@@ -9153,7 +9256,13 @@ function New-CastBar {
     $bSubs = & $mk 'CC' 46
     $bMute = & $mk ([string][char]0x266A) 40
     $vol = New-Object System.Windows.Forms.TrackBar; $vol.Minimum = 0; $vol.Maximum = 100; $vol.TickStyle = 'None'; $vol.Width = 90; $vol.AutoSize = $false; $vol.Height = 30; $vol.BackColor = $T.Panel
-    $bStop = & $mk ('{0}  Stop casting' -f [char]0x25A0) 130; $bStop.ForeColor = $T.Bad
+    $bStop = & $mk ('{0}  Stop casting' -f [char]0x25A0) 140; $bStop.ForeColor = $T.Bad
+    # 2.9.2: icons in the chosen look
+    Set-IconText $bBack 'rewind' '30' -Plain ('{0} 30' -f [char]0x21BA)
+    Set-IconText $bFwd 'forward' '30' -Plain ('30 {0}' -f [char]0x21BB)
+    Set-IconText $bPlay 'pause' '' ([string][char]0x2016) -IconOnly
+    Set-IconText $bMute 'volume' '' ([string][char]0x266A) -IconOnly
+    Set-IconText $bStop 'stop' 'Stop casting' ([string][char]0x25A0)
     $right.Controls.AddRange(@($bBack, $bPlay, $bFwd, $time, $bSubs, $bMute, $vol, $bStop))
     $mid = New-Object System.Windows.Forms.Panel; $mid.Dock = 'Fill'; $mid.BackColor = $T.Panel; $mid.Padding = New-Object System.Windows.Forms.Padding(4, 16, 8, 0)
     $seek = New-Object System.Windows.Forms.TrackBar; $seek.Minimum = 0; $seek.Maximum = 1000; $seek.TickStyle = 'None'; $seek.Dock = 'Top'; $seek.AutoSize = $false; $seek.Height = 30; $seek.BackColor = $T.Panel
@@ -9201,7 +9310,7 @@ function Update-CastBar {
     $set = { param($c, [string] $v) if ($c.Text -ne $v) { $c.Text = $v } }   # (only what changed: no flicker, 3 times a second)
     & $set $u.Info "Casting to $($s.Device.Name)  ($kind)`n$(if ($s.Msg) { $s.Msg } else { $title })"
     $playing = ($s.State -eq 'PLAYING' -or $s.State -eq 'BUFFERING')
-    & $set $u.Play $(if ($playing) { [string][char]0x2016 } else { [string][char]0x25B6 })
+    if ($u.PlayState -ne $playing) { $u.PlayState = $playing; if ($playing) { Set-IconText $u.Play 'pause' '' ([string][char]0x2016) -IconOnly } else { Set-IconText $u.Play 'play' '' ([string][char]0x25B6) -IconOnly } }
     $live = [bool]$s.Media.Live
     $u.Back.Enabled = -not $live; $u.Fwd.Enabled = -not $live; $u.Seek.Enabled = (-not $live -and $s.Dur -gt 0)
     $p = Get-CastPosition $s
@@ -9254,7 +9363,7 @@ function Update-SleepUi {
     $on = [bool]($script:Sleep.Until -or $script:Sleep.EndOfItem); $label = Get-SleepLabel
     try { Invoke-AudioScript ("nrkb.setSleep({0}, '{1}')" -f $on.ToString().ToLower(), $label) } catch { }
     $pw = $script:PlayerWin
-    if ($pw -and $pw.Sleep -and -not $pw.Form.IsDisposed) { $pw.Sleep.Text = if ($on) { "Sleep: $label" } else { 'Sleep  ' + [char]0x25BE }; $pw.Sleep.ForeColor = if ($on) { $T.Accent } else { $T.Text } }
+    if ($pw -and $pw.Sleep -and -not $pw.Form.IsDisposed) { $st = if ($on) { "Sleep: $label" } else { 'Sleep  ' + [char]0x25BE }; Set-IconText $pw.Sleep 'sleep' $st -Plain $st; $pw.Sleep.ForeColor = if ($on) { $T.Accent } else { $T.Text } }
 }
 
 function Invoke-SleepNow {
@@ -9373,14 +9482,14 @@ function Set-PlayerMini([bool] $On) {
         $w = 520; $h = 340
         $f.Bounds = New-Object System.Drawing.Rectangle(($wa.Right - $w - 16), ($wa.Bottom - $h - 16), $w, $h)
         $f.TopMost = $true
-        $pw.MiniBtn.Text = 'Normal size'
+        Set-IconText $pw.MiniBtn 'mini' 'Normal size'
         Write-Log INFO 'Player: mini player'
     } elseif (-not $On -and $pw.Mini) {
         $prev = $pw.Mini; $pw.Mini = $null
         $f.FormBorderStyle = $prev.Border; $f.MinimumSize = $prev.Min; $f.TopMost = $prev.TopMost
         $f.Bounds = $prev.Bounds
         if ($prev.State -eq 'Maximized') { $f.WindowState = 'Maximized' }
-        $pw.MiniBtn.Text = 'Mini'
+        Set-IconText $pw.MiniBtn 'mini' 'Mini'
         foreach ($c in $pw.Bar.Controls) { $c.Visible = $true }
         Update-PlayerNav
         Write-Log INFO 'Player: normal size'
@@ -9396,7 +9505,7 @@ function Update-PlayerExtras {
     if (-not $pw -or -not $pw.Speed) { return }
     $b = ($pw.Mode -eq 'builtin'); $live = [bool]($pw.Target -and $pw.Target.File -and $pw.Target.File.Type -eq 'live')
     $pw.Speed.Visible = ($b -and -not $live)
-    $pw.Speed.Text = 'Speed ' + (Format-Rate ([double](Get-AppSettings).VideoRate))
+    $sp = 'Speed ' + (Format-Rate ([double](Get-AppSettings).VideoRate)); Set-IconText $pw.Speed 'speed' $sp -Plain $sp
     $pw.Subs.Visible = ($b -and @($pw.SubList).Count -gt 0)
     $pw.Audio.Visible = ($b -and (@($pw.ATracks).Count -gt 1 -or @($pw.Versions).Count -gt 0))
     foreach ($x in $pw.StartOver, $pw.LiveBack, $pw.LiveGo) { $x.Visible = ($b -and $live) }
@@ -9969,13 +10078,14 @@ function Get-AgeRating($File) {
     return $age
 }
 
-function Test-ChildAllowed($File) {
+function Test-ChildAllowed($File, [switch] $Quiet) {
     # $true when it may be played; child mode: only up to the chosen age (unknown = not allowed)
+    # -Quiet: no message (filtering a list)
     if (-not (Test-ChildMode) -or -not $File) { return $true }
     $max = [string](Get-AppSettings).ChildMaxAge
     $age = Get-AgeRating $File
     $ok = ($age -and [array]::IndexOf($script:AgeOrder, $age) -ge 0 -and [array]::IndexOf($script:AgeOrder, $age) -le [Math]::Max(0, [array]::IndexOf($script:AgeOrder, $max)))
-    if (-not $ok) {
+    if (-not $ok -and -not $Quiet) {
         Write-Log INFO "Child mode: $($File.Title) blocked (age $(if ($age) { $age } else { 'unknown' }), allowed up to $max)"
         [void][System.Windows.Forms.MessageBox]::Show($form, ("{0}`n`nNot in child mode: {1}." -f $File.Title, $(if ($age) { "rated $age" } else { 'NRK gives no age rating for it' })), 'Child mode', 'OK', 'Information')
     }
@@ -10805,7 +10915,7 @@ function Update-DownloadSummary {
     if ($ui.Pause) {
         $resume = [bool]($script:DlPaused -or ($c.Paused -and -not $busy))
         $ui.Pause.Tag = if ($resume) { 'resume' } else { 'pause' }
-        $ui.Pause.Text = if ($resume) { "{0}  Resume" -f [char]0x25B6 } else { "{0}  Pause" -f [char]0x2016 }
+        if ($resume) { Set-IconText $ui.Pause 'play' 'Resume' ([string][char]0x25B6) } else { Set-IconText $ui.Pause 'pause' 'Pause' ([string][char]0x2016) }
         $ui.Pause.Enabled = ($busy -or [bool]$c.Pending -or [bool]$c.Paused)
         $ui.Summary.Text = $parts -join '   ·   '
     }
@@ -11654,6 +11764,15 @@ function Show-DownloadsWindow {
     & $sepMk
     $bOpenTv = & $mk ("{0}  Open TV folder" -f [char]0x2197)
     $bOpenRadio = & $mk ("{0}  Open radio folder" -f [char]0x2197)
+    # 2.9.2: icons in the chosen look
+    Set-IconText $bSelAll 'selectall' 'Select all' ([string][char]0x2611)
+    Set-IconText $bStart 'down' 'Download selected' ([string][char]0x2193) -Primary
+    Set-IconText $bPause 'pause' 'Pause' ([string][char]0x2016)
+    Set-IconText $bCancel 'cancel' 'Cancel selected' ([string][char]0x2715)
+    Set-IconText $bClear 'check' 'Clear finished' ([string][char]0x2713)
+    Set-IconText $bClearNew 'minus' 'Clear not started' ([string][char]0x2212)
+    Set-IconText $bOpenTv 'folder' 'Open TV folder' ([string][char]0x2197)
+    Set-IconText $bOpenRadio 'folder' 'Open radio folder' ([string][char]0x2197)
     $folderNote = New-Object System.Windows.Forms.Label; $folderNote.Dock = 'Top'; $folderNote.Height = 46; $folderNote.ForeColor = $T.Muted
     $folderNote.Text = 'The folders are set in Options > Downloads.'; $sideItems.Add($folderNote)
     # (Dock=Top stacks in reverse order of adding)
@@ -11924,9 +12043,9 @@ function Update-LogsPauseButton {
     if (-not $ui -or -not $ui.Pause) { return }
     if ($ui.Paused) {
         $waiting = [int]$script:LogCount - [int]$ui.PausedAt
-        $ui.Pause.Text = "{0}  Resume{1}" -f [char]0x25B6, $(if ($waiting -gt 0) { "  ($waiting new)" } else { '' })
+        Set-IconText $ui.Pause 'play' ('Resume{0}' -f $(if ($waiting -gt 0) { "  ($waiting new)" } else { '' })) ([string][char]0x25B6)
         $ui.Pause.ForeColor = $T.Accent
-    } else { $ui.Pause.Text = "{0}  Pause" -f [char]0x2016; $ui.Pause.ForeColor = $T.Text }
+    } else { Set-IconText $ui.Pause 'pause' 'Pause' ([string][char]0x2016); $ui.Pause.ForeColor = $T.Text }
 }
 
 
@@ -12040,6 +12159,11 @@ function Show-LogsWindow {
     $bFolder = & $mk ("{0}  Open folder" -f [char]0x2197)
     $sep = New-Object System.Windows.Forms.Panel; $sep.Dock = 'Top'; $sep.Height = 14; $sep.BackColor = $T.Panel; $sideItems.Add($sep)
     $bClear = & $mk ("{0}  Clear log" -f [char]0x2715)
+    Set-IconText $bRefresh 'reload' 'Refresh' ([string][char]0x27F3)
+    Set-IconText $bCopy 'copy' 'Copy all' ([string][char]0x29C9)
+    Set-IconText $bEditor 'edit' 'Open in editor' ([string][char]0x270E)
+    Set-IconText $bFolder 'folder' 'Open folder' ([string][char]0x2197)
+    Set-IconText $bClear 'trash' 'Clear log' ([string][char]0x2715)
     $bClear.ForeColor = $T.Bad
     $sep2 = New-Object System.Windows.Forms.Panel; $sep2.Dock = 'Top'; $sep2.Height = 18; $sep2.BackColor = $T.Panel; $sideItems.Add($sep2)
     $disk = New-Object System.Windows.Forms.CheckBox; $disk.Text = 'Save logs to disk'; $disk.Checked = [bool]$script:LogToDisk
@@ -12277,7 +12401,7 @@ function Update-IndexerView {
     if ($script:CacheMode -eq 'Off') { $ui.Error.Text = 'Note: Options > "Refresh saved NRK data" is set to "Always fetch from NRK", so the app does not use what the indexer saves.' }
     $ui.Run.Enabled = -not $st.Running
     $ui.Pause.Enabled = $st.Running -and $s.State -ne 'stopping'
-    $ui.Pause.Text = if ($st.Running -and $s.State -eq 'paused') { 'Resume' } else { 'Pause' }
+    if ($st.Running -and $s.State -eq 'paused') { Set-IconText $ui.Pause 'play' 'Resume' } else { Set-IconText $ui.Pause 'pause' 'Pause' }   # (2.9.3: icons)
     $ui.Stop.Enabled = $st.Running -and $s.State -ne 'stopping'
     # the indexer's own log, newest lines last
     if (-not $script:LogToDisk) { if ($ui.Log.Text -notlike '(Logs are not saved*') { $ui.Log.Text = "(Logs are not saved to disk, so the indexer's log is not shown. Switch on 'Save logs to disk' in Logs or Options to see it here.)" }; return }
@@ -12348,6 +12472,7 @@ function Show-IndexerWindow {
     $ui.Stop = New-FlatButton 'Stop' 100
     [void](& $add $ui.Stop 270 248)
     $bFolder = New-FlatButton 'Open folder' 130
+    Set-IconText $ui.Run 'play' 'Run now' -Primary; Set-IconText $ui.Pause 'pause' 'Pause'; Set-IconText $ui.Stop 'stop' 'Stop'; Set-IconText $bFolder 'folder' 'Open folder'   # (2.9.3)
     [void](& $add $bFolder 380 248)
 
     $lblPace = New-Object System.Windows.Forms.Label; $lblPace.Text = 'Pause between requests'; $lblPace.AutoSize = $true
@@ -13499,8 +13624,19 @@ function Show-RadioMini {
     $w.Controls.AddRange(@($t1, $t2))
     $x = 12
     $btns = @{}
+    $tips = New-Object System.Windows.Forms.ToolTip
     foreach ($b in @(@('prev', [string][char]0x23EE, 'Previous'), @('back', '-15', 'Back 15 seconds'), @('play', [string][char]0x23EF, 'Play / pause'), @('fwd', '+15', 'Forward 15 seconds'), @('next', [string][char]0x23ED, 'Next'), @('show', 'Open', 'Show NRK Browser'))) {
         $bt = New-FlatButton $b[1] $(if ($b[0] -eq 'show') { 70 } else { 50 }); $bt.Location = New-Object System.Drawing.Point($x, 52); $bt.Height = 32; $bt.Tag = $b[0]
+        $tips.SetToolTip($bt, $b[2])
+        # 2.9.2: icons in the chosen look (the -15 / +15 keep their numbers)
+        switch ($b[0]) {
+            'prev' { Set-IconText $bt 'previous' '' $b[1] -IconOnly }
+            'next' { Set-IconText $bt 'next' '' $b[1] -IconOnly }
+            'play' { Set-IconText $bt 'pause' '' ([string][char]0x2016) -IconOnly }
+            'back' { Set-IconText $bt 'rewind' '15' -Plain '-15' }
+            'fwd' { Set-IconText $bt 'forward' '15' -Plain '+15' }
+            'show' { Set-IconText $bt 'window' 'Open' '' }
+        }
         $bt.Add_Click({ switch ($this.Tag) { 'prev' { Start-NextAudio -1 } 'next' { Start-NextAudio 1 } 'back' { Invoke-AudioScript 'nrkb.skip(-15)' } 'fwd' { Invoke-AudioScript 'nrkb.skip(15)' } 'play' { Invoke-AudioScript 'nrkb.toggle()' } 'show' { Show-MainWindow } } })
         $w.Controls.Add($bt); $btns[$b[0]] = $bt; $x += $bt.Width + 6
     }
@@ -13511,7 +13647,10 @@ function Show-RadioMini {
         if (-not $r -or $r.Form.IsDisposed) { return }
         $u = $script:AudioUi
         if ($r.Task -and $r.Task.IsCompleted) {
-            try { $s = ([string]$r.Task.Result | ConvertFrom-Json) | ConvertFrom-Json; $r.T1.Text = [string]$s.title; $r.T2.Text = [string]$s.sub; $r.Btn.play.Text = $(if ($s.paused) { [string][char]0x25B6 } else { [string][char]0x2016 }) } catch { }
+            try {
+                $s = ([string]$r.Task.Result | ConvertFrom-Json) | ConvertFrom-Json; $r.T1.Text = [string]$s.title; $r.T2.Text = [string]$s.sub
+                if ($r.Paused -ne [bool]$s.paused) { $r.Paused = [bool]$s.paused; if ($s.paused) { Set-IconText $r.Btn.play 'play' '' ([string][char]0x25B6) -IconOnly } else { Set-IconText $r.Btn.play 'pause' '' ([string][char]0x2016) -IconOnly } }
+            } catch { }
             $r.Task = $null
         }
         if (-not $u.Current) { $r.T1.Text = 'Nothing playing'; $r.T2.Text = ''; return }
@@ -13760,9 +13899,11 @@ function Show-RecordDialog($Channel) {
     $nLen = New-Object System.Windows.Forms.NumericUpDown; $nLen.Minimum = 1; $nLen.Maximum = 720; $nLen.Value = 60; $nLen.Width = 70; $nLen.Location = New-Object System.Drawing.Point(200, 88)
     $note = New-Object System.Windows.Forms.Label; $note.AutoSize = $false; $note.Size = New-Object System.Drawing.Size(400, 54); $note.Location = New-Object System.Drawing.Point(20, 124); $note.ForeColor = $T.Muted
     $note.Text = "Saved in $(Get-RecordDir $(if ($Channel.Type -eq 'radiolive') { 'radio' } else { 'tv' })). The app must be running (it may be in the tray). TV programmes: right-click one in the schedule > Record this programme."
-    $ok = New-FlatButton 'Record' 90 -Primary; $ok.Location = New-Object System.Drawing.Point(140, 186); $ok.DialogResult = 'OK'
-    $lst = New-FlatButton 'Recordings...' 110; $lst.Location = New-Object System.Drawing.Point(236, 186); $lst.Add_Click({ Show-RecordingsWindow })
+    $ok = New-FlatButton 'Record' 100 -Primary; $ok.Location = New-Object System.Drawing.Point(110, 186); $ok.DialogResult = 'OK'
+    $lst = New-FlatButton 'Recordings...' 130; $lst.Location = New-Object System.Drawing.Point(216, 186); $lst.Add_Click({ Show-RecordingsWindow })
     $no = New-FlatButton 'Cancel' 80; $no.Location = New-Object System.Drawing.Point(352, 186); $no.DialogResult = 'Cancel'
+    Set-IconText $ok 'record' 'Record' ([string][char]0x25CF) -Primary   # (2.9.2)
+    Set-IconText $lst 'window' 'Recordings...' ''
     $d.Controls.AddRange(@($rNow, $rAt, $tAt, $lLen, $nLen, $note, $ok, $lst, $no))
     $d.AcceptButton = $ok; $d.CancelButton = $no
     Set-DarkTheme $d; Enable-DarkTitleBar $d
@@ -13785,8 +13926,21 @@ function Show-RecordingsWindow {
     $lv = New-Object System.Windows.Forms.ListView; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.BorderStyle = 'None'; $lv.Dock = 'Fill'; $lv.HideSelection = $false
     foreach ($c in @(@('Title', 250), @('Channel', 130), @('When', 170), @('Status', 90), @('', 200))) { [void]$lv.Columns.Add($c[0], $c[1]) }
     $side = New-Object System.Windows.Forms.FlowLayoutPanel; $side.Dock = 'Bottom'; $side.Height = 52; $side.Padding = New-Object System.Windows.Forms.Padding(10, 10, 10, 0); $side.BackColor = $T.Panel
-    $bStop = New-FlatButton 'Stop / cancel' 120; $bRemove = New-FlatButton 'Remove from list' 140; $bPlay = New-FlatButton 'Open file' 100; $bDir = New-FlatButton 'Open folder' 110
-    $side.Controls.AddRange(@($bStop, $bRemove, $bPlay, $bDir))
+    $bNew = New-FlatButton 'Record...' 120 -Primary
+    $bStop = New-FlatButton 'Stop / cancel' 140; $bRemove = New-FlatButton 'Remove from list' 160; $bPlay = New-FlatButton 'Show file' 120; $bDir = New-FlatButton 'Open folder' 130
+    $side.Controls.AddRange(@($bNew, $bStop, $bRemove, $bPlay, $bDir))
+    # 2.9.2: icons in the chosen look
+    Set-IconText $bNew 'record' 'Record...' ([string][char]0x25CF) -Primary
+    Set-IconText $bStop 'stop' 'Stop / cancel' ([string][char]0x25A0)
+    Set-IconText $bRemove 'trash' 'Remove from list' ([string][char]0x2715)
+    Set-IconText $bPlay 'web' 'Show file' ([string][char]0x2197)
+    Set-IconText $bDir 'folder' 'Open folder' ([string][char]0x2197)
+    $bNew.Add_Click({
+        # record a live channel: the one selected in the main window, or pick from the channels you played
+        $ch = if ($script:SelectedFile -and $script:SelectedFile.Type -in 'live', 'radiolive') { $script:SelectedFile } else { $null }
+        if (-not $ch) { [void][System.Windows.Forms.MessageBox]::Show($script:RecUi.Form, 'Select a live TV or radio channel in the main window first (LIVE TV / LIVE Radio), then press Record... again - or right-click the channel > Record...', 'Record', 'OK', 'Information'); return }
+        Show-RecordDialog $ch
+    })
     $w.Controls.Add($lv); $w.Controls.Add($side)
     $script:RecUi = @{ Form = $w; List = $lv }
     $sel = { @($script:RecUi.List.SelectedItems | ForEach-Object { $_.Tag }) }
