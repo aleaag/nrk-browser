@@ -7,6 +7,12 @@ NRK Browser is a single PowerShell script that gives you a fast, folder-based de
 video player, listen in the radio bar, cast to a Chromecast or a TV, and download whole series
 with subtitles, chapters and covers, all without a browser tab.
 
+> **Made with Claude.** NRK Browser was made with [Claude](https://claude.ai), an AI assistant
+> by Anthropic. It's tested as it's built, but bugs and rough edges are to be expected. If
+> something doesn't work as it should, please
+> [report it](https://github.com/aleaag/nrk-browser/issues), with the log if you can
+> (**Logs** > **Copy all**).
+
 > **Unofficial.** This project is not affiliated with, endorsed by or connected to NRK
 > (Norsk rikskringkasting AS). All programmes, images and trademarks belong to NRK. Downloads
 > are for personal use only. Please respect NRK's terms of use and copyright, and note that
@@ -252,6 +258,7 @@ choose in **Options › Downloads**.
 
 ## Credits
 
+- Made with [Claude](https://claude.ai), an AI assistant by Anthropic.
 - Programme data, images and streams: **NRK** (psapi.nrk.no).
 - [hls.js](https://github.com/video-dev/hls.js) (Apache-2.0): HLS playback.
 - [FFmpeg](https://ffmpeg.org): downloads and casting to TVs.

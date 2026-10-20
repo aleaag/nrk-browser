@@ -93,7 +93,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.10.7'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.10.8'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -16036,11 +16036,13 @@ function Show-OptionsWindow {
     [void](& $add $bIssues 24 258)
     $bIssues.Add_Click({ Start-Process "https://github.com/$($script:UpdateRepo)/issues" })
     $optTips.SetToolTip($bIssues, 'Opens the issue list on GitHub. Attach the log (Logs > Copy all) if you can.')
-    & $header 'Not affiliated with NRK' 316
-    [void](& $muted 'Unofficial. Not made, endorsed or supported by NRK (Norsk rikskringkasting AS). All programmes, images and trademarks belong to NRK. Downloads are for personal use; some content is only available in Norway.' 26 356 600 56)
-    & $header 'Built with' 426
-    [void](& $muted 'NRK''s public programme data (psapi.nrk.no)  ·  Microsoft Edge WebView2  ·  hls.js (Apache-2.0)  ·  FFmpeg' 26 466 600 36)
-    $bStatsA = New-FlatButton 'Statistics...' 130; [void](& $add $bStatsA 24 510)
+    & $header 'Made with Claude' 316
+    [void](& $muted 'NRK Browser was made with Claude, an AI assistant by Anthropic. It is tested as it is built, but bugs and rough edges are to be expected. If something does not work as it should, please report it (Report a problem, above).' 26 356 600 56)
+    & $header 'Not affiliated with NRK' 426
+    [void](& $muted 'Unofficial. Not made, endorsed or supported by NRK (Norsk rikskringkasting AS). All programmes, images and trademarks belong to NRK. Downloads are for personal use; some content is only available in Norway.' 26 466 600 56)
+    & $header 'Built with' 536
+    [void](& $muted 'NRK''s public programme data (psapi.nrk.no)  ·  Microsoft Edge WebView2  ·  hls.js (Apache-2.0)  ·  FFmpeg' 26 576 600 36)
+    $bStatsA = New-FlatButton 'Statistics...' 130; [void](& $add $bStatsA 24 620)
     $bStatsA.Add_Click({ Show-StatsWindow })
 
     # Close, under the pages
