@@ -74,7 +74,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.9.0'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.9.1'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -578,11 +578,11 @@ function Invoke-PumpedGet([string] $Uri) {
 $script:ApiJob = $null
 # folders that list things from many places (no "next episode", no NRK order)
 $script:MixedKinds = @('recent', 'search', 'newweek', 'expiring', 'continue', 'watchlater')
-$script:ApiJobs = [System.Collections.Generic.List[object]]::new()   # (::new: New-Object List[object] refuses hashtables in Add)
+$script:ApiJobs = New-Object System.Collections.ArrayList   # (an ArrayList: a generic List refuses hashtables in Add - 'Argument types do not match')
 
 function Start-ApiJob([string] $Name, [scriptblock] $Work, [scriptblock] $Done, [scriptblock] $Failed = $null, $State = $null) {
     $job = @{ Name = $Name; Work = $Work; Done = $Done; Failed = $Failed; State = $State; Got = @{}; Need = $null; Fetch = $null; Runs = 0; Canceled = $false }
-    $script:ApiJobs.Add($job)
+    [void]$script:ApiJobs.Add($job)
     if (-not $script:ApiJobTimer) {
         $script:ApiJobTimer = New-Object System.Windows.Forms.Timer
         $script:ApiJobTimer.Interval = 100
@@ -5371,7 +5371,7 @@ function Get-WatchLaterFiles {
 }
 function Test-WatchLater($File) { if (-not (Test-PosFile $File)) { return $false }; $k = Get-FileKey $File; return [bool]@(Get-WatchLaterRecords | Where-Object { $_.Key -eq $k }).Count }
 function Set-WatchLater([object[]] $Files, [bool] $On) {
-    $list = [System.Collections.Generic.List[object]]::new(); foreach ($r in (Get-WatchLaterRecords)) { $list.Add($r) }
+    $list = New-Object System.Collections.ArrayList; foreach ($r in (Get-WatchLaterRecords)) { [void]$list.Add($r) }
     $n = 0
     foreach ($f in @($Files | Where-Object { Test-PosFile $_ })) {
         $k = Get-FileKey $f
@@ -13612,13 +13612,13 @@ $script:Recs = $null
 
 function Get-Recordings {
     if ($null -ne $script:Recs) { return $script:Recs }
-    $l = [System.Collections.Generic.List[object]]::new()
+    $l = New-Object System.Collections.ArrayList   # (hashtables: see $script:ApiJobs)
     $j = Read-JsonFile $script:RecFile
     if ($j) {
         foreach ($r in @($j.Items | Where-Object { $_ })) {
             $h = @{}; foreach ($p in $r.PSObject.Properties) { $h[$p.Name] = $p.Value }
             if ($h.Status -eq 'Recording') { $h.Status = 'Stopped'; $h.Note = 'the app was closed while recording' }
-            $l.Add($h)
+            [void]$l.Add($h)
         }
     }
     $script:Recs = $l
@@ -13642,7 +13642,7 @@ function Add-Recording($Channel, [datetime] $Start, [datetime] $End, [string] $T
     $r = @{ Id = [guid]::NewGuid().ToString('N').Substring(0, 10); Title = $(if ($Title) { $Title } else { [string]$Channel.Title }); Medium = $medium
             ChannelId = [string]$Channel.Id; ChannelTitle = [string]$Channel.Title; Manifest = [string]$Channel.ManifestPath
             Start = $Start.ToString('o'); End = $End.ToString('o'); Status = 'Scheduled'; File = ''; Note = '' }
-    (Get-Recordings).Add($r)
+    [void](Get-Recordings).Add($r)
     Save-Recordings
     Write-Log INFO ("Recording planned: {0} on {1}, {2:dd.MM HH:mm}-{3:HH:mm}" -f $r.Title, $r.ChannelTitle, $Start, $End)
     Start-RecordTimer
@@ -14015,9 +14015,9 @@ function Add-RecentChannel($Channel) {
     # live channels you played, newest first (for the jump list and the phone remote)
     $medium = if ($Channel.Type -eq 'radiolive') { 'radio' } else { 'tv' }
     $key = "$($medium):$($Channel.Id)"
-    $list = [System.Collections.Generic.List[object]]::new()
+    $list = New-Object System.Collections.ArrayList
     $j = Read-JsonFile $script:RecentChFile
-    if ($j) { foreach ($x in @($j.Items)) { if ($x -and $x.Key -ne $key) { $list.Add($x) } } }
+    if ($j) { foreach ($x in @($j.Items)) { if ($x -and $x.Key -ne $key) { [void]$list.Add($x) } } }
     $list.Insert(0, [pscustomobject]@{ Key = $key; Title = [string]$Channel.Title })
     while ($list.Count -gt 8) { $list.RemoveAt($list.Count - 1) }
     Write-JsonFile $script:RecentChFile ([ordered]@{ Items = @($list) })
