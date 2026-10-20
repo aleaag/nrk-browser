@@ -12,4 +12,4 @@ all without a browser tab.
 > are for personal use only. Please respect NRK's terms of use and copyright, and note that
 > some content is only available in Norway.
 
-[Main window](https://raw.githubusercontent.com/aleaag/nrk-browser/refs/heads/main/main.png)
+<img src="https://raw.githubusercontent.com/aleaag/nrk-browser/refs/heads/main/main.png" alt="main">
