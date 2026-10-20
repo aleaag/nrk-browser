@@ -74,7 +74,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.9.4'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.9.7'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -3156,7 +3156,7 @@ function Reset-ListIcons {
 }
 Reset-ListIcons
 
-# ---- top bar icons (Options > General > Top bar icons) -------------------------------------
+# ---- top bar icons (Options > General > Icon style) -------------------------------------
 # 'text' is the font symbols the app always had; the rest are drawn here, in 11 looks.
 $script:TopIconStyles = [ordered]@{
     text = 'Text symbols (as before)'; thin = 'Thin outline'; bold = 'Bold outline'; solid = 'Solid'; accent = 'Accent outline'
@@ -3303,7 +3303,7 @@ function Set-TopBarIcons {
 }
 
 # ---- 2.9.2: icons on the buttons of the Downloads and Logs windows, the main window and the cast bar
-# The same look as the top bar (Options > General > Top bar icons): icons\<theme>\<style>\<kind>.png from
+# The same look as the top bar (Options > General > Icon style): icons\<theme>\<style>\<kind>.png from
 # the repository. "Text symbols" (or a missing file): the old symbol in the text, as before.
 # The teal (primary) buttons use the "tiles" icons, which are made for a teal background.
 $script:IconButtons = New-Object System.Collections.ArrayList   # @{ Button; Kind; Text; Glyph; Primary; IconOnly }
@@ -7355,7 +7355,7 @@ function Get-PlayerWindow {
     foreach ($x in $bSpeed, $bSubs, $bAudio, $bStartOver, $bLiveBack, $bLiveGo) { $x.Visible = $false }
     $hint.ForeColor = $T.Muted; $hint.AutoEllipsis = $true
     $bar.Controls.AddRange(@($bPrev, $bNext, $bStartOver, $bLiveBack, $bLiveGo, $bSpeed, $bSubs, $bAudio, $bQual, $bSleep, $bMode, $bTop, $bFull, $bMini, $bShot, $bReload, $bExt, $bCast, $hint))
-    # 2.9.3: icons in the chosen look (Options > General > Top bar icons); -Plain = the text as before
+    # 2.9.3: icons in the chosen look (Options > General > Icon style); -Plain = the text as before
     Set-IconText $bPrev 'previous' 'Previous' -Plain ("{0}  Previous" -f [char]0x2039)
     Set-IconText $bNext 'next' 'Next' -Plain ("Next  {0}" -f [char]0x203A)
     Set-IconText $bStartOver 'startover' 'Start over' -Plain ("{0}  Start over" -f [char]0x21E4)
@@ -14503,8 +14503,9 @@ function Show-OptionsWindow {
     $cbTheme.SelectedIndex = [array]::IndexOf(@('System', 'Light', 'Dark'), $script:ThemeMode)
     [void](& $add $cbTheme 120 60)
     [void](& $muted "Windows is set to $((Get-SystemTheme).ToLower()) mode" 432 64 200)
-    $lblIcons = New-Object System.Windows.Forms.Label; $lblIcons.Text = 'Top bar icons'; $lblIcons.AutoSize = $true
+    $lblIcons = New-Object System.Windows.Forms.Label; $lblIcons.Text = 'Icon style'; $lblIcons.AutoSize = $true
     [void](& $add $lblIcons 26 102)
+    [void](& $muted 'Top bar and the buttons in every window' 432 102 220)
     $ui.TopIcons = New-Object System.Windows.Forms.ComboBox
     $ui.TopIcons.DropDownStyle = 'DropDownList'; $ui.TopIcons.FlatStyle = 'Flat'; $ui.TopIcons.Width = 300
     $ui.TopIcons.BackColor = $T.Surface; $ui.TopIcons.ForeColor = $T.Text
