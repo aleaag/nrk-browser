@@ -1,4 +1,4 @@
-# NRK Browser
+# NRK Browser (In development, expect issues)
  
 **Browse, watch, listen to and download NRK TV and NRK Radio from one Windows app.**
  
@@ -24,10 +24,10 @@ all without a browser tab.
 - **Radio Archive**: all radio.nrk.no categories plus the radio **A–Å** index: series, podcasts and
   single programmes.
 
-  ### Watch TV in NRK's own player
+### Watch TV in NRK's own player
 
-  ### Listen to radio and podcasts in the audio bar
+### Listen to radio and podcasts in the audio bar
 
-  ### Download queue
+### Download queue
 
-  ### More to come
+### More to come
