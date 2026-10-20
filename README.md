@@ -12,7 +12,7 @@ with subtitles, chapters and covers, all without a browser tab.
 > are for personal use only. Please respect NRK's terms of use and copyright, and note that
 > some content is only available in Norway.
 
-<img src="https://raw.githubusercontent.com/aleaag/nrk-browser/refs/heads/main/pictures/main.png" alt="main" width="800" height="auto">
+<img src="https://raw.githubusercontent.com/aleaag/nrk-browser/refs/heads/main/screenshot.png" alt="main" width="800" height="auto">
 
 ---
 
@@ -207,7 +207,7 @@ Everything lives in **`%LOCALAPPDATA%\NRK-Browser`** (Options › Install & file
 | `downloads.json`, `dlhistory.json` | the download list, and what was downloaded before |
 | `indexer\` | the indexer's list of everything (search, New this week, Last chance) |
 | `cache\` | saved NRK pages and images (clear it in Options) |
-| `assets\` | icons and folder pictures, fetched from this repository's `icons` and `pictures` folders at startup (only what is missing) |
+| `assets\` | icons and folder pictures, unpacked from this repository's `assets.zip` (fetched again only when it changes) |
 | `logs\` | log files, when **Save logs to disk** is on |
 | `backups\` | what you had before a restore |
 | `webview2-sdk\`, `hls.js\`, `WebView2Data\` | components and player data |
@@ -234,21 +234,9 @@ choose in **Options › Downloads**.
 2. Commit `NRK-Browser.ps1` to the root of `main`.
 3. Running copies download that file, compare its version line with their own, and install it
    when it is newer.
-4. Changed or new icons/pictures: update `assets.json` (it lists every file in `icons` and
-   `pictures` with the start of its SHA-256), so running copies fetch only what changed. From the
-   repository folder in PowerShell:
-   ```powershell
-   $f = [ordered]@{}; Get-ChildItem icons, pictures -Recurse -Filter *.png | Where-Object Name -ne 'main.png' | Sort-Object FullName | ForEach-Object { $f[(Resolve-Path -Relative $_.FullName).TrimStart('.\').Replace('\', '/')] = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.Substring(0, 16).ToLower() }
-   [ordered]@{ version = 1; files = $f } | ConvertTo-Json | Set-Content assets.json -Encoding UTF8
-   ```
-4. After changing anything in `icons/` or `pictures/`, update `assets.json` so running copies
-   fetch the new pictures (each file's first 16 hex digits of its SHA-256). From the repository
-   folder in PowerShell:
-   ```powershell
-   $f = [ordered]@{}; Get-ChildItem icons, pictures -Recurse -Filter *.png | Where-Object Name -ne 'main.png' | Sort-Object FullName | ForEach-Object {
-       $f[(Resolve-Path -Relative $_.FullName).TrimStart('.\').Replace('\', '/')] = (Get-FileHash $_.FullName SHA256).Hash.Substring(0, 16).ToLower() }
-   [ordered]@{ version = 1; files = $f } | ConvertTo-Json | Set-Content assets.json -Encoding UTF8
-   ```
+4. Changed or new icons/pictures: they are all in **`assets.zip`**, and **`assets.json`** gives its
+   SHA-256. Commit both to the root of `main`. Running copies fetch the zip again only when that
+   hash changes, and only use it when the hash matches.
 
 ## Credits
 

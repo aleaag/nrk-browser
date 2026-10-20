@@ -74,7 +74,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.9.3'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.9.4'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -2912,12 +2912,19 @@ function Start-AssetDownload {
 function Update-AssetDownload {
     $run = $script:AssetRun
     $localFile = Join-Path $script:AssetsDir 'assets.local.json'   # what we have: name -> hash
+    if ($run.Phase -eq 'zip') { if ($run.Zip.Task.IsCompleted) { Complete-AssetZip }; return }
     if ($run.Phase -eq 'manifest') {
         if (-not $run.ManifestTask.IsCompleted) { return }
         $list = @{}
         try {
             if ($run.ManifestTask.IsFaulted) { throw $run.ManifestTask.Exception.GetBaseException() }
             $j = [Text.Encoding]::UTF8.GetString($run.ManifestTask.Result) | ConvertFrom-Json
+            if ($j.zip -and $j.sha256) {
+                # 2.9.4: everything in one zip (assets.zip); fetched only when its hash changed
+                try { $run.ManifestClient.Dispose() } catch { }
+                Start-AssetZip $j
+                return
+            }
             foreach ($p in $j.files.PSObject.Properties) { if ($p.Name -match '^(icons|pictures)/[\w\-/]+\.png$') { $list[$p.Name] = [string]$p.Value } }
             Write-Log DEBUG "Assets: assets.json lists $($list.Count) file(s)"
         } catch {
@@ -2969,6 +2976,70 @@ function Update-AssetDownload {
         Write-Log $(if ($run.Failed) { 'WARN' } else { 'INFO' }) ("Assets: {0} saved in {1}{2}" -f $run.Got, $script:AssetsDir, $(if ($run.Failed) { ", $($run.Failed) failed (first: $($run.FirstError)); tried again next start" } else { '' }))
         if ($run.Got) { try { Update-AssetPictures } catch { Write-LogException $_ 'Assets' } }
     }
+}
+
+function Start-AssetZip($Manifest) {
+    # assets.json { format: 'zip', zip: 'assets.zip', sha256, size, files }: the zip is fetched when its
+    # hash differs from the one saved last time (assets\assets.zip.json), checked, unpacked into a new
+    # folder and only then put in place of the old one - a failed download keeps what is there
+    $run = $script:AssetRun
+    $sha = ([string]$Manifest.sha256).ToLower()
+    $mine = Read-JsonFile (Join-Path $script:AssetsDir 'assets.zip.json')
+    if ($mine -and [string]$mine.sha256 -eq $sha -and (Test-Path -LiteralPath (Join-Path $script:AssetsDir 'icons'))) {
+        Write-Log DEBUG "Assets: assets.zip unchanged ($($Manifest.files) files)"
+        $run.Timer.Stop(); $run.Timer.Dispose(); return
+    }
+    $name = [string]$Manifest.zip
+    if ($name -notmatch '^[\w\-.]+\.zip$') { Write-Log WARN "Assets: odd zip name in assets.json: $name"; $run.Timer.Stop(); $run.Timer.Dispose(); return }
+    Write-Log INFO ("Assets: fetching {0} ({1:N0} KB, {2} files) from {3}" -f $name, ([double]$Manifest.size / 1KB), $Manifest.files, $script:AssetBase)
+    $wc = New-Object System.Net.WebClient; $wc.Headers['User-Agent'] = $script:UserAgent
+    $run.Zip = @{ Client = $wc; Task = $wc.DownloadDataTaskAsync("$($script:AssetBase)/$name"); Sha = $sha; Manifest = $Manifest; Watch = [Diagnostics.Stopwatch]::StartNew() }
+    $run.Phase = 'zip'
+}
+
+function Complete-AssetZip {
+    $run = $script:AssetRun; $z = $run.Zip
+    $run.Timer.Stop(); $run.Timer.Dispose()
+    $new = Join-Path $script:AppDataDir 'assets.new'; $old = Join-Path $script:AppDataDir 'assets.old'
+    try {
+        if ($z.Task.IsFaulted -or $z.Task.IsCanceled) { throw $(if ($z.Task.Exception) { $z.Task.Exception.GetBaseException() } else { 'cancelled' }) }
+        $bytes = $z.Task.Result
+        $shaObj = [Security.Cryptography.SHA256]::Create()
+        $got = (([BitConverter]::ToString($shaObj.ComputeHash($bytes))) -replace '-', '').ToLower(); $shaObj.Dispose()
+        if ($got -ne $z.Sha) { throw "the zip's SHA-256 is $got, assets.json says $($z.Sha)" }
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $new) { Remove-Item -LiteralPath $new -Recurse -Force }
+        New-Item -ItemType Directory -Path $new -Force | Out-Null
+        $ms = New-Object IO.MemoryStream(, $bytes)
+        $zip = New-Object IO.Compression.ZipArchive($ms, [IO.Compression.ZipArchiveMode]::Read)
+        $n = 0
+        try {
+            foreach ($e in $zip.Entries) {
+                $rel = $e.FullName -replace '\\', '/'
+                if ($rel.EndsWith('/')) { continue }
+                # only pictures, only inside the folder (no "..\")
+                if ($rel -notmatch '^(icons|pictures)/[\w\-/]+\.png$' -or $rel -match '\.\.') { continue }
+                $dest = Join-Path $new ($rel -replace '/', '\')
+                New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
+                $in = $e.Open(); $out = [IO.File]::Create($dest)
+                try { $in.CopyTo($out) } finally { $out.Dispose(); $in.Dispose() }
+                $n++
+            }
+        } finally { $zip.Dispose(); $ms.Dispose() }
+        if ($n -lt 10) { throw "only $n picture(s) in the zip" }
+        Write-JsonFile (Join-Path $new 'assets.zip.json') ([ordered]@{ sha256 = $z.Sha; files = $n; at = (Get-Date).ToString('o') })
+        # swap: the pictures in use are in memory (read once), so the folders can be renamed
+        if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $script:AssetsDir) { Rename-Item -LiteralPath $script:AssetsDir -NewName 'assets.old' }
+        Rename-Item -LiteralPath $new -NewName 'assets'
+        Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log INFO ("Assets: {0} pictures from {1} in {2:N1} s" -f $n, $z.Manifest.zip, $z.Watch.Elapsed.TotalSeconds)
+        Update-AssetPictures
+    } catch {
+        Write-Log WARN "Assets: $($z.Manifest.zip) not used ($($_.Exception.Message)); keeping the pictures there are; tried again next start"
+        Remove-Item -LiteralPath $new -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $script:AssetsDir) -and (Test-Path -LiteralPath $old)) { Rename-Item -LiteralPath $old -NewName 'assets' -ErrorAction SilentlyContinue }
+    } finally { try { $z.Client.Dispose() } catch { } }
 }
 
 function Save-AssetLocal {
