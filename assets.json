@@ -1,8 +1,8 @@
 {
   "format": "zip",
   "zip": "assets.zip",
-  "sha256": "3ece9f95a2f91ad3a85f26339b709d0913ac1e1c36d0e420e30488e2399ca1c2",
-  "size": 2026654,
+  "sha256": "c75652828af117bf140b963c2ee4c6a681e86c33ce66b8d99dea13c059590661",
+  "size": 2025155,
   "files": 744,
-  "built": "2026-10-20 14:17"
+  "built": "2026-10-20 19:56"
 }

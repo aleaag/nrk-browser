@@ -35,7 +35,7 @@ with subtitles, chapters and covers, all without a browser tab.
   within 14 days.
 - **Continue watching** (what you started, and the next episode of series you watch) and
   **Watch later** (right-click › Watch later), separate from Favourites.
-- **Recently played**, a clickable breadcrumb, Back, sorting (Z–A, A–Z or NRK's order), and
+- **Finished watching** (what you watched or listened to to the end), a clickable breadcrumb, Back, sorting (Z–A, A–Z or NRK's order), and
   Shift/Ctrl multi-select in the tree and the list.
 - **Descriptions under titles** and **"Available until"** (with "5 days left" in the list).
 - **Thumbnails**: show the files list as a grid of pictures (Ctrl+G), or as a list.
@@ -216,7 +216,7 @@ Everything lives in **`%LOCALAPPDATA%\NRK-Browser`** (Options › Install & file
 | Path | Contents |
 |---|---|
 | `settings.json` | your options |
-| `favourites.json`, `excluded.json`, `recent.json` | favourites (and followed series), hidden items, recently played |
+| `favourites.json`, `excluded.json`, `finished.json` | favourites (and followed series), hidden items, Finished watching |
 | `positions.json` | where you stopped in each programme, and what you've watched |
 | `continue.json`, `watchlater.json` | Continue watching and Watch later |
 | `seriesprefs.json`, `recentchannels.json` | speed and skips per series; channels for the jump list and phone remote |

@@ -93,7 +93,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Windows PowerShell draws a (hidden) progress bar per web request: much slower
-$script:AppVersion      = '2.10.8'   # the updater compares this line with the copy on GitHub
+$script:AppVersion      = '2.10.9'   # the updater compares this line with the copy on GitHub
 # Updates: the script on GitHub is both the version check and the update. Its version line
 # is compared with ours; when it is newer, that same download is checked and installed.
 $script:UpdateRepo      = 'aleaag/nrk-browser'
@@ -2080,7 +2080,7 @@ function Initialize-WebView2 {
 #  - several requests at once (Options: speed), the gap between them following NRK's answer
 #    time and growing when NRK says slow down;
 #  - most wanted first: series you open or search for in the app (priority.json), then your
-#    favourites and recently played, then new series, then the rest, longest unchecked first;
+#    favourites and the series you are watching, then new series, then the rest, longest unchecked first;
 #  - a quick check (most runs) skips series that have been quiet lately (they are looked at
 #    less often, 1-14 days) and reads only the seasons where something can have changed: for
 #    TV the first and last, for radio those whose episode count changed. The rest keeps its
@@ -2728,13 +2728,14 @@ function Publish-IndexSearch([string] $Why) {
 }
 
 function Get-IndexFavouriteKeys {
-    # your favourites (followed or not) and the series of what you played lately: checked every run, first
+    # your favourites (followed or not) and the series you are watching (Continue watching): checked every run, first
     $set = New-Object 'System.Collections.Generic.HashSet[string]'
     try { $j = Read-JsonFile (Join-Path $script:AppDataDir 'favourites.json'); if ($j) { foreach ($r in @($j.Items)) { if ($r -and $r.Key) { [void]$set.Add([string]$r.Key) } } } } catch { }
     try {
-        $j = Read-JsonFile (Join-Path $script:AppDataDir 'recent.json')
+        $j = Read-JsonFile (Join-Path $script:AppDataDir 'continue.json')
         if ($j) {
-            foreach ($r in @($j.Items)) {
+            foreach ($c in @($j.Items | Select-Object -First 60)) {
+                $r = if ($c) { $c.File } else { $null }
                 if (-not $r) { continue }
                 if ($r.Type -eq 'audio' -and $r.SeriesId) { [void]$set.Add(('radioseries|{0}|{1}' -f $(if ($r.Kind -eq 'podcast') { 'podcast' } else { 'series' }), $r.SeriesId)) }
                 elseif ($r.SeriesItem -and $r.SeriesItem.Id) { [void]$set.Add("series|$($r.SeriesItem.Id)") }
@@ -3533,7 +3534,7 @@ function Set-DarkTheme {
 $script:AssetBase = 'https://raw.githubusercontent.com/{0}/refs/heads/main' -f $script:UpdateRepo
 $script:AssetsDir = Join-Path $script:AppDataDir 'assets'
 $script:AssetImgs = @{}
-$script:AssetPictures = @{ continue = 'continue-watching'; watchlater = 'watch-later'; tv = 'tv'; radio = 'radio'; recent = 'recently-played'; fav = 'favourites'; new = 'new-this-week'; last = 'last-chance' }
+$script:AssetPictures = @{ continue = 'continue-watching'; watchlater = 'watch-later'; tv = 'tv'; radio = 'radio'; recent = 'finished-watching'; fav = 'favourites'; new = 'new-this-week'; last = 'last-chance' }
 
 function Get-AssetFile([string] $Rel) { return (Join-Path $script:AssetsDir ($Rel -replace '/', '\')) }
 
@@ -4708,7 +4709,7 @@ $miFRecord = New-ThemedMenuItem 'Record...'
 $treeMenu = New-ThemedMenu
 $miTDownload = New-ThemedMenuItem 'Download'
 $miTOpen = New-ThemedMenuItem 'Open'
-$miTClearRecent = New-ThemedMenuItem 'Clear recently played'
+$miTClearRecent = New-ThemedMenuItem 'Clear finished watching'
 $miTCloseSearch = New-ThemedMenuItem 'Close search'
 $miTHide = New-ThemedMenuItem "Hide (don't show or index)"
 $miTFav = New-ThemedMenuItem 'Add to favourites'
@@ -5234,7 +5235,7 @@ function Initialize-Tree {
     $folderTree.Nodes.Clear()
     $script:SearchNode = $null
     Read-KnownEmpty
-    $script:RecentNode = New-FolderNode 'Recently played' @{ Kind = 'recent'; Title = 'Recently played' } 'other'
+    $script:RecentNode = New-FolderNode 'Finished watching' @{ Kind = 'recent'; Title = 'Finished watching' } 'other'   # (2.10.9: was "Recently played"; the kind stays 'recent')
     $script:ContinueNode = New-FolderNode 'Continue watching' @{ Kind = 'continue'; Title = 'Continue watching' } 'episode'
     $script:WatchLaterNode = New-FolderNode ('Watch later   ({0})' -f @(Get-WatchLaterRecords).Count) @{ Kind = 'watchlater'; Title = 'Watch later' } 'program'
     $script:FavNode = New-FolderNode 'Favourites' @{ Kind = 'favourites'; Title = 'Favourites' } 'star'
@@ -5766,7 +5767,8 @@ function Update-SearchFilterButton {
 }
 
 # ---- back up and restore your own things (Options > Install & files) ------------------------
-$script:BackupFiles = @('settings.json', 'excluded.json', 'favourites.json', 'recent.json', 'downloads.json', 'positions.json')
+$script:BackupFiles = @('settings.json', 'excluded.json', 'favourites.json', 'finished.json', 'downloads.json', 'positions.json',
+    'continue.json', 'watchlater.json', 'seriesprefs.json', 'stats.json', 'recentchannels.json', 'recordings.json')   # (2.10.9: the 2.9 lists were missing)
 
 function Export-AppBackup([string] $Path) {
     Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
@@ -5804,15 +5806,18 @@ function Import-AppBackup([string] $Path) {
     } finally { $zip.Dispose() }
     $script:SettingsMem.Stamp = ''; $script:Favs = $null; $script:PosMap = $null; $script:Excluded = $null; $script:ExcludedVer++
     $script:WatchLaterMem = $null; $script:RecentChMem = $null; $script:Cont = $null; $script:Stats = $null; $script:SeriesPrefs = $null   # (2.9.x lists: read again)
+    if (-not @(@(Get-Recordings) | Where-Object { $_.Status -eq 'Recording' }).Count) { $script:Recs = $null }   # (not while one is recording: it is read again next start)
     Write-Log INFO "Restore: $n file(s) from $Path (the previous ones: $safety)"
     return $n
 }
 
-# ---- recently played -------------------------------------------------------------------
-# The last 50 things played (any folder), newest first, in recent.json. Each entry keeps what
-# is needed to play it again straight from the "Recently played" folder.
-$script:RecentFile = Join-Path $script:AppDataDir 'recent.json'
-$script:RecentMax = 50
+# ---- finished watching (2.10.9; was "Recently played") ------------------------------------
+# What you watched or listened to to the end, newest first, in finished.json (up to 200). Each
+# entry keeps what is needed to play it again from the "Finished watching" folder. "The end": the
+# player says it ended, or you got to the last minute (or the last 5 %): the credits. Started but
+# not finished stays in Continue watching; marking files as watched by hand does not add them.
+$script:FinishedFile = Join-Path $script:AppDataDir 'finished.json'
+$script:FinishedMax = 200
 
 function ConvertTo-FileRecord($File) {
     $h = [ordered]@{}
@@ -5833,27 +5838,34 @@ function ConvertFrom-FileRecord($Record) {
     return [pscustomobject]$h
 }
 
-function Get-RecentRecords {
-    $j = Read-JsonFile $script:RecentFile
-    if (-not $j) { return @() }
+function Get-FinishedRecords {
+    $j = Read-JsonFile $script:FinishedFile
+    if (-not $j) {
+        # the first time: what Continue watching already knows was finished
+        $seed = @(@((Get-ContinueMap).Values) | Where-Object { $_ -and $_.Done -and $_.File } | ForEach-Object { $r = $_.File; $r | Add-Member -NotePropertyName FinishedAt -NotePropertyValue $_.At -Force; $r })
+        Write-JsonFile $script:FinishedFile ([ordered]@{ Items = @($seed | Select-Object -First $script:FinishedMax) })
+        if ($seed.Count) { Write-Log INFO "Finished watching: $($seed.Count) programme(s) taken over from Continue watching" }
+        return @($seed)
+    }
     return @($j.Items | Where-Object { $_ })
 }
 
-function Add-RecentPlayed($File) {
-    if (-not $File -or [string]$File.Type -notin 'live', 'radiolive', 'episode', 'program', 'audio') { return }
+function Add-FinishedWatched($File) {
+    # (from Set-PlayPosition, when a file has just become finished)
+    if (-not $File -or [string]$File.Type -notin 'episode', 'program', 'audio') { return }
     try {
         $rec = ConvertTo-FileRecord $File
-        $rec.PlayedAt = (Get-Date).ToString('o')
-        $list = @($rec) + @(Get-RecentRecords | Where-Object { -not ([string]$_.Type -eq [string]$File.Type -and [string]$_.Id -eq [string]$File.Id) })
-        Write-JsonFile $script:RecentFile ([ordered]@{ Items = @($list | Select-Object -First $script:RecentMax) })
-    } catch { Write-Log DEBUG "Recently played: $($_.Exception.Message)" }
+        $rec.FinishedAt = (Get-Date).ToString('o')
+        $list = @($rec) + @(Get-FinishedRecords | Where-Object { -not ([string]$_.Type -eq [string]$File.Type -and [string]$_.Id -eq [string]$File.Id) })
+        Write-JsonFile $script:FinishedFile ([ordered]@{ Items = @($list | Select-Object -First $script:FinishedMax) })
+    } catch { Write-Log DEBUG "Finished watching: $($_.Exception.Message)" }
 }
 
-function Get-RecentFiles { @(Get-RecentRecords | ForEach-Object { ConvertFrom-FileRecord $_ }) }
+function Get-FinishedFiles { @(Get-FinishedRecords | ForEach-Object { ConvertFrom-FileRecord $_ }) }
 
-function Clear-RecentPlayed {
-    Remove-Item -LiteralPath $script:RecentFile -Force -ErrorAction SilentlyContinue
-    Write-Log INFO 'Recently played cleared'
+function Clear-FinishedWatched {
+    Write-JsonFile $script:FinishedFile ([ordered]@{ Items = @() })   # (an empty list: not filled again from Continue watching)
+    Write-Log INFO 'Finished watching cleared'
     if ((Get-FolderTag).Kind -eq 'recent') { Open-Folder $folderTree.SelectedNode }
 }
 
@@ -6047,6 +6059,7 @@ function Set-PlayPosition($File, [double] $Pos, [double] $Dur, [switch] $Ended) 
     $m[$k] = [pscustomobject]@{ Key = $k; Pos = [Math]::Round($Pos, 1); Dur = [Math]::Round($Dur, 1); At = (Get-Date).ToString('o'); Done = $done; Title = [string]$File.Title }
     try { Add-PlayStats $File $old $Pos } catch { }
     try { Update-ContinueRecord $File $Pos $done } catch { }
+    if ($done -and -not ($old -and $old.Done)) { Add-FinishedWatched $File }   # (2.10.9: just finished)
     $script:PosDirty = $true
     Save-PosMap
     if (-not $old -or [bool]$old.Done -ne $done -or [Math]::Abs([double]$old.Pos - $Pos) -gt 20) { try { $itemsList.Invalidate() } catch { } }
@@ -6678,14 +6691,13 @@ function Get-PlaceholderImage([ValidateSet('tv', 'radio', 'recent', 'fav', 'new'
         $pW = & $mkPen $light 6; $pA = & $mkPen $acc 6
         $bA = New-Object System.Drawing.SolidBrush($acc); $bW = New-Object System.Drawing.SolidBrush($light)
         $quad = { param($gp, $x0, $y0, $cx, $cy, $x1, $y1) $gp.AddBezier([float]$x0, [float]$y0, [float]($x0 + 2 / 3 * ($cx - $x0)), [float]($y0 + 2 / 3 * ($cy - $y0)), [float]($x1 + 2 / 3 * ($cx - $x1)), [float]($y1 + 2 / 3 * ($cy - $y1)), [float]$x1, [float]$y1) }
-        $label = switch ($Kind) { 'radio' { 'Radio' } 'recent' { 'Recently played' } 'fav' { 'Favourites' } 'new' { 'New this week' } 'last' { 'Last chance' } 'continue' { 'Continue watching' } 'watchlater' { 'Watch later' } default { 'TV' } }
+        $label = switch ($Kind) { 'radio' { 'Radio' } 'recent' { 'Finished watching' } 'fav' { 'Favourites' } 'new' { 'New this week' } 'last' { 'Last chance' } 'continue' { 'Continue watching' } 'watchlater' { 'Watch later' } default { 'TV' } }
         switch ($Kind) {
             'recent' {
-                # a clock turning back
-                $g.DrawArc($pW, 41, 18, 88, 88, 180, -315)
-                $g.DrawLines($pA, [System.Drawing.PointF[]]@((& $pt 42 18), (& $pt 54 31), (& $pt 37 37)))
-                $g.DrawLines($pA, [System.Drawing.PointF[]]@((& $pt 85 38), (& $pt 85 62), (& $pt 102 74)))
-                $g.FillEllipse($bW, 80, 57, 10, 10)
+                # a screen with a tick (finished)
+                $g.DrawRectangle($pW, 30, 22, 110, 70)
+                $g.DrawLines($pA, [System.Drawing.PointF[]]@((& $pt 66 57), (& $pt 80 71), (& $pt 106 43)))
+                $g.DrawLine($pA, 34, 108, 136, 108)
             }
             'fav' {
                 # a star with a teal centre
@@ -6837,7 +6849,7 @@ function Show-FolderPreview {
             Set-Preview 'Watch later' ('{0} item(s)  ·  newest first' -f @($script:Files).Count) 'Programmes and episodes you put aside: right-click one in any list > Watch later. Separate from Favourites (which are whole series).' $null
         }
         'recent' {
-            Set-Preview 'Recently played' ('{0} item(s)  ·  newest first' -f @($script:Files).Count) 'What you played last, from any folder: double-click to play it again. Right-click this folder to clear the list.' $null
+            Set-Preview 'Finished watching' ('{0} item(s)  ·  newest first' -f @($script:Files).Count) 'What you watched or listened to to the end, from any folder. Double-click to play it again. Right-click this folder to clear the list.' $null
         }
         'search' {
             Set-Preview $tag.Title ('{0} series (folders)  ·  {1} programmes and episodes (files)' -f $node.Nodes.Count, @($script:Files).Count) 'Best matches first, from the indexer''s list of everything on NRK TV and radio. Right-click this folder to close the search.' $null
@@ -6866,8 +6878,8 @@ function Open-Folder {
     $loaded = @{ Ok = $false }
     switch ($tag.Kind) {
         'recent' {
-            $script:Files = @(Get-RecentFiles)
-            Set-Status $(if ($script:Files.Count) { 'Recently played: {0}  ·  newest first  ·  double-click to play again' -f $script:Files.Count } else { 'Nothing played yet' })
+            $script:Files = @(Get-FinishedFiles)
+            Set-Status $(if ($script:Files.Count) { 'Finished watching: {0}  ·  newest first  ·  double-click to play again' -f $script:Files.Count } else { 'Nothing watched to the end yet (what you started is in Continue watching)' })
         }
         'continue' {
             $all = @(Get-ContinueFiles)
@@ -7459,6 +7471,20 @@ $script:PlayerOnlyJs = @'
   for (const n of ['play', 'pause', 'volumechange']) {
     document.addEventListener(n, e => { const v = e.target; if (v && v.tagName === 'VIDEO') post({ type: 'vstate', paused: v.paused, muted: v.muted }); }, true);
   }
+  // 2.10.9: where you are in the programme (every 5 s, and on pause, seek and leaving), as the
+  // built-in player does: Continue watching and Finished watching need it. Not for live streams
+  // (no fixed length). p: the page it plays on (NRK's player goes on to the next episode itself)
+  let lastPos = 0;
+  const vid = e => { const v = e.target; return v && v.tagName === 'VIDEO' && isFinite(v.duration) && v.duration >= 30 ? v : null; };
+  const report = (v, force) => {
+    if (!v || !(v.currentTime > 0)) return;
+    const n = Date.now(); if (!force && n - lastPos < 5000) return; lastPos = n;
+    post({ type: 'vpos', t: v.currentTime, d: v.duration, p: location.pathname });
+  };
+  document.addEventListener('timeupdate', e => report(vid(e), false), true);
+  for (const n of ['pause', 'seeked']) document.addEventListener(n, e => report(vid(e), true), true);
+  document.addEventListener('ended', e => { const v = vid(e); if (v) post({ type: 'ended', t: v.duration, d: v.duration, web: true, p: location.pathname }); }, true);
+  window.addEventListener('pagehide', () => { const v = (videos()[0] || [])[0]; if (v && isFinite(v.duration) && v.duration >= 30) report(v, true); });
 })();
 '@
 
@@ -8103,7 +8129,7 @@ function New-WebViewControl {
                         Write-Log WARN ("Built-in player: {0}{1}" -f $m.details, $(if ($m.retry) { " (retry $($m.retry))" } elseif ($m.fatal) { ' - stopped' } else { '' }))
                         if ($m.fatal -and $script:PlayerWin) { $script:PlayerWin.Hint.Text = 'Playback stopped - try Reload, or "Open NRK page"' }
                     }
-                    'vpos' { if ($script:PlayerWin -and $script:PlayerWin.Target) { Set-PlayPosition $script:PlayerWin.Target.File ([double]$m.t) ([double]$m.d) } }
+                    'vpos' { if ($script:PlayerWin -and $script:PlayerWin.Target -and (Test-PlayerPage $m.p)) { Set-PlayPosition $script:PlayerWin.Target.File ([double]$m.t) ([double]$m.d) } }
                     'atracks' { if ($script:PlayerWin) { $script:PlayerWin.ATracks = @($m.list); $script:PlayerWin.ATrack = [int]$m.cur; Update-PlayerExtras } }
                     'vlive' {
                         $pw = $script:PlayerWin
@@ -8115,7 +8141,8 @@ function New-WebViewControl {
                         }
                     }
                     'ended' {
-                        if ($script:PlayerWin -and $script:PlayerWin.Target) { Set-PlayPosition $script:PlayerWin.Target.File ([double]$m.t) ([double]$m.d) -Ended }
+                        if ($script:PlayerWin -and $script:PlayerWin.Target -and (Test-PlayerPage $m.p)) { Set-PlayPosition $script:PlayerWin.Target.File ([double]$m.t) ([double]$m.d) -Ended }
+                        if ($m.web) { return }   # (NRK's own player: it goes on to the next episode by itself)
                         if (Test-SleepAtEnd) { Invoke-PlayerScript 'nrkb.setNext(null)'; return }
                         if (-not (Get-AppSettings).AutoNext) { return }
                         if ($m.card) { Write-Log INFO 'Built-in player: finished, the next-episode card counts down'; return }   # (the card says go or cancel)
@@ -8411,7 +8438,7 @@ function Start-Player {
     try {
         $pw = Get-PlayerWindow
         $pw.Url = $playTarget.Url
-        $pw.Target = $playTarget; $pw.Mode = $mode
+        $pw.Target = $playTarget; $pw.Mode = $mode; $pw.WebPath = $null; $pw.WebMoved = $false
         $x = $script:PlayerExtra; $script:PlayerExtra = $null
         $pw.SubList = if ($mode -eq 'builtin' -and $x) { $x.Subs } else { @() }; $pw.SubIndex = if ($x) { $x.SubIndex } else { -1 }
         $pw.Versions = if ($mode -eq 'builtin' -and $x) { $x.Versions } else { @() }; $pw.ATracks = @(); $pw.ATrack = -1
@@ -8436,7 +8463,6 @@ function Start-Player {
         # live channels have no .File; a finished programme from a channel's schedule keeps the channel
         $played = if ($playTarget.File) { $playTarget.File } elseif ($listFile) { $listFile } elseif ($script:SelectedFile -and $script:SelectedFile.Type -eq 'live') { $script:SelectedFile } else { $null }
         Save-LastPlayed $played 'video' $(if ($FromQueue) { $script:VideoQueueNode } else { $null })
-        Add-RecentPlayed $played
     } catch {
         Write-LogException $_ 'Start-Player'
         Set-Status "Could not start the embedded player: $($_.Exception.Message)"
@@ -8566,6 +8592,17 @@ function Watch-PlayerPointer {
     $pw.PtrTimer = $t
     $pw.Form.Add_Disposed({ try { $script:PlayerWin.PtrTimer.Stop(); $script:PlayerWin.PtrTimer.Dispose() } catch { } })
     $t.Start()
+}
+
+function Test-PlayerPage([string] $Path) {
+    # 2.10.9: positions from NRK's own player count for what we started only while it stays on
+    # that page: when NRK goes on to the next episode by itself, that one is not ours to save
+    if (-not $Path) { return $true }   # (the built-in player)
+    $pw = $script:PlayerWin
+    if (-not $pw.WebPath) { $pw.WebPath = $Path; return $true }
+    if ($pw.WebPath -eq $Path) { return $true }
+    if (-not $pw.WebMoved) { $pw.WebMoved = $true; Write-Log INFO "Player: NRK's player went on to $Path; its position is not saved for '$($pw.Target.Title)'" }
+    return $false
 }
 
 function Sync-PlayerPointer {
@@ -9188,7 +9225,6 @@ function Start-AudioPlayer {
     } | ConvertTo-Json -Compress
     Show-AudioBar
     Save-LastPlayed $File 'audio' $(if ($FromQueue) { $u.QueueNode } else { $null })
-    Add-RecentPlayed $File
     Send-AudioFx
     Invoke-AudioScript "nrkb.load($($u.Last))"   # not ready yet: sent when the page says 'ready'
     Invoke-AudioScript "nrkb.setNav($(Get-AudioNavJson))"
@@ -9900,7 +9936,6 @@ function Start-Cast($Device, $File, [object[]] $Queue = $null, [int] $Index = -1
     Show-CastBar
     $ok = if ($Device.Kind -eq 'cast') { Start-ChromecastSession $s } else { Start-DlnaSession $s }
     if (-not $ok) { $script:Cast.Session = $null; Hide-CastBar; return }
-    Add-RecentPlayed $File
     Save-LastPlayed $File 'cast' $s.QueueNode $Device   # (continue where you left off: on this device)
     if (-not $script:CastTimer) {
         $script:CastTimer = New-Object System.Windows.Forms.Timer
@@ -11364,7 +11399,7 @@ function Get-NodeFiles {
             if (Expand-FolderNode $Node) { foreach ($c in @($Node.Nodes | Sort-Object { [int]$_.Tag.Order })) { if ($c.Tag.Kind -eq 'radioseason') { Get-NodeFiles $c } } }
         }
         'search' { @($tag.Items | Where-Object { $_.Downloadable }) }
-        'recent' { @(Get-RecentFiles | Where-Object { $_.Downloadable }) }
+        'recent' { @(Get-FinishedFiles | Where-Object { $_.Downloadable }) }
         'continue' { @(Get-ContinueFiles | Where-Object { $_.Downloadable }) }
         'watchlater' { @(Get-WatchLaterFiles | Where-Object { $_.Downloadable }) }
         { $_ -in 'newweek', 'expiring' } { @((Get-DatedFiles $tag.Kind.Replace('newweek', 'new')) | Where-Object { $_ -and $_.Downloadable }) }
@@ -15822,7 +15857,7 @@ function Show-OptionsWindow {
     [void](& $add $ui.CacheMode 220 338)
     $ui.LogDisk = & $check 'Save logs to disk (kept for 3 days; the Logs window always shows this session)' ([bool]$st.Logging) 26 386
     & $header 'Back up' 432
-    [void](& $muted 'Your settings, favourites, hidden items, what you have watched (and where you stopped), recently played and the download list, in one file.' 26 470 600 36)
+    [void](& $muted 'Your settings, favourites, hidden items, what you have watched (and where you stopped), Continue watching, Finished watching, Watch later, recordings and the download list, in one file.' 26 470 600 36)
     $bBackup = New-FlatButton 'Back up...' 140 -Primary
     [void](& $add $bBackup 24 512)
     $bRestore = New-FlatButton 'Restore...' 140
@@ -15839,7 +15874,7 @@ function Show-OptionsWindow {
         $dlg = New-Object System.Windows.Forms.OpenFileDialog
         $dlg.Filter = 'NRK Browser backup (*.zip)|*.zip'; $dlg.InitialDirectory = [Environment]::GetFolderPath('MyDocuments')
         if ($dlg.ShowDialog($script:OptUi.Form) -ne 'OK') { return }
-        $q = [System.Windows.Forms.MessageBox]::Show($script:OptUi.Form, "Replace your settings, favourites, hidden items, watched list, recently played and download list with the ones in`n$($dlg.FileName)?`n`nWhat you have now is kept in the app's backups folder first.", 'Restore', 'YesNo', 'Warning')
+        $q = [System.Windows.Forms.MessageBox]::Show($script:OptUi.Form, "Replace your settings, favourites, hidden items, watched list, Continue watching, Finished watching, Watch later, recordings and download list with the ones in`n$($dlg.FileName)?`n`nWhat you have now is kept in the app's backups folder first.", 'Restore', 'YesNo', 'Warning')
         if ($q -ne 'Yes') { return }
         try { $n = Import-AppBackup $dlg.FileName }
         catch { Write-LogException $_ 'Restore'; [void][System.Windows.Forms.MessageBox]::Show($script:OptUi.Form, "Could not restore:`n$($_.Exception.Message)", 'Restore', 'OK', 'Error'); return }
@@ -16335,7 +16370,7 @@ $miTFeed.Add_Click({ if ($script:TreeMenuFeed) { [System.Windows.Forms.Clipboard
 $miTDownload.Add_Click({ Add-ToDownloadQueue -Nodes @($script:TreeMenuNodes) })
 $miTHide.Add_Click({ Add-Excluded -Nodes @($script:TreeMenuNodes | Where-Object { $_.Tag.Kind -in 'category', 'letter', 'radiocategory', 'radioletter', 'series', 'season', 'radioseries', 'radioseason' }) })
 $miTClearRecent.Add_Click({
-    if ([System.Windows.Forms.MessageBox]::Show($form, 'Clear the list of recently played programmes?', 'Recently played', 'YesNo', 'Question') -eq 'Yes') { Clear-RecentPlayed }
+    if ([System.Windows.Forms.MessageBox]::Show($form, 'Clear the list of programmes you finished watching? (Whether they count as watched stays as it is.)', 'Finished watching', 'YesNo', 'Question') -eq 'Yes') { Clear-FinishedWatched }
 })
 $miTCloseSearch.Add_Click({
     $n = $script:SearchNode
